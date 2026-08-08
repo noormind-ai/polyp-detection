@@ -36,7 +36,7 @@ HF_FILE = "weights/best.pt"
     gpu="A100",
     image=image,
     volumes={MODELS_DIR: volume},
-    scaledown_window=60,  # container stops 60s after last request
+    scaledown_window=300,  # container stops 5min after last request — short enough to control cost, long enough to survive normal UI setup time between warmup and first frame
 )
 class PolypDetector:
 
@@ -93,6 +93,34 @@ class PolypDetector:
             }
             for box in results.boxes
         ]
+
+    @modal.method()
+    def infer_frame_bench(self, frame_bytes: bytes) -> dict:
+        """
+        Benchmark-only variant of infer_frame — times JPEG decode and the GPU
+        forward pass separately so RPC/network overhead can be isolated from
+        actual compute time. Not called by the production app.
+        """
+        import time
+        import cv2
+        import numpy as np
+
+        t0 = time.perf_counter()
+        frame = cv2.imdecode(np.frombuffer(frame_bytes, np.uint8), cv2.IMREAD_COLOR)
+        decode_ms = (time.perf_counter() - t0) * 1000
+
+        t1 = time.perf_counter()
+        results = self.model(frame, conf=0.3, verbose=False)[0]
+        gpu_ms = (time.perf_counter() - t1) * 1000
+
+        boxes = [
+            {
+                "bbox": [round(x) for x in box.xyxy[0].tolist()],
+                "conf": round(float(box.conf[0]), 3),
+            }
+            for box in results.boxes
+        ]
+        return {"boxes": boxes, "decode_ms": round(decode_ms, 2), "gpu_ms": round(gpu_ms, 2)}
 
     @modal.method()
     def infer_video(self, video_bytes: bytes) -> dict:

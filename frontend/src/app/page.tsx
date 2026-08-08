@@ -1,10 +1,12 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import UploadPanel from "@/components/UploadPanel";
 import WarmupPanel from "@/components/WarmupPanel";
 import VideoPlayer from "@/components/VideoPlayer";
 import RealtimePlayer from "@/components/RealtimePlayer";
+import LiveCameraPlayer from "@/components/LiveCameraPlayer";
+import { useLanguage } from "@/lib/i18n";
 
 type Stage = "idle" | "warming" | "ready" | "processing" | "done";
 
@@ -27,10 +29,15 @@ interface GtData {
 }
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001";
+// Must match scaledown_window in inference/app.py — Modal releases the GPU container
+// this long after its last request, so we bounce back to "Start Session" at the same
+// point instead of letting the user hit a surprise cold-start delay.
+const MODAL_IDLE_MS = 5 * 60 * 1000;
 
 export default function Home() {
+  const { t, lang, toggleLang } = useLanguage();
   const [stage, setStage] = useState<Stage>("idle");
-  const [mode, setMode] = useState<"upload" | "realtime" | null>(null);
+  const [mode, setMode] = useState<"upload" | "realtime" | "camera" | "screen" | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [result, setResult] = useState<InferResult | null>(null);
   const [groundTruth, setGroundTruth] = useState<GtData | null>(null);
@@ -38,6 +45,29 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [stopping, setStopping] = useState(false);
   const gtInputRef = useRef<HTMLInputElement>(null);
+  const lastActiveRef = useRef<number>(Date.now());
+
+  function markActive() { lastActiveRef.current = Date.now(); }
+
+  // While a session is active, watch for the GPU having gone idle long enough that
+  // Modal already released the container — return to the start screen so the UI
+  // reflects reality instead of letting the next request eat a cold-start delay.
+  useEffect(() => {
+    if (stage !== "ready" && stage !== "processing") return;
+    const interval = setInterval(() => {
+      if (Date.now() - lastActiveRef.current > MODAL_IDLE_MS) {
+        fetch(`${API}/api/session/stop`, { method: "POST" }).catch(() => {});
+        setStage("idle");
+        setMode(null);
+        setResult(null);
+        setVideoUrl(null);
+        setGroundTruth(null);
+        setShowGt(false);
+        setError(t("Session timed out after 5 minutes idle — the GPU was released to save cost. Click Start Session to reconnect."));
+      }
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [stage, t]);
 
   async function handleStop() {
     setStopping(true);
@@ -61,13 +91,14 @@ export default function Home() {
       const res = await fetch(`${API}/api/session/start`, { method: "POST" });
       if (!res.ok) {
         const text = await res.text();
-        throw new Error(`Backend error ${res.status}: ${text}`);
+        throw new Error(t("Backend error {status}: {text}", { status: res.status, text }));
       }
+      markActive();
       setStage("ready");
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes("fetch") || msg.includes("Failed to fetch")) {
-        setError(`Cannot reach backend at ${API}. Is uvicorn running?`);
+        setError(t("Cannot reach backend at {API}. Is uvicorn running?", { API }));
       } else {
         setError(msg);
       }
@@ -89,11 +120,12 @@ export default function Home() {
     ]);
 
     if (!inferRes.ok) {
-      setError("Inference failed. Check backend logs.");
+      setError(t("Inference failed. Check backend logs."));
       setStage("ready");
       return;
     }
 
+    markActive();
     const data: InferResult = await inferRes.json();
     setResult(data);
     if (gtData) {
@@ -123,21 +155,36 @@ export default function Home() {
 
   return (
     <main className="min-h-screen bg-gray-950 text-white p-8 max-w-4xl mx-auto">
-      <h1 className="text-2xl font-semibold mb-1">Polyp Detection AI</h1>
-      <p className="text-gray-500 text-sm mb-10">
-        Real-time colonoscopy polyp detection · YOLOv5 · Kvasir-SEG · mAP50 0.93
-      </p>
+      <div className="flex items-start justify-between mb-10">
+        <div>
+          <h1 className="text-2xl font-semibold mb-1">{t("Polyp Detection AI")}</h1>
+          <p className="text-gray-500 text-sm">
+            {t("Real-time colonoscopy polyp detection · YOLOv5 · Kvasir-SEG · mAP50 0.93")}
+          </p>
+        </div>
+        <div className="flex gap-2 flex-shrink-0">
+          <a href="/" className="text-sm px-3 py-2 rounded-lg border border-gray-700 text-gray-400 hover:text-gray-200 hover:border-gray-500 transition-colors">
+            {t("Home")}
+          </a>
+          <button
+            onClick={toggleLang}
+            className="text-sm px-3 py-2 rounded-lg border border-gray-700 text-gray-400 hover:text-gray-200 hover:border-gray-500 transition-colors"
+          >
+            {lang === "fa" ? "EN" : "فا"}
+          </button>
+        </div>
+      </div>
 
       {stage === "idle" && (
         <div className="flex flex-col items-center justify-center py-24 gap-6">
           <p className="text-gray-400 text-center max-w-sm">
-            Starts a GPU session on Modal. First start takes ~60 seconds to load the model.
+            {t("Starts a GPU session on Modal. First start takes ~60 seconds to load the model.")}
           </p>
           <button
             onClick={handleStart}
             className="px-8 py-3 bg-blue-600 hover:bg-blue-500 rounded-xl text-white font-medium text-lg transition-colors"
           >
-            Start Session
+            {t("Start Session")}
           </button>
         </div>
       )}
@@ -149,34 +196,50 @@ export default function Home() {
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2 text-green-400 text-sm">
               <span className="w-2 h-2 rounded-full bg-green-400 inline-block animate-pulse" />
-              GPU ready · Model loaded · A100 active
+              {t("GPU ready · Model loaded · A100 active")}
             </div>
             <button
               onClick={handleStop}
               disabled={stopping}
               className="text-sm text-red-400 hover:text-red-300 transition-colors disabled:opacity-50"
             >
-              {stopping ? "Ending..." : "End Session"}
+              {stopping ? t("Ending...") : t("End Session")}
             </button>
           </div>
 
           {mode === null && (
-            <div className="grid grid-cols-2 gap-4 pt-4">
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 pt-4">
               <button
                 onClick={() => setMode("upload")}
                 className="flex flex-col items-center gap-3 p-8 rounded-xl border-2 border-gray-700 hover:border-blue-500 hover:bg-blue-950/10 transition-colors text-center"
               >
                 <span className="text-3xl">🎬</span>
-                <span className="text-white font-medium">Upload Video</span>
-                <span className="text-gray-500 text-sm">Analyse a recorded colonoscopy clip</span>
+                <span className="text-white font-medium">{t("Upload Video")}</span>
+                <span className="text-gray-500 text-sm">{t("Analyse a recorded colonoscopy clip")}</span>
               </button>
               <button
                 onClick={() => setMode("realtime")}
                 className="flex flex-col items-center gap-3 p-8 rounded-xl border-2 border-gray-700 hover:border-green-500 hover:bg-green-950/10 transition-colors text-center"
               >
                 <span className="text-3xl">📷</span>
-                <span className="text-white font-medium">Real-time</span>
-                <span className="text-gray-500 text-sm">Frame-by-frame · ~600ms/frame</span>
+                <span className="text-white font-medium">{t("Real-time")}</span>
+                <span className="text-gray-500 text-sm">{t("Frame-by-frame · ~600ms/frame")}</span>
+              </button>
+              <button
+                onClick={() => setMode("camera")}
+                className="flex flex-col items-center gap-3 p-8 rounded-xl border-2 border-gray-700 hover:border-purple-500 hover:bg-purple-950/10 transition-colors text-center"
+              >
+                <span className="text-3xl">📹</span>
+                <span className="text-white font-medium">{t("Live Camera")}</span>
+                <span className="text-gray-500 text-sm">{t("Webcam, phone, or capture card")}</span>
+              </button>
+              <button
+                onClick={() => setMode("screen")}
+                className="flex flex-col items-center gap-3 p-8 rounded-xl border-2 border-gray-700 hover:border-purple-500 hover:bg-purple-950/10 transition-colors text-center"
+              >
+                <span className="text-3xl">🖥️</span>
+                <span className="text-white font-medium">{t("Screen Share")}</span>
+                <span className="text-gray-500 text-sm">{t("Share a window/screen instead of a device")}</span>
               </button>
             </div>
           )}
@@ -184,7 +247,7 @@ export default function Home() {
           {mode === "upload" && (
             <div className="space-y-3">
               <button onClick={() => setMode(null)} className="text-sm text-gray-500 hover:text-gray-300 transition-colors">
-                ← Back
+                {t("← Back")}
               </button>
               <UploadPanel onUpload={handleUpload} />
             </div>
@@ -193,9 +256,27 @@ export default function Home() {
           {mode === "realtime" && (
             <div className="space-y-3">
               <button onClick={() => setMode(null)} className="text-sm text-gray-500 hover:text-gray-300 transition-colors">
-                ← Back
+                {t("← Back")}
               </button>
-              <RealtimePlayer onStop={() => setMode(null)} />
+              <RealtimePlayer onStop={() => setMode(null)} onActivity={markActive} />
+            </div>
+          )}
+
+          {mode === "camera" && (
+            <div className="space-y-3">
+              <button onClick={() => setMode(null)} className="text-sm text-gray-500 hover:text-gray-300 transition-colors">
+                {t("← Back")}
+              </button>
+              <LiveCameraPlayer onStop={() => setMode(null)} onActivity={markActive} />
+            </div>
+          )}
+
+          {mode === "screen" && (
+            <div className="space-y-3">
+              <button onClick={() => setMode(null)} className="text-sm text-gray-500 hover:text-gray-300 transition-colors">
+                {t("← Back")}
+              </button>
+              <LiveCameraPlayer onStop={() => setMode(null)} onActivity={markActive} initialMode="screen" />
             </div>
           )}
         </div>
@@ -205,7 +286,7 @@ export default function Home() {
         <div className="space-y-4">
           <div className="flex items-center gap-2 text-yellow-400 text-sm animate-pulse">
             <span className="w-2 h-2 rounded-full bg-yellow-400 inline-block" />
-            Running inference on Modal...
+            {t("Running inference on Modal...")}
           </div>
           {videoUrl && (
             <video src={videoUrl} autoPlay loop muted
@@ -219,21 +300,21 @@ export default function Home() {
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2 text-green-400 text-sm">
               <span className="w-2 h-2 rounded-full bg-green-400 inline-block" />
-              Inference complete · {result.frames.length} frames · {result.fps.toFixed(0)} fps
+              {t("Inference complete · {frames} frames · {fps} fps", { frames: result.frames.length, fps: result.fps.toFixed(0) })}
             </div>
             <div className="flex gap-4">
               <button
                 onClick={resetToUpload}
                 className="text-sm text-gray-500 hover:text-gray-300 transition-colors"
               >
-                Try another video
+                {t("Try another video")}
               </button>
               <button
                 onClick={handleStop}
                 disabled={stopping}
                 className="text-sm text-red-400 hover:text-red-300 transition-colors disabled:opacity-50"
               >
-                {stopping ? "Ending..." : "End Session"}
+                {stopping ? t("Ending...") : t("End Session")}
               </button>
             </div>
           </div>
@@ -255,7 +336,7 @@ export default function Home() {
               <>
                 <div className="flex items-center gap-3">
                   <span className="inline-block w-3 h-3 rounded-sm flex-shrink-0" style={{ background: "#22d3ee" }} />
-                  <span className="text-sm text-gray-300">Ground Truth Labels</span>
+                  <span className="text-sm text-gray-300">{t("Ground Truth Labels")}</span>
                 </div>
                 <div className="flex items-center gap-3">
                   <button
@@ -274,18 +355,18 @@ export default function Home() {
                     onClick={() => { setGroundTruth(null); setShowGt(false); }}
                     className="text-xs text-gray-600 hover:text-gray-400 transition-colors"
                   >
-                    Remove
+                    {t("Remove")}
                   </button>
                 </div>
               </>
             ) : (
               <>
-                <span className="text-sm text-gray-400">Want to compare with ground truth?</span>
+                <span className="text-sm text-gray-400">{t("Want to compare with ground truth?")}</span>
                 <button
                   onClick={() => gtInputRef.current?.click()}
                   className="text-sm px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-white transition-colors"
                 >
-                  Load GT JSON
+                  {t("Load GT JSON")}
                 </button>
               </>
             )}
@@ -296,7 +377,7 @@ export default function Home() {
             onClick={resetToUpload}
             className="w-full py-3 bg-gray-800 hover:bg-gray-700 rounded-xl text-white font-medium transition-colors"
           >
-            Upload another video
+            {t("Upload another video")}
           </button>
         </div>
       )}

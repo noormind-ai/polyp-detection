@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { useLanguage } from "@/lib/i18n";
 
 interface Detection {
   bbox: [number, number, number, number];
@@ -23,6 +24,7 @@ interface Props {
 const SPEEDS = [0.25, 0.5, 1, 1.5, 2];
 
 export default function VideoPlayer({ src, detections, fps, width, height, groundTruth }: Props) {
+  const { t } = useLanguage();
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rafRef = useRef<number>(0);
@@ -110,13 +112,13 @@ export default function VideoPlayer({ src, detections, fps, width, height, groun
       {/* Stats */}
       <div className="flex flex-wrap gap-x-6 gap-y-1 text-sm">
         <span className="text-gray-400">
-          Frames with polyp: <span className="text-white font-medium">{polypsFound} / {totalFrames}</span>
+          {t("Frames with polyp: {n} / {total}", { n: polypsFound, total: totalFrames })}
         </span>
         <span className="text-gray-400">
-          Detection rate: <span className="text-white font-medium">{detectionRate}%</span>
+          {t("Detection rate: {rate}%", { rate: detectionRate })}
         </span>
         <span className="text-gray-400">
-          Resolution: <span className="text-white font-medium">{width}×{height}</span>
+          {t("Resolution: {width}×{height}", { width, height })}
         </span>
       </div>
 
@@ -148,15 +150,15 @@ export default function VideoPlayer({ src, detections, fps, width, height, groun
           onClick={togglePlay}
           className="px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-white text-xs font-medium transition-colors w-16"
         >
-          {playing ? "Pause" : "Play"}
+          {playing ? t("Pause") : t("Play")}
         </button>
         <button
           onClick={handleStop}
           className="px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-white text-xs font-medium transition-colors"
         >
-          Stop
+          {t("Stop")}
         </button>
-        <span className="text-xs text-gray-500">Speed</span>
+        <span className="text-xs text-gray-500">{t("Speed")}</span>
         <div className="flex gap-1">
           {SPEEDS.map((s) => (
             <button
@@ -174,14 +176,14 @@ export default function VideoPlayer({ src, detections, fps, width, height, groun
         </div>
         <span className="ml-auto text-xs text-gray-500 flex items-center gap-2">
           <span className="inline-block w-3 h-3 rounded-sm" style={{ background: "#39ff14" }} />
-          predicted
+          {t("predicted")}
           {groundTruth ? (
             <>
               <span className="inline-block w-3 h-3 rounded-sm ml-1" style={{ background: "#22d3ee" }} />
-              ground truth
+              {t("ground truth")}
             </>
           ) : (
-            <span className="text-gray-600 ml-1">(no GT loaded)</span>
+            <span className="text-gray-600 ml-1">{t("(no GT loaded)")}</span>
           )}
         </span>
       </div>
