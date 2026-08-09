@@ -13,7 +13,7 @@ const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 const INFER_TIMEOUT_MS = 6000;
 // Resize frames to this width before sending — faster inference, smaller payload
 const INFER_WIDTH = 320;
-const SPEEDS = [0.25, 0.5, 1, 1.5, 2];
+const SPEEDS = [0.1, 0.25, 0.5, 1, 1.5, 2];
 // Don't auto-capture the same ongoing detection every single frame — once a
 // polyp is flagged, wait this long before the next auto-capture so the
 // review queue fills with distinct moments, not near-duplicates.
@@ -42,13 +42,14 @@ export default function RealtimePlayer({
   const [wsStatus, setWsStatus]   = useState<"connecting" | "open" | "error" | "closed">("connecting");
   const [closeCode, setCloseCode] = useState<number | null>(null);
   const [polyp, setPolyp]         = useState(false);
-  const [speed, setSpeed]         = useState(0.25); // slow default — demo footage moves too fast to react to otherwise
+  const [speed, setSpeed]         = useState(0.1); // slow default — demo footage moves too fast to react to otherwise
   const [stats, setStats]         = useState({ sent: 0, received: 0, avgMs: 0 });
   const [lastError, setLastError] = useState("");
   const [duration, setDuration]   = useState(0);
   const [curTime, setCurTime]     = useState(0);
   const [showCapture, setShowCapture] = useState(false);
   const [feedbackRefreshKey, setFeedbackRefreshKey] = useState(0);
+  const [videoEnded, setVideoEnded]   = useState(false);
   const msHistory = useRef<number[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -155,7 +156,7 @@ export default function RealtimePlayer({
   async function startLoop(video: HTMLVideoElement) {
     if (scanRef.current) return;
     scanRef.current = true;
-    video.loop = true;
+    video.loop = false;
     video.playbackRate = speed;
     await video.play();
 
@@ -311,7 +312,9 @@ export default function RealtimePlayer({
         <>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div className="space-y-1.5">
-              <p className="text-xs text-gray-500 uppercase tracking-wide">{t("Live · {speed}x · no lag", { speed })}</p>
+              <p className="text-xs text-gray-500 uppercase tracking-wide">
+                {videoEnded ? t("Finished · {speed}x", { speed }) : t("Live · {speed}x · no lag", { speed })}
+              </p>
               <div className="relative w-full rounded-xl overflow-hidden border border-gray-800 bg-black"
                 style={{ aspectRatio: "560/480" }}>
                 <video
@@ -321,6 +324,7 @@ export default function RealtimePlayer({
                   onCanPlay={handleVideoLoad}
                   onTimeUpdate={handleTimeUpdate}
                   onLoadedMetadata={handleVideoLoad}
+                  onEnded={() => { scanRef.current = false; setVideoEnded(true); }}
                   className="absolute inset-0 w-full h-full object-cover"
                 />
               </div>
@@ -381,7 +385,7 @@ export default function RealtimePlayer({
             {t("👁 Dr. found a polyp AI missed")}
           </button>
 
-          <FeedbackPanel key={feedbackRefreshKey} caseId={caseId} />
+          <FeedbackPanel caseId={caseId} refreshSignal={feedbackRefreshKey} />
 
           <button
             onClick={() => { scanRef.current = false; setVideoUrl(null); }}

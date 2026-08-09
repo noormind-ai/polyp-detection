@@ -156,4 +156,12 @@ export const FA: Record<string, string> = {
   "✓ Dr. didn't notice at first — confirms correct": "✓ پزشک ابتدا متوجه نشده بود — درستی را تأیید می‌کند",
   "✗ Dr. says this is wrong": "✗ پزشک می‌گوید این نادرست است",
   "Green box is the AI's detection. Drag on the image to correct it if needed.": "کادر سبز، تشخیص هوش مصنوعی است. در صورت نیاز با کشیدن روی تصویر آن را اصلاح کنید.",
+
+  // Inline review panel: auto-advancing queue, move/draw box editing, quick delete
+  "Skip → next": "رد شدن ← بعدی",
+  "Save box": "ذخیره کادر",
+  "✓ All caught up — nothing waiting for review.": "✓ همه بررسی شد — چیزی در انتظار بررسی نیست.",
+  "Green shows what the AI detected.": "سبز نشان‌دهنده تشخیص هوش مصنوعی است.",
+  "Click inside the box to move it, or click empty space to draw a new one.": "برای جابه‌جایی، داخل کادر کلیک کنید؛ برای رسم کادر جدید، روی فضای خالی کلیک کنید.",
+  "Finished · {speed}x": "پایان یافت · {speed}x",
 };
