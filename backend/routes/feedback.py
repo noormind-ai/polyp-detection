@@ -55,7 +55,7 @@ CASES_DIR = DATA_DIR / "cases"
 MANIFEST_PATH = DATA_DIR / "manifest.csv"
 MANIFEST_FIELDS = [
     "case_id", "filename", "has_video", "timestamp", "source", "status", "noticed_first",
-    "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2", "ai_detections",
+    "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2", "ai_detections", "box_corrected",
 ]
 STATUSES = {"pending", "confirmed", "false_positive", "dr_found"}
 NOTICED_FIRST = {"dr", "ai", ""}
@@ -134,7 +134,7 @@ async def auto_capture(
         "case_id": case_id, "filename": filename, "has_video": has_video,
         "timestamp": ts, "source": "auto", "status": "pending", "noticed_first": "",
         "bbox_x1": "", "bbox_y1": "", "bbox_x2": "", "bbox_y2": "",
-        "ai_detections": ai_detections,
+        "ai_detections": ai_detections, "box_corrected": "",
     })
     _write_manifest(rows)
     return {"filename": filename}
@@ -169,7 +169,43 @@ async def dr_found_capture(
         "case_id": case_id, "filename": filename, "has_video": has_video,
         "timestamp": ts, "source": "manual", "status": "dr_found", "noticed_first": "dr",
         "bbox_x1": x1, "bbox_y1": y1, "bbox_x2": x2, "bbox_y2": y2,
-        "ai_detections": ai_detections or "",
+        "ai_detections": ai_detections or "", "box_corrected": "",
+    })
+    _write_manifest(rows)
+    return {"filename": filename}
+
+
+@router.post("/feedback/{case_id}/false-positive/capture")
+async def false_positive_capture(
+    case_id: str,
+    file: UploadFile = File(...),
+    bbox: Optional[str] = Form(default=None),
+    ai_detections: Optional[str] = Form(default=None),
+    video: Optional[UploadFile] = File(default=None),
+):
+    """Manual capture — staff flags what the AI is showing right now as wrong,
+    on the spot, without waiting for auto-capture + review."""
+    image_bytes = await file.read()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="empty image")
+    video_bytes = await video.read() if video else None
+    filename, ts, has_video = _save_capture(case_id, image_bytes, video_bytes)
+
+    x1 = y1 = x2 = y2 = ""
+    if bbox:
+        try:
+            coords = json.loads(bbox)
+            if len(coords) == 4:
+                x1, y1, x2, y2 = coords
+        except (ValueError, TypeError):
+            log.warning("false_positive_capture: could not parse bbox %r", bbox)
+
+    rows = _read_manifest()
+    rows.append({
+        "case_id": case_id, "filename": filename, "has_video": has_video,
+        "timestamp": ts, "source": "manual", "status": "false_positive", "noticed_first": "",
+        "bbox_x1": x1, "bbox_y1": y1, "bbox_x2": x2, "bbox_y2": y2,
+        "ai_detections": ai_detections or "", "box_corrected": "",
     })
     _write_manifest(rows)
     return {"filename": filename}
@@ -194,10 +230,14 @@ async def review_capture(
     correct: bool = Form(...),
     noticed_first: str = Form(...),
     bbox: Optional[str] = Form(default=None),
+    box_corrected: bool = Form(default=False),
 ):
     """Nurse reviews a pending auto-capture: confirms it's a real polyp
     (optionally adjusting the box) or marks it a false positive, and records
-    whether the doctor had already noticed it or the model caught it first."""
+    whether the doctor had already noticed it or the model caught it first.
+    box_corrected flags whether the saved box is the AI's own detection as-is
+    or one the nurse moved/redrew — lets later analysis separate "AI box was
+    right" from "AI box needed a correction"."""
     _check_id(case_id, "case_id")
     _check_id(filename.split(".")[0], "filename")
     if noticed_first not in NOTICED_FIRST:
@@ -207,6 +247,7 @@ async def review_capture(
         if r["case_id"] == case_id and r["filename"] == filename:
             r["status"] = "confirmed" if correct else "false_positive"
             r["noticed_first"] = noticed_first
+            r["box_corrected"] = box_corrected
             if bbox:
                 try:
                     x1, y1, x2, y2 = json.loads(bbox)

@@ -7,6 +7,7 @@ const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001";
 
 interface Box { bbox: [number, number, number, number]; conf: number; }
 interface Props {
+  mode: "dr_found" | "false_positive";
   video: HTMLVideoElement;
   caseId: string;
   getClip?: () => Blob | null;
@@ -14,13 +15,15 @@ interface Props {
   onSaved: () => void;
 }
 
-// Manual capture flow — for the one case auto-capture can't cover: a doctor
-// pointing out a polyp the model never flagged, so there's no detection
-// event to auto-trigger from. The saved image is always the plain camera
-// frame; the model's own (likely empty) output for this exact frame is
-// shown for reference and stored as metadata, so review can catch "actually
-// the model did flag this" cases.
-export default function FeedbackCapture({ video, caseId, getClip, onClose, onSaved }: Props) {
+// Manual capture flow — for the two cases auto-capture can't cover on its own:
+// - dr_found: a doctor pointing out a polyp the model never flagged, so
+//   there's no detection event to auto-trigger from.
+// - false_positive: staff flagging what the model is showing RIGHT NOW as
+//   wrong, on the spot, rather than waiting for the review queue.
+// Either way the saved image is always the plain camera frame; the model's
+// own output for this exact frame is shown for reference and stored as
+// metadata, so review can catch "actually the model did/didn't agree" cases.
+export default function FeedbackCapture({ mode, video, caseId, getClip, onClose, onSaved }: Props) {
   const { t } = useLanguage();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [duration, setDuration] = useState(video.duration || 0);
@@ -119,7 +122,8 @@ export default function FeedbackCapture({ video, caseId, getClip, onClose, onSav
         fd.append("ai_detections", JSON.stringify(aiBoxes));
         const clip = getClip?.();
         if (clip) fd.append("video", clip, "clip.webm");
-        const res = await fetch(`${API}/api/feedback/${caseId}/dr-found/capture`, { method: "POST", body: fd });
+        const endpoint = mode === "dr_found" ? "dr-found/capture" : "false-positive/capture";
+        const res = await fetch(`${API}/api/feedback/${caseId}/${endpoint}`, { method: "POST", body: fd });
         if (res.ok) { onSaved(); onClose(); }
       } finally {
         setSaving(false);
@@ -127,11 +131,16 @@ export default function FeedbackCapture({ video, caseId, getClip, onClose, onSav
     }, "image/jpeg", 0.92);
   }
 
+  const accent = mode === "dr_found" ? "border-emerald-500" : "border-amber-500";
+  const saveColor = mode === "dr_found" ? "bg-emerald-600 hover:bg-emerald-500" : "bg-amber-600 hover:bg-amber-500";
+
   return (
     <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
-      <div className="bg-gray-950 border-2 border-emerald-500 rounded-2xl p-5 max-w-2xl w-full space-y-4">
+      <div className={`bg-gray-950 border-2 ${accent} rounded-2xl p-5 max-w-2xl w-full space-y-4`}>
         <div className="flex items-center justify-between">
-          <h3 className="text-lg font-semibold text-white">{t("Dr. found a polyp (AI missed it)")}</h3>
+          <h3 className="text-lg font-semibold text-white">
+            {mode === "dr_found" ? t("Dr. found a polyp (AI missed it)") : t("Mark AI detection as false positive")}
+          </h3>
           <button onClick={onClose} className="text-gray-500 hover:text-gray-300 text-sm">{t("Cancel")}</button>
         </div>
 
@@ -170,8 +179,13 @@ export default function FeedbackCapture({ video, caseId, getClip, onClose, onSav
 
         <p className="text-xs text-gray-500">
           {checking ? t("Checking what AI sees on this exact frame…") :
-            aiBoxes.length > 0 ? t("AI also detected {n} box(es) on this frame — check before saving.", { n: aiBoxes.length }) :
-            t("AI detected nothing on this exact frame — confirmed miss.")}
+            mode === "dr_found" ? (
+              aiBoxes.length > 0 ? t("AI also detected {n} box(es) on this frame — check before saving.", { n: aiBoxes.length }) :
+              t("AI detected nothing on this exact frame — confirmed miss.")
+            ) : (
+              aiBoxes.length > 0 ? t("AI currently shows {n} box(es) here — save to record this as a false alarm.", { n: aiBoxes.length }) :
+              t("AI shows nothing right now — if it flagged something moments ago, save anyway to record the false alarm.")
+            )}
         </p>
 
         <div className="space-y-2">
@@ -190,7 +204,7 @@ export default function FeedbackCapture({ video, caseId, getClip, onClose, onSav
 
         <div className="flex gap-3">
           <button onClick={handleSave} disabled={saving}
-            className="flex-1 py-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded-xl text-white font-medium transition-colors">
+            className={`flex-1 py-2.5 ${saveColor} disabled:opacity-50 rounded-xl text-white font-medium transition-colors`}>
             {saving ? t("Saving…") : t("Save")}
           </button>
           <button onClick={onClose} className="px-5 py-2.5 bg-gray-800 hover:bg-gray-700 rounded-xl text-white font-medium transition-colors">

@@ -47,7 +47,8 @@ export default function RealtimePlayer({
   const [lastError, setLastError] = useState("");
   const [duration, setDuration]   = useState(0);
   const [curTime, setCurTime]     = useState(0);
-  const [showCapture, setShowCapture] = useState(false);
+  const [showCapture, setShowCapture]     = useState(false);
+  const [showFPCapture, setShowFPCapture] = useState(false);
   const [feedbackRefreshKey, setFeedbackRefreshKey] = useState(0);
   const [videoEnded, setVideoEnded]   = useState(false);
   const msHistory = useRef<number[]>([]);
@@ -214,6 +215,17 @@ export default function RealtimePlayer({
     setCurTime(video.currentTime);
   }
 
+  // Restarts the current clip from the top — playback no longer loops on its
+  // own, so this is how staff re-watch it (e.g. right after it finished).
+  function replay() {
+    const video = videoRef.current;
+    if (!video) return;
+    setVideoEnded(false);
+    video.currentTime = 0;
+    setCurTime(0);
+    startLoop(video);
+  }
+
   function handleDrop(e: React.DragEvent) {
     e.preventDefault();
     setDragging(false);
@@ -309,91 +321,105 @@ export default function RealtimePlayer({
       )}
 
       {videoUrl && (
-        <>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <div className="space-y-1.5">
-              <p className="text-xs text-gray-500 uppercase tracking-wide">
-                {videoEnded ? t("Finished · {speed}x", { speed }) : t("Live · {speed}x · no lag", { speed })}
-              </p>
-              <div className="relative w-full rounded-xl overflow-hidden border border-gray-800 bg-black"
-                style={{ aspectRatio: "560/480" }}>
-                <video
-                  ref={videoRef}
-                  src={videoUrl}
-                  muted
-                  onCanPlay={handleVideoLoad}
-                  onTimeUpdate={handleTimeUpdate}
-                  onLoadedMetadata={handleVideoLoad}
-                  onEnded={() => { scanRef.current = false; setVideoEnded(true); }}
-                  className="absolute inset-0 w-full h-full object-cover"
-                />
+        <div className="grid grid-cols-1 lg:grid-cols-[1fr_360px] gap-4 items-start">
+          <div className="space-y-3 min-w-0">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <p className="text-xs text-gray-500 uppercase tracking-wide">
+                  {videoEnded ? t("Finished · {speed}x", { speed }) : t("Live · {speed}x · no lag", { speed })}
+                </p>
+                <div className="relative w-full rounded-xl overflow-hidden border border-gray-800 bg-black"
+                  style={{ aspectRatio: "560/480" }}>
+                  <video
+                    ref={videoRef}
+                    src={videoUrl}
+                    muted
+                    onCanPlay={handleVideoLoad}
+                    onTimeUpdate={handleTimeUpdate}
+                    onLoadedMetadata={handleVideoLoad}
+                    onEnded={() => { scanRef.current = false; setVideoEnded(true); }}
+                    className="absolute inset-0 w-full h-full object-cover"
+                  />
+                </div>
+              </div>
+              <div className="space-y-1.5">
+                <p className="text-xs text-gray-500 uppercase tracking-wide">
+                  {t("Detected · ~{avgMs}ms behind live", { avgMs: stats.avgMs || 250 })}
+                </p>
+                <div className="relative w-full rounded-xl overflow-hidden border border-gray-800 bg-black"
+                  style={{ aspectRatio: "560/480" }}>
+                  <canvas ref={analyzedRef} className="absolute inset-0 w-full h-full object-contain" />
+                </div>
               </div>
             </div>
+
+            {/* Seek — for lining up the exact moment before a manual capture */}
             <div className="space-y-1.5">
-              <p className="text-xs text-gray-500 uppercase tracking-wide">
-                {t("Detected · ~{avgMs}ms behind live", { avgMs: stats.avgMs || 250 })}
-              </p>
-              <div className="relative w-full rounded-xl overflow-hidden border border-gray-800 bg-black"
-                style={{ aspectRatio: "560/480" }}>
-                <canvas ref={analyzedRef} className="absolute inset-0 w-full h-full object-contain" />
+              <input
+                type="range" min={0} max={duration || 0} step={0.1} value={curTime}
+                onChange={(e) => seekTo(parseFloat(e.target.value))}
+                className="w-full"
+              />
+              <div className="flex items-center gap-2 text-xs">
+                <button onClick={() => seekTo(curTime - 3)} className="px-2.5 py-1 rounded-md bg-gray-800 hover:bg-gray-700 text-gray-300 font-mono transition-colors">{t("← 3s")}</button>
+                <button onClick={() => seekTo(curTime - 1)} className="px-2.5 py-1 rounded-md bg-gray-800 hover:bg-gray-700 text-gray-300 font-mono transition-colors">{t("← 1s")}</button>
+                <button onClick={replay} className="px-2.5 py-1 rounded-md bg-gray-800 hover:bg-gray-700 text-gray-300 font-medium transition-colors">{t("↺ Replay")}</button>
+                <span className="text-gray-500 font-mono">{curTime.toFixed(1)}s / {duration.toFixed(1)}s</span>
               </div>
             </div>
-          </div>
 
-          {/* Seek — for lining up the exact moment before a manual capture */}
-          <div className="space-y-1.5">
-            <input
-              type="range" min={0} max={duration || 0} step={0.1} value={curTime}
-              onChange={(e) => seekTo(parseFloat(e.target.value))}
-              className="w-full"
-            />
-            <div className="flex items-center gap-2 text-xs">
-              <button onClick={() => seekTo(curTime - 3)} className="px-2.5 py-1 rounded-md bg-gray-800 hover:bg-gray-700 text-gray-300 font-mono transition-colors">{t("← 3s")}</button>
-              <button onClick={() => seekTo(curTime - 1)} className="px-2.5 py-1 rounded-md bg-gray-800 hover:bg-gray-700 text-gray-300 font-mono transition-colors">{t("← 1s")}</button>
-              <span className="text-gray-500 font-mono">{curTime.toFixed(1)}s / {duration.toFixed(1)}s</span>
+            {/* Speed control */}
+            <div className="flex items-center gap-2 text-sm">
+              <span className="text-gray-500">{t("Playback speed")}</span>
+              <div className="flex gap-1">
+                {SPEEDS.map((s) => (
+                  <button
+                    key={s}
+                    onClick={() => setSpeed(s)}
+                    className={`px-2.5 py-1 rounded-md text-xs font-mono transition-colors ${
+                      speed === s ? "bg-green-600 text-white" : "bg-gray-800 text-gray-400 hover:bg-gray-700"
+                    }`}
+                  >
+                    {s}x
+                  </button>
+                ))}
+              </div>
+              <span className="text-gray-600 text-xs">
+                {t("slower playback = less motion between frames = the two panels drift apart less")}
+              </span>
             </div>
-          </div>
 
-          {/* Speed control */}
-          <div className="flex items-center gap-2 text-sm">
-            <span className="text-gray-500">{t("Playback speed")}</span>
-            <div className="flex gap-1">
-              {SPEEDS.map((s) => (
-                <button
-                  key={s}
-                  onClick={() => setSpeed(s)}
-                  className={`px-2.5 py-1 rounded-md text-xs font-mono transition-colors ${
-                    speed === s ? "bg-green-600 text-white" : "bg-gray-800 text-gray-400 hover:bg-gray-700"
-                  }`}
-                >
-                  {s}x
-                </button>
-              ))}
+            {/* Manual capture — the two cases auto-capture can't cover on its own:
+                a doctor pointing out something the model missed, or staff flagging
+                what the model is showing right now as wrong. Everything else shows
+                up on its own in the side panel, no button needed to go look for it. */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <button
+                onClick={() => setShowCapture(true)}
+                className="py-3 px-4 rounded-xl bg-emerald-700 hover:bg-emerald-600 text-white font-medium text-sm transition-colors"
+              >
+                {t("👁 Dr. found a polyp AI missed")}
+              </button>
+              <button
+                onClick={() => setShowFPCapture(true)}
+                className="py-3 px-4 rounded-xl bg-amber-700 hover:bg-amber-600 text-white font-medium text-sm transition-colors"
+              >
+                {t("🚫 Mark current AI box as false positive")}
+              </button>
             </div>
-            <span className="text-gray-600 text-xs">
-              {t("slower playback = less motion between frames = the two panels drift apart less")}
-            </span>
+
+            <button
+              onClick={() => { scanRef.current = false; setVideoUrl(null); }}
+              className="text-sm text-gray-500 hover:text-gray-300 transition-colors"
+            >
+              {t("← Load different video")}
+            </button>
           </div>
 
-          {/* One clear button for the one case that needs manual capture (AI never
-              triggered anything to auto-queue). Everything else shows up on its own
-              in the bars below, no button needed to go look for it. */}
-          <button
-            onClick={() => setShowCapture(true)}
-            className="w-full py-3 px-4 rounded-xl bg-emerald-700 hover:bg-emerald-600 text-white font-medium text-sm transition-colors"
-          >
-            {t("👁 Dr. found a polyp AI missed")}
-          </button>
-
-          <FeedbackPanel caseId={caseId} refreshSignal={feedbackRefreshKey} />
-
-          <button
-            onClick={() => { scanRef.current = false; setVideoUrl(null); }}
-            className="text-sm text-gray-500 hover:text-gray-300 transition-colors"
-          >
-            {t("← Load different video")}
-          </button>
-        </>
+          <div className="lg:sticky lg:top-4">
+            <FeedbackPanel caseId={caseId} refreshSignal={feedbackRefreshKey} />
+          </div>
+        </div>
       )}
 
       <p className="text-xs text-gray-600">
@@ -402,10 +428,21 @@ export default function RealtimePlayer({
 
       {showCapture && videoRef.current && (
         <FeedbackCapture
+          mode="dr_found"
           video={videoRef.current}
           caseId={caseId}
           getClip={getClip}
           onClose={() => setShowCapture(false)}
+          onSaved={() => setFeedbackRefreshKey((k) => k + 1)}
+        />
+      )}
+      {showFPCapture && videoRef.current && (
+        <FeedbackCapture
+          mode="false_positive"
+          video={videoRef.current}
+          caseId={caseId}
+          getClip={getClip}
+          onClose={() => setShowFPCapture(false)}
           onSaved={() => setFeedbackRefreshKey((k) => k + 1)}
         />
       )}

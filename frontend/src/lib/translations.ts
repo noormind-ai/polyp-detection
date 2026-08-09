@@ -164,4 +164,13 @@ export const FA: Record<string, string> = {
   "Green shows what the AI detected.": "سبز نشان‌دهنده تشخیص هوش مصنوعی است.",
   "Click inside the box to move it, or click empty space to draw a new one.": "برای جابه‌جایی، داخل کادر کلیک کنید؛ برای رسم کادر جدید، روی فضای خالی کلیک کنید.",
   "Finished · {speed}x": "پایان یافت · {speed}x",
+
+  // Replay + manual false-positive capture + side-panel false-positive bar
+  "↺ Replay": "↺ پخش دوباره",
+  "🚫 Mark current AI box as false positive": "🚫 علامت‌گذاری کادر فعلی هوش مصنوعی به‌عنوان هشدار کاذب",
+  "🚫 False positives": "🚫 هشدارهای کاذب",
+  "Mark AI detection as false positive": "علامت‌گذاری تشخیص هوش مصنوعی به‌عنوان هشدار کاذب",
+  "AI currently shows {n} box(es) here — save to record this as a false alarm.": "هوش مصنوعی هم‌اکنون {n} کادر اینجا نشان می‌دهد — برای ثبت این هشدار کاذب ذخیره کنید.",
+  "AI shows nothing right now — if it flagged something moments ago, save anyway to record the false alarm.": "هوش مصنوعی در حال حاضر چیزی نشان نمی‌دهد — اگر لحظاتی پیش چیزی را علامت زده بود، برای ثبت هشدار کاذب باز هم ذخیره کنید.",
+  "AI": "هوش مصنوعی",
 };
