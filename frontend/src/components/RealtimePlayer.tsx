@@ -2,25 +2,37 @@
 
 import { useEffect, useRef, useState } from "react";
 import DemoVideoPicker from "./DemoVideoPicker";
+import FeedbackCapture from "./FeedbackCapture";
+import ReviewQueue from "./ReviewQueue";
+import FeedbackGallery from "./FeedbackGallery";
 import { useLanguage } from "@/lib/i18n";
+import { useRollingClip } from "@/lib/useRollingClip";
 
+const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001";
 const API_WS = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001").replace(/^http/, "ws");
 const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 const INFER_TIMEOUT_MS = 6000;
 // Resize frames to this width before sending — faster inference, smaller payload
 const INFER_WIDTH = 320;
 const SPEEDS = [0.25, 0.5, 1, 1.5, 2];
+// Don't auto-capture the same ongoing detection every single frame — once a
+// polyp is flagged, wait this long before the next auto-capture so the
+// review queue fills with distinct moments, not near-duplicates.
+const AUTO_CAPTURE_COOLDOWN_MS = 4000;
 
 interface Box { bbox: [number, number, number, number]; conf: number; }
 interface Timing { recv_ms: number; modal_ms: number; total_ms: number; }
 
-export default function RealtimePlayer({ onStop, onActivity, wsPath = "/api/ws/infer" }: { onStop: () => void; onActivity?: () => void; wsPath?: string }) {
+export default function RealtimePlayer({
+  caseId, onStop, onActivity, wsPath = "/api/ws/infer",
+}: { caseId: string; onStop: () => void; onActivity?: () => void; wsPath?: string }) {
   const { t } = useLanguage();
   const WS_URL = `${API_WS}${wsPath}`;
   const videoRef    = useRef<HTMLVideoElement>(null);
   const analyzedRef = useRef<HTMLCanvasElement>(null); // last frame actually sent to the model, with boxes burned on
   const wsRef       = useRef<WebSocket | null>(null);
   const scanRef     = useRef(false); // capture loop running?
+  const lastAutoCaptureRef = useRef(0);
 
   // Pending response promise resolver — one in-flight request at a time
   const pendingRef = useRef<((v: { boxes: Box[]; timing: Timing } | null) => void) | null>(null);
@@ -31,11 +43,28 @@ export default function RealtimePlayer({ onStop, onActivity, wsPath = "/api/ws/i
   const [wsStatus, setWsStatus]   = useState<"connecting" | "open" | "error" | "closed">("connecting");
   const [closeCode, setCloseCode] = useState<number | null>(null);
   const [polyp, setPolyp]         = useState(false);
-  const [speed, setSpeed]         = useState(1);
+  const [speed, setSpeed]         = useState(0.5); // lower default — easier to catch a good moment on demo footage
   const [stats, setStats]         = useState({ sent: 0, received: 0, avgMs: 0 });
   const [lastError, setLastError] = useState("");
+  const [duration, setDuration]   = useState(0);
+  const [curTime, setCurTime]     = useState(0);
+  const [showCapture, setShowCapture] = useState(false);
+  const [showQueue, setShowQueue]     = useState(false);
+  const [showGallery, setShowGallery] = useState(false);
+  const [queueCount, setQueueCount]   = useState(0);
   const msHistory = useRef<number[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const { getClip } = useRollingClip(videoRef.current);
+
+  async function refreshQueueCount() {
+    try {
+      const res = await fetch(`${API}/api/feedback/queue?case_id=${caseId}`);
+      const data = await res.json();
+      setQueueCount(Array.isArray(data) ? data.length : 0);
+    } catch { /* non-critical */ }
+  }
+  useEffect(() => { refreshQueueCount(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // WebSocket — connect once on mount
   useEffect(() => {
@@ -109,6 +138,29 @@ export default function RealtimePlayer({ onStop, onActivity, wsPath = "/api/ws/i
 
   function updateBoxes(b: Box[]) { setPolyp(b.length > 0); }
 
+  // Auto-capture — the clean (no-overlay) frame that was already grabbed for
+  // inference, plus what the model saw, plus a rolling clip if available.
+  // Throttled so a polyp staying in view for a while doesn't flood the queue.
+  function maybeAutoCapture(cap: HTMLCanvasElement, boxes: Box[]) {
+    if (boxes.length === 0) return;
+    const now = Date.now();
+    if (now - lastAutoCaptureRef.current < AUTO_CAPTURE_COOLDOWN_MS) return;
+    lastAutoCaptureRef.current = now;
+
+    cap.toBlob(async (blob) => {
+      if (!blob) return;
+      const fd = new FormData();
+      fd.append("file", blob, "frame.jpg");
+      fd.append("ai_detections", JSON.stringify(boxes));
+      const clip = getClip();
+      if (clip) fd.append("video", clip, "clip.webm");
+      try {
+        await fetch(`${API}/api/feedback/${caseId}/auto-capture`, { method: "POST", body: fd });
+        refreshQueueCount();
+      } catch { /* best-effort — don't interrupt the live loop over this */ }
+    }, "image/jpeg", 0.85);
+  }
+
   // Live loop — send whatever frame is currently playing → wait for result → send next.
   // The video plays continuously (at the chosen speed); we just grab whatever frame is
   // current each time, same pattern as the live-camera mode.
@@ -150,6 +202,7 @@ export default function RealtimePlayer({ onStop, onActivity, wsPath = "/api/ws/i
       if (result) {
         updateBoxes(result.boxes);
         drawAnalyzedFrame(cap, result.boxes);
+        maybeAutoCapture(cap, result.boxes);
       }
     }
   }
@@ -157,7 +210,19 @@ export default function RealtimePlayer({ onStop, onActivity, wsPath = "/api/ws/i
   function handleVideoLoad() {
     const video = videoRef.current;
     if (!video) return;
+    setDuration(video.duration || 0);
     startLoop(video);
+  }
+
+  function handleTimeUpdate() {
+    if (videoRef.current) setCurTime(videoRef.current.currentTime);
+  }
+
+  function seekTo(newTime: number) {
+    const video = videoRef.current;
+    if (!video) return;
+    video.currentTime = Math.max(0, Math.min(duration, newTime));
+    setCurTime(video.currentTime);
   }
 
   function handleDrop(e: React.DragEvent) {
@@ -266,6 +331,8 @@ export default function RealtimePlayer({ onStop, onActivity, wsPath = "/api/ws/i
                   src={videoUrl}
                   muted
                   onCanPlay={handleVideoLoad}
+                  onTimeUpdate={handleTimeUpdate}
+                  onLoadedMetadata={handleVideoLoad}
                   className="absolute inset-0 w-full h-full object-cover"
                 />
               </div>
@@ -278,6 +345,20 @@ export default function RealtimePlayer({ onStop, onActivity, wsPath = "/api/ws/i
                 style={{ aspectRatio: "560/480" }}>
                 <canvas ref={analyzedRef} className="absolute inset-0 w-full h-full object-contain" />
               </div>
+            </div>
+          </div>
+
+          {/* Seek — for lining up the exact moment before a manual capture */}
+          <div className="space-y-1.5">
+            <input
+              type="range" min={0} max={duration || 0} step={0.1} value={curTime}
+              onChange={(e) => seekTo(parseFloat(e.target.value))}
+              className="w-full"
+            />
+            <div className="flex items-center gap-2 text-xs">
+              <button onClick={() => seekTo(curTime - 3)} className="px-2.5 py-1 rounded-md bg-gray-800 hover:bg-gray-700 text-gray-300 font-mono transition-colors">{t("← 3s")}</button>
+              <button onClick={() => seekTo(curTime - 1)} className="px-2.5 py-1 rounded-md bg-gray-800 hover:bg-gray-700 text-gray-300 font-mono transition-colors">{t("← 1s")}</button>
+              <span className="text-gray-500 font-mono">{curTime.toFixed(1)}s / {duration.toFixed(1)}s</span>
             </div>
           </div>
 
@@ -302,6 +383,33 @@ export default function RealtimePlayer({ onStop, onActivity, wsPath = "/api/ws/i
             </span>
           </div>
 
+          {/* Feedback capture — big, clearly-labeled buttons for use by staff in the room */}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2">
+            <button
+              onClick={() => setShowCapture(true)}
+              className="py-3 px-4 rounded-xl bg-emerald-700 hover:bg-emerald-600 text-white font-medium text-sm transition-colors"
+            >
+              {t("👁 Dr. found a polyp AI missed")}
+            </button>
+            <button
+              onClick={() => setShowQueue(true)}
+              className="relative py-3 px-4 rounded-xl bg-blue-700 hover:bg-blue-600 text-white font-medium text-sm transition-colors"
+            >
+              {t("📋 Review AI detections")}
+              {queueCount > 0 && (
+                <span className="absolute -top-2 -right-2 bg-red-600 text-white text-xs rounded-full w-6 h-6 flex items-center justify-center">
+                  {queueCount}
+                </span>
+              )}
+            </button>
+            <button
+              onClick={() => setShowGallery(true)}
+              className="py-3 px-4 rounded-xl bg-gray-800 hover:bg-gray-700 text-white font-medium text-sm transition-colors"
+            >
+              {t("🗂 Saved captures")}
+            </button>
+          </div>
+
           <button
             onClick={() => { scanRef.current = false; setVideoUrl(null); }}
             className="text-sm text-gray-500 hover:text-gray-300 transition-colors"
@@ -314,6 +422,26 @@ export default function RealtimePlayer({ onStop, onActivity, wsPath = "/api/ws/i
       <p className="text-xs text-gray-600">
         {t("Frames scaled to {width}px before sending · one frame in flight at a time", { width: INFER_WIDTH })}
       </p>
+
+      {showCapture && videoRef.current && (
+        <FeedbackCapture
+          video={videoRef.current}
+          caseId={caseId}
+          getClip={getClip}
+          onClose={() => setShowCapture(false)}
+          onSaved={() => {}}
+        />
+      )}
+      {showQueue && (
+        <ReviewQueue
+          caseId={caseId}
+          onClose={() => { setShowQueue(false); refreshQueueCount(); }}
+          onReviewed={refreshQueueCount}
+        />
+      )}
+      {showGallery && (
+        <FeedbackGallery caseId={caseId} onClose={() => setShowGallery(false)} />
+      )}
     </div>
   );
 }

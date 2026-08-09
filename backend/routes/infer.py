@@ -1,4 +1,5 @@
 import logging
+import secrets
 from pathlib import Path
 
 from fastapi import APIRouter, File, HTTPException, UploadFile, WebSocket
@@ -16,11 +17,17 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MAX_UPLOAD_MB = 500
 
 
+def _new_case_id() -> str:
+    """Random per-session study ID — never a patient name or MRN. Feedback
+    captures during this session are filed under this ID, not identifying info."""
+    return secrets.token_hex(4)  # e.g. "a1b2c3d4"
+
+
 @router.post("/session/start")
 async def session_start():
     try:
         await modal_client.warmup()
-        return {"status": "ready"}
+        return {"status": "ready", "case_id": _new_case_id()}
     except Exception as e:
         return JSONResponse(
             status_code=503,
