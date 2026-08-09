@@ -65,10 +65,12 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
   // status change) — once "saved"/"discarded"/skipped, mark it dismissed so
   // it moves from the active bar into the reviewed one instead of resurfacing.
   const dismissedRef = useRef<Set<string>>(new Set());
-  // Which dr_found filenames we've already seen — lets a genuinely NEW capture
-  // be told apart from "same list, routine poll" so only real new arrivals
-  // interrupt the current review.
-  const seenDrFoundRef = useRef<Set<string>>(new Set());
+  // Filenames (pending or dr_found) we've already seen — lets a genuinely NEW
+  // capture be told apart from "same list, routine poll" so only real new
+  // arrivals interrupt the current review. Covers both kinds: the nurse wants
+  // the review window to always show whichever image was captured most
+  // recently, AI-detected or doctor-found alike.
+  const seenRef = useRef<Set<string>>(new Set());
   const hasLoadedRef = useRef(false);
   // The box a pending item's editable box STARTED at (the AI's own detection,
   // or null) — compared against the current box at submit time to flag
@@ -109,8 +111,9 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
   }
 
   async function reconcile(lists: Lists) {
+    const active = [...lists.pending, ...lists.drFound.filter((e) => !dismissedRef.current.has(e.filename))];
     if (!hasLoadedRef.current) {
-      lists.drFound.forEach((e) => seenDrFoundRef.current.add(e.filename));
+      active.forEach((e) => seenRef.current.add(e.filename));
       hasLoadedRef.current = true;
       setCurrentKey((prev) => {
         if (prev && stillPresent(lists, prev)) return prev;
@@ -119,10 +122,10 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
       });
       return;
     }
-    const fresh = lists.drFound.filter((e) => !seenDrFoundRef.current.has(e.filename));
-    fresh.forEach((e) => seenDrFoundRef.current.add(e.filename));
+    const fresh = active.filter((e) => !seenRef.current.has(e.filename));
+    fresh.forEach((e) => seenRef.current.add(e.filename));
     if (fresh.length > 0) {
-      setCurrentKey(fresh.sort(byNewest)[0].filename); // interrupt — newest wins
+      setCurrentKey(fresh.sort(byNewest)[0].filename); // interrupt — always the latest capture wins
       return;
     }
     setCurrentKey((prev) => {
