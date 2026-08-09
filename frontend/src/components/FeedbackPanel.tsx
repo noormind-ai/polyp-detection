@@ -19,7 +19,6 @@ interface Entry {
 }
 
 type UserBox = [number, number, number, number];
-type Lists = { pending: Entry[]; drFound: Entry[]; reviewed: Entry[] };
 
 function parseSavedBox(e: Entry): UserBox | null {
   const vals = [e.bbox_x1, e.bbox_y1, e.bbox_x2, e.bbox_y2];
@@ -46,40 +45,32 @@ function clampBox(b: UserBox, w: number, h: number): UserBox {
 
 const byNewest = (a: Entry, b: Entry) => Number(b.timestamp || 0) - Number(a.timestamp || 0);
 
-// Two active queues (drive the review card) + one "already reviewed" history
-// split the same way. A brand new dr-found capture always jumps to the front
-// (FILO — newest reviewed first, then whatever it interrupted). Nothing else
-// steals focus from whatever the nurse is currently looking at.
+// Two fully independent lanes — separate queue, separate review window, no
+// interaction between them. AI-detected: stable, oldest-first, a new capture
+// never interrupts whatever's open. Dr-found: newest-first, a new capture
+// always takes over its own window immediately (doctor-caught misses are
+// urgent) — but this NEVER touches the AI-detected lane or vice versa.
 export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: string; refreshSignal?: number }) {
   const { t } = useLanguage();
   const [pending, setPending] = useState<Entry[]>([]);
   const [drFound, setDrFound] = useState<Entry[]>([]);
-  const [reviewed, setReviewed] = useState<Entry[]>([]); // confirmed + false_positive (former pending, resolved)
-  const [currentKey, setCurrentKey] = useState<string | null>(null); // filename
-  const [box, setBox] = useState<UserBox | null>(null);
-  const [dragMode, setDragMode] = useState<"move" | "draw" | null>(null);
-  const [dragStart, setDragStart] = useState<[number, number] | null>(null); // draw-mode anchor corner
-  const [moveOffset, setMoveOffset] = useState<[number, number] | null>(null); // move-mode: cursor offset from box top-left
-  const [imgNatural, setImgNatural] = useState({ w: 0, h: 0 });
-  // dr_found items never leave the drFound list just from being handled (no
-  // status change) — once "saved"/"discarded"/skipped, mark it dismissed so
-  // it moves from the active bar into the reviewed one instead of resurfacing.
+  const [reviewed, setReviewed] = useState<Entry[]>([]); // confirmed + false_positive (ex-pending)
+  const [pendingKey, setPendingKey] = useState<string | null>(null);
+  const [drKey, setDrKey] = useState<string | null>(null);
+  // dr_found items never leave the list just from being handled (no status
+  // change) — dismissing moves one from the active bar to the reviewed one.
   const dismissedRef = useRef<Set<string>>(new Set());
-  // Filenames (pending or dr_found) we've already seen — lets a genuinely NEW
-  // capture be told apart from "same list, routine poll" so only real new
-  // arrivals interrupt the current review. Covers both kinds: the nurse wants
-  // the review window to always show whichever image was captured most
-  // recently, AI-detected or doctor-found alike.
-  const seenRef = useRef<Set<string>>(new Set());
+  // Skip doesn't change anything server-side, so without this a skipped
+  // pending item would just resurface on the very next poll (still oldest).
+  const dismissedPendingRef = useRef<Set<string>>(new Set());
+  const seenDrRef = useRef<Set<string>>(new Set());
   const hasLoadedRef = useRef(false);
-  // The box a pending item's editable box STARTED at (the AI's own detection,
-  // or null) — compared against the current box at submit time to flag
-  // whether the nurse actually corrected it.
-  const originalBoxRef = useRef<UserBox | null>(null);
+
+  type Lists = { pending: Entry[]; drFound: Entry[]; reviewed: Entry[] };
 
   async function loadAll(): Promise<Lists> {
     try {
-      const [q, rest] = await Promise.all([
+      const [q, rest]: [Entry[], Entry[]] = await Promise.all([
         fetch(`${API}/api/feedback/queue?case_id=${caseId}`).then((r) => r.json()),
         fetch(`${API}/api/feedback/list?case_id=${caseId}`).then((r) => r.json()),
       ]);
@@ -92,56 +83,43 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
     }
   }
 
-  // Priority: an active (not-yet-dismissed) dr-found capture always outranks
-  // a pending AI detection, newest dr-found first.
-  function pickNext(lists: Lists, excludeFilename?: string): Entry | null {
-    const dr = lists.drFound
-      .filter((e) => !dismissedRef.current.has(e.filename) && e.filename !== excludeFilename)
-      .sort(byNewest);
-    if (dr.length) return dr[0];
-    const p = lists.pending.filter((e) => e.filename !== excludeFilename);
-    if (p.length) return p[0];
-    return null;
-  }
-
-  function stillPresent(lists: Lists, filename: string): boolean {
-    return lists.pending.some((e) => e.filename === filename)
-      || lists.drFound.some((e) => e.filename === filename)
-      || lists.reviewed.some((e) => e.filename === filename);
-  }
-
-  async function reconcile(lists: Lists) {
-    const active = [...lists.pending, ...lists.drFound.filter((e) => !dismissedRef.current.has(e.filename))];
-    if (!hasLoadedRef.current) {
-      active.forEach((e) => seenRef.current.add(e.filename));
-      hasLoadedRef.current = true;
-      setCurrentKey((prev) => {
-        if (prev && stillPresent(lists, prev)) return prev;
-        const next = pickNext(lists);
-        return next ? next.filename : null;
-      });
-      return;
-    }
-    const fresh = active.filter((e) => !seenRef.current.has(e.filename));
-    fresh.forEach((e) => seenRef.current.add(e.filename));
-    if (fresh.length > 0) {
-      setCurrentKey(fresh.sort(byNewest)[0].filename); // interrupt — always the latest capture wins
-      return;
-    }
-    setCurrentKey((prev) => {
-      if (prev && stillPresent(lists, prev)) return prev;
-      const next = pickNext(lists);
-      return next ? next.filename : null;
+  function reconcilePending(pendingList: Entry[], reviewedList: Entry[]) {
+    setPendingKey((prev) => {
+      if (prev && (pendingList.some((e) => e.filename === prev) || reviewedList.some((e) => e.filename === prev))) return prev;
+      return pendingList.find((e) => !dismissedPendingRef.current.has(e.filename))?.filename ?? null;
     });
   }
 
-  // Poll for new captures.
+  function reconcileDrFound(drList: Entry[]) {
+    const active = drList.filter((e) => !dismissedRef.current.has(e.filename));
+    if (!hasLoadedRef.current) {
+      active.forEach((e) => seenDrRef.current.add(e.filename));
+      hasLoadedRef.current = true;
+      setDrKey((prev) => {
+        if (prev && drList.some((e) => e.filename === prev)) return prev;
+        return [...active].sort(byNewest)[0]?.filename ?? null;
+      });
+      return;
+    }
+    const fresh = active.filter((e) => !seenDrRef.current.has(e.filename));
+    fresh.forEach((e) => seenDrRef.current.add(e.filename));
+    if (fresh.length > 0) {
+      setDrKey(fresh.sort(byNewest)[0].filename); // a new capture always takes over this window
+      return;
+    }
+    setDrKey((prev) => {
+      if (prev && drList.some((e) => e.filename === prev)) return prev;
+      return [...active].sort(byNewest)[0]?.filename ?? null;
+    });
+  }
+
   useEffect(() => {
     let alive = true;
     async function tick() {
       const lists = await loadAll();
       if (!alive) return;
-      await reconcile(lists);
+      reconcilePending(lists.pending, lists.reviewed);
+      reconcileDrFound(lists.drFound);
     }
     tick();
     const iv = setInterval(tick, 5000);
@@ -149,48 +127,185 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [caseId]);
 
-  // A capture elsewhere in the app bumps this — refresh right away instead of
-  // waiting for the next poll tick.
   useEffect(() => {
     if (refreshSignal === undefined) return;
     (async () => {
       const lists = await loadAll();
-      await reconcile(lists);
+      reconcilePending(lists.pending, lists.reviewed);
+      reconcileDrFound(lists.drFound);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshSignal]);
 
-  const current = useMemo(() => {
-    if (!currentKey) return null;
-    return [...pending, ...drFound, ...reviewed].find((e) => e.filename === currentKey) ?? null;
-  }, [currentKey, pending, drFound, reviewed]);
+  const pendingCurrent = useMemo(
+    () => [...pending, ...reviewed].find((e) => e.filename === pendingKey) ?? null,
+    [pendingKey, pending, reviewed],
+  );
+  const drCurrent = useMemo(() => drFound.find((e) => e.filename === drKey) ?? null, [drKey, drFound]);
 
-  const aiBoxes: Box[] = current ? (() => { try { return JSON.parse(current.ai_detections || "[]"); } catch { return []; } })() : [];
+  async function advancePending(entry: Entry, dismiss = false) {
+    if (dismiss) dismissedPendingRef.current.add(entry.filename);
+    const lists = await loadAll();
+    setPendingKey((prev) => {
+      const stillOpenElsewhere = prev && prev !== entry.filename
+        && (lists.pending.some((e) => e.filename === prev) || lists.reviewed.some((e) => e.filename === prev))
+        && !dismissedPendingRef.current.has(prev);
+      if (stillOpenElsewhere) return prev;
+      return lists.pending.find((e) => !dismissedPendingRef.current.has(e.filename) && e.filename !== entry.filename)?.filename ?? null;
+    });
+  }
 
-  // Reset the edit box only when the SELECTED entry changes — not on every
-  // poll refresh, which would otherwise wipe an in-progress edit every 5s.
-  // For a pending (AI-detected) item there's no saved box yet — start the
-  // editable box AT the AI's own first detection, so there's something to
-  // confirm-or-correct rather than an empty frame; originalBoxRef records
-  // that starting point so submitReview can tell whether the nurse actually
-  // changed it.
-  // Deliberately NOT resetting imgNatural here: the <img> node is reused across
-  // entries (only its src changes), and its own onLoad race-loses against this
-  // effect when the new image is cache-hot — resetting to 0 here would then
-  // clobber the correct value onLoad just set, permanently hiding every box
-  // overlay. Captured frames share one capture resolution, so the stale
-  // dimensions from the previous entry are harmless for the instant before
-  // the new onLoad fires anyway.
+  async function advanceDrFound(entry: Entry, dismiss: boolean) {
+    if (dismiss) dismissedRef.current.add(entry.filename);
+    const lists = await loadAll();
+    setDrKey((prev) => {
+      const stillOpenElsewhere = prev && prev !== entry.filename
+        && lists.drFound.some((e) => e.filename === prev) && !dismissedRef.current.has(prev);
+      if (stillOpenElsewhere) return prev;
+      const active = lists.drFound.filter((e) => !dismissedRef.current.has(e.filename) && e.filename !== entry.filename);
+      return [...active].sort(byNewest)[0]?.filename ?? null;
+    });
+  }
+
+  async function submitReview(entry: Entry, correct: boolean, box: UserBox | null, corrected: boolean) {
+    const fd = new FormData();
+    fd.append("correct", String(correct));
+    fd.append("noticed_first", "ai");
+    fd.append("box_corrected", String(corrected));
+    if (box) fd.append("bbox", JSON.stringify(box.map((n) => Math.round(n))));
+    await fetch(`${API}/api/feedback/${entry.case_id}/${entry.filename}/review`, { method: "POST", body: fd });
+    await advancePending(entry);
+  }
+
+  async function saveDrFoundBox(entry: Entry, box: UserBox | null) {
+    const fd = new FormData();
+    if (box) fd.append("bbox", JSON.stringify(box.map((n) => Math.round(n))));
+    await fetch(`${API}/api/feedback/${entry.case_id}/${entry.filename}`, { method: "PATCH", body: fd });
+    await advanceDrFound(entry, true);
+  }
+
+  async function deleteCapture(entry: Entry, lane: "pending" | "dr_found") {
+    await fetch(`${API}/api/feedback/${entry.case_id}/${entry.filename}`, { method: "DELETE" });
+    if (lane === "pending") await advancePending(entry, true);
+    else await advanceDrFound(entry, true);
+  }
+
+  const reviewedDrFound = drFound.filter((e) => dismissedRef.current.has(e.filename));
+
+  return (
+    <div className="space-y-5">
+      <Lane
+        title={t("🤖 AI detected")}
+        activeEntries={pending}
+        current={pendingCurrent}
+        onOpen={(e) => setPendingKey(e.filename)}
+        onDelete={(e) => deleteCapture(e, "pending")}
+        onSkip={(e) => advancePending(e, true)}
+        renderActions={(entry, box, corrected) => (
+          <div className="grid grid-cols-2 gap-2">
+            <button onClick={() => submitReview(entry, true, box, corrected)} className="py-2.5 bg-emerald-600 hover:bg-emerald-500 rounded-xl text-white font-medium text-sm transition-colors">
+              {t("✓ Confirm polyp")}
+            </button>
+            <button onClick={() => submitReview(entry, false, box, corrected)} className="py-2.5 bg-amber-600 hover:bg-amber-500 rounded-xl text-white font-medium text-sm transition-colors">
+              {t("✗ Not a polyp")}
+            </button>
+          </div>
+        )}
+        reviewedTitle={t("Already reviewed")}
+        reviewedEntries={reviewed}
+        onOpenReviewed={(e) => setPendingKey(e.filename)}
+      />
+
+      <Lane
+        title={t("👁 Dr. found, AI missed")}
+        activeEntries={drFound.filter((e) => !dismissedRef.current.has(e.filename))}
+        current={drCurrent}
+        onOpen={(e) => setDrKey(e.filename)}
+        onDelete={(e) => deleteCapture(e, "dr_found")}
+        onSkip={(e) => advanceDrFound(e, true)}
+        renderActions={(entry, box) => (
+          <div className="grid grid-cols-2 gap-2">
+            <button onClick={() => saveDrFoundBox(entry, box)} className="py-2.5 bg-sky-600 hover:bg-sky-500 rounded-xl text-white font-medium text-sm transition-colors">
+              {t("💾 Save")}
+            </button>
+            <button onClick={() => deleteCapture(entry, "dr_found")} className="py-2.5 bg-gray-800 hover:bg-gray-700 rounded-xl text-red-400 font-medium text-sm transition-colors">
+              {t("🗑 Discard")}
+            </button>
+          </div>
+        )}
+        reviewedTitle={t("Already reviewed")}
+        reviewedEntries={reviewedDrFound}
+        onOpenReviewed={(e) => setDrKey(e.filename)}
+      />
+    </div>
+  );
+}
+
+// One self-contained lane: bar of active thumbnails, its own review card
+// (with its own box-editing state), and a reviewed-history bar underneath.
+function Lane({
+  title, activeEntries, current, onOpen, onDelete, onSkip, renderActions, reviewedTitle, reviewedEntries, onOpenReviewed,
+}: {
+  title: string;
+  activeEntries: Entry[];
+  current: Entry | null;
+  onOpen: (e: Entry) => void;
+  onDelete: (e: Entry) => void;
+  onSkip: (e: Entry) => void;
+  renderActions: (entry: Entry, box: UserBox | null, corrected: boolean) => React.ReactNode;
+  reviewedTitle: string;
+  reviewedEntries: Entry[];
+  onOpenReviewed: (e: Entry) => void;
+}) {
+  const { t } = useLanguage();
+  return (
+    <div className="space-y-4 bg-gray-900/50 border border-gray-800 rounded-xl p-4">
+      <Bar title={title} entries={activeEntries} emptyText={t("Nothing yet.")} currentFilename={current?.filename ?? null} onOpen={onOpen} onDelete={onDelete} />
+
+      <div className="border-t border-gray-800 pt-4">
+        {current ? (
+          <ReviewCard entry={current} onSkip={() => onSkip(current)} renderActions={renderActions} />
+        ) : (
+          <p className="text-sm text-gray-500 text-center py-6">{t("✓ All caught up")}</p>
+        )}
+      </div>
+
+      {reviewedEntries.length > 0 && (
+        <div className="border-t border-gray-800 pt-3 space-y-2">
+          <p className="text-xs text-gray-500 uppercase tracking-wide">{reviewedTitle}</p>
+          <Bar title="" entries={reviewedEntries} emptyText="" currentFilename={current?.filename ?? null} onOpen={onOpenReviewed} onDelete={onDelete} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+// The image + editable box + action buttons for whichever entry is current in
+// its lane. Owns its own box-editing state so the two lanes never interfere.
+function ReviewCard({ entry, onSkip, renderActions }: {
+  entry: Entry;
+  onSkip: () => void;
+  renderActions: (entry: Entry, box: UserBox | null, corrected: boolean) => React.ReactNode;
+}) {
+  const { t } = useLanguage();
+  const [box, setBox] = useState<UserBox | null>(null);
+  const [dragMode, setDragMode] = useState<"move" | "draw" | null>(null);
+  const [dragStart, setDragStart] = useState<[number, number] | null>(null);
+  const [moveOffset, setMoveOffset] = useState<[number, number] | null>(null);
+  const [imgNatural, setImgNatural] = useState({ w: 0, h: 0 });
+  const originalBoxRef = useRef<UserBox | null>(null);
+
+  const aiBoxes: Box[] = useMemo(() => { try { return JSON.parse(entry.ai_detections || "[]"); } catch { return []; } }, [entry.ai_detections]);
+
+  // Reset only when the entry itself changes — not on re-renders from polling.
   useEffect(() => {
     setDragMode(null); setDragStart(null); setMoveOffset(null);
-    let initial: UserBox | null = current ? parseSavedBox(current) : null;
-    if (current && current.status === "pending" && !initial && aiBoxes.length > 0) {
-      initial = [...aiBoxes[0].bbox];
-    }
+    let initial = parseSavedBox(entry);
+    if (entry.status === "pending" && !initial && aiBoxes.length > 0) initial = [...aiBoxes[0].bbox];
     setBox(initial);
     originalBoxRef.current = initial;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentKey]);
+  }, [entry.filename]);
 
   function imgPos(e: React.MouseEvent<HTMLImageElement>): [number, number] {
     const img = e.currentTarget;
@@ -198,10 +313,6 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
     const scaleX = imgNatural.w / rect.width, scaleY = imgNatural.h / rect.height;
     return [(e.clientX - rect.left) * scaleX, (e.clientY - rect.top) * scaleY];
   }
-  // Shared by mousemove AND mouseup — resolving once more on release (using the
-  // release event's own coordinates) means the box always lands exactly where
-  // the cursor let go, even if the browser coalesced/dropped intermediate
-  // mousemove events during a fast drag (it does this routinely).
   function applyDrag(pt: [number, number], mode: "move" | "draw", startBox: UserBox | null, offset: [number, number] | null, anchor: [number, number] | null) {
     if (mode === "move" && startBox && offset) {
       const w = startBox[2] - startBox[0], h = startBox[3] - startBox[1];
@@ -231,170 +342,65 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
     setDragMode(null); setDragStart(null); setMoveOffset(null);
   }
 
-  async function advanceAfter(entry: Entry) {
-    if (entry.status === "dr_found") dismissedRef.current.add(entry.filename);
-    const lists = await loadAll();
-    const next = pickNext(lists, entry.filename);
-    setCurrentKey(next ? next.filename : null);
-  }
-
-  // noticed_first is always "ai" here — this queue only ever holds frames the
-  // AI itself flagged, so the AI is definitionally what triggered the capture.
-  async function submitReview(correct: boolean) {
-    if (!current || current.status !== "pending") return;
-    const rounded = box ? (box.map((n) => Math.round(n)) as UserBox) : null;
-    const origRounded = originalBoxRef.current ? (originalBoxRef.current.map((n) => Math.round(n)) as UserBox) : null;
-    const corrected = JSON.stringify(rounded) !== JSON.stringify(origRounded);
-    const fd = new FormData();
-    fd.append("correct", String(correct));
-    fd.append("noticed_first", "ai");
-    fd.append("box_corrected", String(corrected));
-    if (rounded) fd.append("bbox", JSON.stringify(rounded));
-    await fetch(`${API}/api/feedback/${current.case_id}/${current.filename}/review`, { method: "POST", body: fd });
-    await advanceAfter(current);
-  }
-
-  // Box is optional — saving with none clears any previously saved one (the
-  // backend's PATCH treats an absent bbox as "clear").
-  async function saveBox() {
-    if (!current || current.status === "pending") return;
-    const fd = new FormData();
-    if (box) fd.append("bbox", JSON.stringify(box.map((n) => Math.round(n))));
-    await fetch(`${API}/api/feedback/${current.case_id}/${current.filename}`, { method: "PATCH", body: fd });
-    await advanceAfter(current);
-  }
-
-  function skip() {
-    if (!current) return;
-    advanceAfter(current);
-  }
-
-  async function deleteCapture(entry: Entry) {
-    await fetch(`${API}/api/feedback/${entry.case_id}/${entry.filename}`, { method: "DELETE" });
-    await advanceAfter(entry);
-  }
-
-  const activeDrFound = drFound.filter((e) => !dismissedRef.current.has(e.filename));
-  const reviewedDrFound = drFound.filter((e) => dismissedRef.current.has(e.filename));
+  const rounded = box ? (box.map((n) => Math.round(n)) as UserBox) : null;
+  const origRounded = originalBoxRef.current ? (originalBoxRef.current.map((n) => Math.round(n)) as UserBox) : null;
+  const corrected = JSON.stringify(rounded) !== JSON.stringify(origRounded);
 
   return (
-    <div className="space-y-4 bg-gray-900/50 border border-gray-800 rounded-xl p-4">
-      <Bar
-        title={t("🤖 AI detected")}
-        entries={pending}
-        emptyText={t("Nothing yet.")}
-        currentKey={currentKey}
-        onOpen={(e) => setCurrentKey(e.filename)}
-        onDelete={deleteCapture}
-      />
-      <Bar
-        title={t("👁 Dr. found, AI missed")}
-        entries={activeDrFound}
-        emptyText={t("Nothing yet.")}
-        currentKey={currentKey}
-        onOpen={(e) => setCurrentKey(e.filename)}
-        onDelete={deleteCapture}
-      />
-
-      <div className="border-t border-gray-800 pt-4">
-        {!current ? (
-          <p className="text-sm text-gray-500 text-center py-6">{t("✓ All caught up")}</p>
-        ) : (
-          <div className="space-y-3">
-            <div className="flex items-center justify-end">
-              <button onClick={skip} className="text-xs text-gray-500 hover:text-gray-300 transition-colors">{t("Skip → next")}</button>
-            </div>
-
-            <div className="relative w-full max-w-xl mx-auto rounded-xl overflow-hidden border border-gray-800 bg-black">
-              <img
-                src={`${API}/api/feedback/${current.case_id}/image/${current.filename}`}
-                alt=""
-                draggable={false}
-                className="w-full h-auto block cursor-crosshair select-none"
-                onLoad={(e) => setImgNatural({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })}
-                onDragStart={(e) => e.preventDefault()}
-                onMouseDown={handleMouseDown}
-                onMouseMove={handleMouseMove}
-                onMouseUp={handleMouseUp}
-                onMouseLeave={handleMouseUp}
-              />
-              {imgNatural.w > 0 && aiBoxes.map((b, i) => {
-                const [x1, y1, x2, y2] = b.bbox;
-                const scaleX = 100 / imgNatural.w, scaleY = 100 / imgNatural.h;
-                return (
-                  <div key={i} className="absolute border-2 border-[#39ff14] pointer-events-none"
-                    style={{ left: `${x1 * scaleX}%`, top: `${y1 * scaleY}%`, width: `${(x2 - x1) * scaleX}%`, height: `${(y2 - y1) * scaleY}%` }} />
-                );
-              })}
-              {box && imgNatural.w > 0 && (() => {
-                const [x1, y1, x2, y2] = box;
-                const scaleX = 100 / imgNatural.w, scaleY = 100 / imgNatural.h;
-                return (
-                  <div className="absolute border-2 border-red-500 pointer-events-none"
-                    style={{ left: `${x1 * scaleX}%`, top: `${y1 * scaleY}%`, width: `${(x2 - x1) * scaleX}%`, height: `${(y2 - y1) * scaleY}%` }} />
-                );
-              })()}
-            </div>
-
-            {current.status === "pending" ? (
-              <div className="grid grid-cols-2 gap-2">
-                <button onClick={() => submitReview(true)} className="py-2.5 bg-emerald-600 hover:bg-emerald-500 rounded-xl text-white font-medium text-sm transition-colors">
-                  {t("✓ Confirm polyp")}
-                </button>
-                <button onClick={() => submitReview(false)} className="py-2.5 bg-amber-600 hover:bg-amber-500 rounded-xl text-white font-medium text-sm transition-colors">
-                  {t("✗ Not a polyp")}
-                </button>
-              </div>
-            ) : (
-              <div className="grid grid-cols-2 gap-2">
-                <button onClick={saveBox} className="py-2.5 bg-sky-600 hover:bg-sky-500 rounded-xl text-white font-medium text-sm transition-colors">
-                  {t("💾 Save")}
-                </button>
-                <button onClick={() => deleteCapture(current)} className="py-2.5 bg-gray-800 hover:bg-gray-700 rounded-xl text-red-400 font-medium text-sm transition-colors">
-                  {t("🗑 Discard")}
-                </button>
-              </div>
-            )}
-          </div>
-        )}
+    <div className="space-y-3">
+      <div className="flex items-center justify-end">
+        <button onClick={onSkip} className="text-xs text-gray-500 hover:text-gray-300 transition-colors">{t("Skip → next")}</button>
       </div>
 
-      <div className="border-t border-gray-800 pt-4 space-y-3">
-        <p className="text-xs text-gray-500 uppercase tracking-wide">{t("Already reviewed")}</p>
-        <Bar
-          title={t("🤖 AI detected")}
-          entries={reviewed}
-          emptyText={t("Nothing yet.")}
-          currentKey={currentKey}
-          onOpen={(e) => setCurrentKey(e.filename)}
-          onDelete={deleteCapture}
+      <div className="relative w-full max-w-xl mx-auto rounded-xl overflow-hidden border border-gray-800 bg-black">
+        <img
+          src={`${API}/api/feedback/${entry.case_id}/image/${entry.filename}`}
+          alt=""
+          draggable={false}
+          className="w-full h-auto block cursor-crosshair select-none"
+          onLoad={(e) => setImgNatural({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })}
+          onDragStart={(e) => e.preventDefault()}
+          onMouseDown={handleMouseDown}
+          onMouseMove={handleMouseMove}
+          onMouseUp={handleMouseUp}
+          onMouseLeave={handleMouseUp}
         />
-        <Bar
-          title={t("👁 Dr. found, AI missed")}
-          entries={reviewedDrFound}
-          emptyText={t("Nothing yet.")}
-          currentKey={currentKey}
-          onOpen={(e) => setCurrentKey(e.filename)}
-          onDelete={deleteCapture}
-        />
+        {imgNatural.w > 0 && aiBoxes.map((b, i) => {
+          const [x1, y1, x2, y2] = b.bbox;
+          const scaleX = 100 / imgNatural.w, scaleY = 100 / imgNatural.h;
+          return (
+            <div key={i} className="absolute border-2 border-[#39ff14] pointer-events-none"
+              style={{ left: `${x1 * scaleX}%`, top: `${y1 * scaleY}%`, width: `${(x2 - x1) * scaleX}%`, height: `${(y2 - y1) * scaleY}%` }} />
+          );
+        })}
+        {rounded && imgNatural.w > 0 && (() => {
+          const [x1, y1, x2, y2] = rounded;
+          const scaleX = 100 / imgNatural.w, scaleY = 100 / imgNatural.h;
+          return (
+            <div className="absolute border-2 border-red-500 pointer-events-none"
+              style={{ left: `${x1 * scaleX}%`, top: `${y1 * scaleY}%`, width: `${(x2 - x1) * scaleX}%`, height: `${(y2 - y1) * scaleY}%` }} />
+          );
+        })()}
       </div>
+
+      {renderActions(entry, rounded, corrected)}
     </div>
   );
 }
 
-function Bar({ title, entries, emptyText, currentKey, onOpen, onDelete }: {
-  title: string; entries: Entry[]; emptyText: string; currentKey: string | null;
+function Bar({ title, entries, emptyText, currentFilename, onOpen, onDelete }: {
+  title: string; entries: Entry[]; emptyText: string; currentFilename: string | null;
   onOpen: (e: Entry) => void; onDelete: (e: Entry) => void;
 }) {
   return (
     <div className="space-y-2">
-      <p className="text-sm text-gray-300 font-medium">{title} {entries.length > 0 && `(${entries.length})`}</p>
+      {title && <p className="text-sm text-gray-300 font-medium">{title} {entries.length > 0 && `(${entries.length})`}</p>}
       {entries.length === 0 ? (
-        <p className="text-xs text-gray-600">{emptyText}</p>
+        emptyText && <p className="text-xs text-gray-600">{emptyText}</p>
       ) : (
         <div className="flex gap-2 overflow-x-auto pb-1">
           {entries.map((e) => {
-            const isCurrent = currentKey === e.filename;
+            const isCurrent = currentFilename === e.filename;
             return (
               <div key={e.filename} className="relative flex-shrink-0">
                 <button
