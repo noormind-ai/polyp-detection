@@ -1,6 +1,9 @@
 "use client";
 
 import { DEMO_VIDEOS } from "./demos";
+import { useLanguage } from "@/lib/i18n";
+
+const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 
 interface Props {
   onSelect: (file: string) => void;
@@ -8,9 +11,10 @@ interface Props {
 }
 
 export default function DemoVideoPicker({ onSelect, loading }: Props) {
+  const { t } = useLanguage();
   return (
     <div className="space-y-3">
-      <p className="text-sm text-gray-400">Choose a demo clip to run inference on:</p>
+      <p className="text-sm text-gray-400">{t("Choose a demo clip to run inference on:")}</p>
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
         {DEMO_VIDEOS.map((v) => {
           const isLoading = loading === v.file;
@@ -25,8 +29,8 @@ export default function DemoVideoPicker({ onSelect, loading }: Props) {
               <div className="aspect-video w-full bg-gray-800 flex items-center justify-center overflow-hidden">
                 {v.thumbnail ? (
                   <img
-                    src={`/demos/${v.thumbnail}`}
-                    alt={v.label}
+                    src={`${BASE_PATH}/demos/${v.thumbnail}`}
+                    alt={t(v.label)}
                     className="w-full h-full object-cover"
                   />
                 ) : (
@@ -40,9 +44,9 @@ export default function DemoVideoPicker({ onSelect, loading }: Props) {
               {/* Label */}
               <div className="px-3 py-2">
                 <p className="text-sm text-white font-medium group-hover:text-blue-300 transition-colors">
-                  {isLoading ? "Loading…" : v.label}
+                  {isLoading ? t("Loading…") : t(v.label)}
                 </p>
-                <p className="text-xs text-gray-500 mt-0.5">{v.description}</p>
+                <p className="text-xs text-gray-500 mt-0.5">{t(v.description)}</p>
               </div>
             </button>
           );

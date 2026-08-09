@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useLanguage } from "@/lib/i18n";
 
 const STEPS = [
   { at: 0,     text: "Requesting A100 GPU on Modal..." },
@@ -12,7 +13,12 @@ const STEPS = [
 ];
 
 export default function WarmupPanel() {
+  const { t } = useLanguage();
   const [logs, setLogs] = useState<string[]>([]);
+  const cliCommand = "modal app stop polyp-detection";
+  const [footerBefore, footerAfter] = t(
+    "Cold start ~60s · Warm starts are instant · Stop with modal app stop polyp-detection"
+  ).split(cliCommand);
 
   useEffect(() => {
     const timers = STEPS.map(({ at, text }) =>
@@ -27,7 +33,7 @@ export default function WarmupPanel() {
     <div className="space-y-5 py-4">
       <div>
         <div className="flex justify-between text-sm text-gray-400 mb-2">
-          <span>Starting GPU session</span>
+          <span>{t("Starting GPU session")}</span>
           <span>{progress}%</span>
         </div>
         <div className="h-1.5 bg-gray-800 rounded-full overflow-hidden">
@@ -44,7 +50,7 @@ export default function WarmupPanel() {
             <span className="text-gray-600 select-none mr-2">
               {String(i + 1).padStart(2, "0")}
             </span>
-            {line}
+            {t(line)}
           </div>
         ))}
         {logs.length > 0 && (
@@ -53,8 +59,9 @@ export default function WarmupPanel() {
       </div>
 
       <p className="text-xs text-gray-600 text-center">
-        Cold start ~60s · Warm starts are instant · Stop with{" "}
-        <code className="text-gray-500">modal app stop polyp-detection</code>
+        {footerBefore}
+        <code className="text-gray-500">{cliCommand}</code>
+        {footerAfter}
       </p>
     </div>
   );

@@ -2,8 +2,10 @@
 
 import { useEffect, useRef, useState } from "react";
 import DemoVideoPicker from "./DemoVideoPicker";
+import { useLanguage } from "@/lib/i18n";
 
 const API_WS = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001").replace(/^http/, "ws");
+const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 const INFER_TIMEOUT_MS = 6000;
 // Resize frames to this width before sending — faster inference, smaller payload
 const INFER_WIDTH = 320;
@@ -13,6 +15,7 @@ interface Box { bbox: [number, number, number, number]; conf: number; }
 interface Timing { recv_ms: number; modal_ms: number; total_ms: number; }
 
 export default function RealtimePlayer({ onStop, onActivity, wsPath = "/api/ws/infer" }: { onStop: () => void; onActivity?: () => void; wsPath?: string }) {
+  const { t } = useLanguage();
   const WS_URL = `${API_WS}${wsPath}`;
   const videoRef    = useRef<HTMLVideoElement>(null);
   const analyzedRef = useRef<HTMLCanvasElement>(null); // last frame actually sent to the model, with boxes burned on
@@ -25,7 +28,8 @@ export default function RealtimePlayer({ onStop, onActivity, wsPath = "/api/ws/i
   const [videoUrl, setVideoUrl]   = useState<string | null>(null);
   const [tab, setTab]             = useState<"upload" | "demo">("demo");
   const [dragging, setDragging]   = useState(false);
-  const [wsStatus, setWsStatus]   = useState<string>("connecting");
+  const [wsStatus, setWsStatus]   = useState<"connecting" | "open" | "error" | "closed">("connecting");
+  const [closeCode, setCloseCode] = useState<number | null>(null);
   const [polyp, setPolyp]         = useState(false);
   const [speed, setSpeed]         = useState(1);
   const [stats, setStats]         = useState({ sent: 0, received: 0, avgMs: 0 });
@@ -40,7 +44,7 @@ export default function RealtimePlayer({ onStop, onActivity, wsPath = "/api/ws/i
 
     ws.onopen  = () => setWsStatus("open");
     ws.onerror = () => setWsStatus("error");
-    ws.onclose = (e) => { setWsStatus(`closed (${e.code})`); pendingRef.current?.(null); };
+    ws.onclose = (e) => { setWsStatus("closed"); setCloseCode(e.code); pendingRef.current?.(null); };
 
     ws.onmessage = (e) => {
       let data: unknown;
@@ -93,7 +97,7 @@ export default function RealtimePlayer({ onStop, onActivity, wsPath = "/api/ws/i
       ctx.lineWidth   = 3;
       ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
       ctx.shadowBlur  = 0;
-      const label = `polyp  ${Math.round(det.conf * 100)}%`;
+      const label = t("polyp  {conf}%", { conf: Math.round(det.conf * 100) });
       ctx.font = "bold 13px monospace";
       const tw = ctx.measureText(label).width;
       ctx.fillStyle = "#39ff14";
@@ -170,10 +174,14 @@ export default function RealtimePlayer({ onStop, onActivity, wsPath = "/api/ws/i
 
   function handleDemoSelect(filename: string) {
     scanRef.current = false;
-    setVideoUrl(`/demos/${filename}`);
+    setVideoUrl(`${BASE_PATH}/demos/${filename}`);
   }
 
   const wsOk = wsStatus === "open";
+  const wsStatusText =
+    wsStatus === "open" ? t("connected") :
+    wsStatus === "closed" ? t("closed ({code})", { code: closeCode ?? "" }) :
+    t(wsStatus);
 
   return (
     <div className="space-y-3">
@@ -182,25 +190,25 @@ export default function RealtimePlayer({ onStop, onActivity, wsPath = "/api/ws/i
         <div className="flex items-center gap-3">
           <span className={`flex items-center gap-1.5 ${wsOk ? "text-green-400" : "text-yellow-400"}`}>
             <span className={`w-2 h-2 rounded-full inline-block ${wsOk ? "bg-green-400 animate-pulse" : "bg-yellow-400"}`} />
-            {wsOk ? "connected" : wsStatus}
+            {wsStatusText}
           </span>
-          {polyp && <span className="text-[#39ff14] font-medium animate-pulse">Polyp detected</span>}
+          {polyp && <span className="text-[#39ff14] font-medium animate-pulse">{t("Polyp detected")}</span>}
         </div>
-        <button onClick={onStop} className="text-sm text-red-400 hover:text-red-300 transition-colors">Stop</button>
+        <button onClick={onStop} className="text-sm text-red-400 hover:text-red-300 transition-colors">{t("Stop")}</button>
       </div>
 
       {/* Debug panel */}
       <div className="bg-gray-900 border border-gray-800 rounded-lg px-3 py-2 font-mono text-xs grid grid-cols-2 gap-x-6 gap-y-0.5">
-        <span className="text-gray-500">Frames sent</span>
+        <span className="text-gray-500">{t("Frames sent")}</span>
         <span className="text-white">{stats.sent}</span>
-        <span className="text-gray-500">Responses back</span>
+        <span className="text-gray-500">{t("Responses back")}</span>
         <span className="text-white">{stats.received}</span>
-        <span className="text-gray-500">Modal latency (avg)</span>
+        <span className="text-gray-500">{t("Modal latency (avg)")}</span>
         <span className={stats.avgMs > 800 ? "text-red-400" : "text-green-400"}>
-          {stats.avgMs > 0 ? `${stats.avgMs} ms` : "—"}
+          {stats.avgMs > 0 ? t("{avgMs} ms", { avgMs: stats.avgMs }) : "—"}
         </span>
         {lastError && <>
-          <span className="text-gray-500">Error</span>
+          <span className="text-gray-500">{t("Error")}</span>
           <span className="text-red-400 truncate">{lastError}</span>
         </>}
       </div>
@@ -209,17 +217,17 @@ export default function RealtimePlayer({ onStop, onActivity, wsPath = "/api/ws/i
         <div className="space-y-4">
           {/* Tab switcher */}
           <div className="flex gap-1 border-b border-gray-800">
-            {(["demo", "upload"] as const).map((t) => (
+            {(["demo", "upload"] as const).map((tabKey) => (
               <button
-                key={t}
-                onClick={() => setTab(t)}
+                key={tabKey}
+                onClick={() => setTab(tabKey)}
                 className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px ${
-                  tab === t
+                  tab === tabKey
                     ? "border-green-500 text-white"
                     : "border-transparent text-gray-500 hover:text-gray-300"
                 }`}
               >
-                {t === "upload" ? "Upload video" : "Try a demo"}
+                {tabKey === "upload" ? t("Upload video") : t("Try a demo")}
               </button>
             ))}
           </div>
@@ -235,8 +243,8 @@ export default function RealtimePlayer({ onStop, onActivity, wsPath = "/api/ws/i
               }`}
             >
               <input ref={fileInputRef} type="file" accept="video/*" className="hidden" onChange={handleFile} />
-              <p className="text-gray-200 text-lg">Drop a colonoscopy video here</p>
-              <p className="text-gray-500 text-sm mt-2">Plays continuously — right panel shows the last analyzed frame</p>
+              <p className="text-gray-200 text-lg">{t("Drop a colonoscopy video here")}</p>
+              <p className="text-gray-500 text-sm mt-2">{t("Plays continuously — right panel shows the last analyzed frame")}</p>
             </div>
           )}
 
@@ -250,7 +258,7 @@ export default function RealtimePlayer({ onStop, onActivity, wsPath = "/api/ws/i
         <>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div className="space-y-1.5">
-              <p className="text-xs text-gray-500 uppercase tracking-wide">Live · {speed}x · no lag</p>
+              <p className="text-xs text-gray-500 uppercase tracking-wide">{t("Live · {speed}x · no lag", { speed })}</p>
               <div className="relative w-full rounded-xl overflow-hidden border border-gray-800 bg-black"
                 style={{ aspectRatio: "560/480" }}>
                 <video
@@ -264,7 +272,7 @@ export default function RealtimePlayer({ onStop, onActivity, wsPath = "/api/ws/i
             </div>
             <div className="space-y-1.5">
               <p className="text-xs text-gray-500 uppercase tracking-wide">
-                Detected · ~{stats.avgMs || 250}ms behind live
+                {t("Detected · ~{avgMs}ms behind live", { avgMs: stats.avgMs || 250 })}
               </p>
               <div className="relative w-full rounded-xl overflow-hidden border border-gray-800 bg-black"
                 style={{ aspectRatio: "560/480" }}>
@@ -275,7 +283,7 @@ export default function RealtimePlayer({ onStop, onActivity, wsPath = "/api/ws/i
 
           {/* Speed control */}
           <div className="flex items-center gap-2 text-sm">
-            <span className="text-gray-500">Playback speed</span>
+            <span className="text-gray-500">{t("Playback speed")}</span>
             <div className="flex gap-1">
               {SPEEDS.map((s) => (
                 <button
@@ -290,7 +298,7 @@ export default function RealtimePlayer({ onStop, onActivity, wsPath = "/api/ws/i
               ))}
             </div>
             <span className="text-gray-600 text-xs">
-              slower playback = less motion between frames = the two panels drift apart less
+              {t("slower playback = less motion between frames = the two panels drift apart less")}
             </span>
           </div>
 
@@ -298,13 +306,13 @@ export default function RealtimePlayer({ onStop, onActivity, wsPath = "/api/ws/i
             onClick={() => { scanRef.current = false; setVideoUrl(null); }}
             className="text-sm text-gray-500 hover:text-gray-300 transition-colors"
           >
-            ← Load different video
+            {t("← Load different video")}
           </button>
         </>
       )}
 
       <p className="text-xs text-gray-600">
-        Frames scaled to {INFER_WIDTH}px before sending · one frame in flight at a time
+        {t("Frames scaled to {width}px before sending · one frame in flight at a time", { width: INFER_WIDTH })}
       </p>
     </div>
   );
