@@ -3,8 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import DemoVideoPicker from "./DemoVideoPicker";
 import FeedbackCapture from "./FeedbackCapture";
-import ReviewQueue from "./ReviewQueue";
-import FeedbackGallery from "./FeedbackGallery";
+import FeedbackPanel from "./FeedbackPanel";
 import { useLanguage } from "@/lib/i18n";
 import { useRollingClip } from "@/lib/useRollingClip";
 
@@ -43,28 +42,17 @@ export default function RealtimePlayer({
   const [wsStatus, setWsStatus]   = useState<"connecting" | "open" | "error" | "closed">("connecting");
   const [closeCode, setCloseCode] = useState<number | null>(null);
   const [polyp, setPolyp]         = useState(false);
-  const [speed, setSpeed]         = useState(0.5); // lower default — easier to catch a good moment on demo footage
+  const [speed, setSpeed]         = useState(0.25); // slow default — demo footage moves too fast to react to otherwise
   const [stats, setStats]         = useState({ sent: 0, received: 0, avgMs: 0 });
   const [lastError, setLastError] = useState("");
   const [duration, setDuration]   = useState(0);
   const [curTime, setCurTime]     = useState(0);
   const [showCapture, setShowCapture] = useState(false);
-  const [showQueue, setShowQueue]     = useState(false);
-  const [showGallery, setShowGallery] = useState(false);
-  const [queueCount, setQueueCount]   = useState(0);
+  const [feedbackRefreshKey, setFeedbackRefreshKey] = useState(0);
   const msHistory = useRef<number[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const { getClip } = useRollingClip(videoRef.current);
-
-  async function refreshQueueCount() {
-    try {
-      const res = await fetch(`${API}/api/feedback/queue?case_id=${caseId}`);
-      const data = await res.json();
-      setQueueCount(Array.isArray(data) ? data.length : 0);
-    } catch { /* non-critical */ }
-  }
-  useEffect(() => { refreshQueueCount(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // WebSocket — connect once on mount
   useEffect(() => {
@@ -156,7 +144,7 @@ export default function RealtimePlayer({
       if (clip) fd.append("video", clip, "clip.webm");
       try {
         await fetch(`${API}/api/feedback/${caseId}/auto-capture`, { method: "POST", body: fd });
-        refreshQueueCount();
+        setFeedbackRefreshKey((k) => k + 1);
       } catch { /* best-effort — don't interrupt the live loop over this */ }
     }, "image/jpeg", 0.85);
   }
@@ -383,32 +371,17 @@ export default function RealtimePlayer({
             </span>
           </div>
 
-          {/* Feedback capture — big, clearly-labeled buttons for use by staff in the room */}
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2">
-            <button
-              onClick={() => setShowCapture(true)}
-              className="py-3 px-4 rounded-xl bg-emerald-700 hover:bg-emerald-600 text-white font-medium text-sm transition-colors"
-            >
-              {t("👁 Dr. found a polyp AI missed")}
-            </button>
-            <button
-              onClick={() => setShowQueue(true)}
-              className="relative py-3 px-4 rounded-xl bg-blue-700 hover:bg-blue-600 text-white font-medium text-sm transition-colors"
-            >
-              {t("📋 Review AI detections")}
-              {queueCount > 0 && (
-                <span className="absolute -top-2 -right-2 bg-red-600 text-white text-xs rounded-full w-6 h-6 flex items-center justify-center">
-                  {queueCount}
-                </span>
-              )}
-            </button>
-            <button
-              onClick={() => setShowGallery(true)}
-              className="py-3 px-4 rounded-xl bg-gray-800 hover:bg-gray-700 text-white font-medium text-sm transition-colors"
-            >
-              {t("🗂 Saved captures")}
-            </button>
-          </div>
+          {/* One clear button for the one case that needs manual capture (AI never
+              triggered anything to auto-queue). Everything else shows up on its own
+              in the bars below, no button needed to go look for it. */}
+          <button
+            onClick={() => setShowCapture(true)}
+            className="w-full py-3 px-4 rounded-xl bg-emerald-700 hover:bg-emerald-600 text-white font-medium text-sm transition-colors"
+          >
+            {t("👁 Dr. found a polyp AI missed")}
+          </button>
+
+          <FeedbackPanel key={feedbackRefreshKey} caseId={caseId} />
 
           <button
             onClick={() => { scanRef.current = false; setVideoUrl(null); }}
@@ -429,18 +402,8 @@ export default function RealtimePlayer({
           caseId={caseId}
           getClip={getClip}
           onClose={() => setShowCapture(false)}
-          onSaved={() => {}}
+          onSaved={() => setFeedbackRefreshKey((k) => k + 1)}
         />
-      )}
-      {showQueue && (
-        <ReviewQueue
-          caseId={caseId}
-          onClose={() => { setShowQueue(false); refreshQueueCount(); }}
-          onReviewed={refreshQueueCount}
-        />
-      )}
-      {showGallery && (
-        <FeedbackGallery caseId={caseId} onClose={() => setShowGallery(false)} />
       )}
     </div>
   );

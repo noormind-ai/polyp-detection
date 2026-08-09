@@ -146,4 +146,14 @@ export const FA: Record<string, string> = {
   "🗂 Saved captures": "🗂 تصاویر ذخیره‌شده",
   "📋 Review queue": "📋 صف بررسی",
   "🗂 Feedback mode": "🗂 حالت بازخورد",
+
+  // Inline always-visible feedback panel (bars of thumbnails, no button-to-open)
+  "🤖 AI detected — needs review": "🤖 هوش مصنوعی تشخیص داد — نیاز به بررسی",
+  "👁 Dr. found, AI missed": "👁 پزشک یافت، هوش مصنوعی تشخیص نداد",
+  "Nothing yet.": "هنوز چیزی نیست.",
+  "Review AI detection": "بررسی تشخیص هوش مصنوعی",
+  "✓ Dr. already found this": "✓ پزشک قبلاً این را یافته بود",
+  "✓ Dr. didn't notice at first — confirms correct": "✓ پزشک ابتدا متوجه نشده بود — درستی را تأیید می‌کند",
+  "✗ Dr. says this is wrong": "✗ پزشک می‌گوید این نادرست است",
+  "Green box is the AI's detection. Drag on the image to correct it if needed.": "کادر سبز، تشخیص هوش مصنوعی است. در صورت نیاز با کشیدن روی تصویر آن را اصلاح کنید.",
 };
