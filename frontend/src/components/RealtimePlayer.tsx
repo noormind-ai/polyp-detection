@@ -344,7 +344,7 @@ export default function RealtimePlayer({
       )}
 
       {videoUrl && (
-        <div className="grid grid-cols-1 lg:grid-cols-[1fr_360px] gap-4 items-start">
+        <div className="space-y-4">
           <div className="space-y-3 min-w-0">
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div className="space-y-1.5">
@@ -430,9 +430,7 @@ export default function RealtimePlayer({
             </button>
           </div>
 
-          <div className="lg:sticky lg:top-4">
-            <FeedbackPanel caseId={caseId} refreshSignal={feedbackRefreshKey} />
-          </div>
+          <FeedbackPanel caseId={caseId} refreshSignal={feedbackRefreshKey} />
         </div>
       )}
 

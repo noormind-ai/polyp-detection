@@ -182,4 +182,5 @@ export const FA: Record<string, string> = {
   "💾 Save": "💾 ذخیره",
   "🗑 Discard": "🗑 حذف",
   "Already reviewed": "بررسی‌شده",
+  "Queue": "صف",
 };

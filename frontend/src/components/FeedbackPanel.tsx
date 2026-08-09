@@ -193,7 +193,7 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
   const reviewedDrFound = drFound.filter((e) => dismissedRef.current.has(e.filename));
 
   return (
-    <div className="space-y-5">
+    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-start">
       <Lane
         title={t("🤖 AI detected")}
         activeEntries={pending}
@@ -260,20 +260,21 @@ function Lane({
   const { t } = useLanguage();
   return (
     <div className="space-y-4 bg-gray-900/50 border border-gray-800 rounded-xl p-4">
-      <Bar title={title} entries={activeEntries} emptyText={t("Nothing yet.")} currentFilename={current?.filename ?? null} onOpen={onOpen} onDelete={onDelete} />
+      <p className="text-sm text-gray-300 font-medium">{title}</p>
 
-      <div className="border-t border-gray-800 pt-4">
-        {current ? (
-          <ReviewCard entry={current} onSkip={() => onSkip(current)} renderActions={renderActions} />
-        ) : (
-          <p className="text-sm text-gray-500 text-center py-6">{t("✓ All caught up")}</p>
-        )}
+      {current ? (
+        <ReviewCard entry={current} onSkip={() => onSkip(current)} renderActions={renderActions} />
+      ) : (
+        <p className="text-sm text-gray-500 text-center py-6">{t("✓ All caught up")}</p>
+      )}
+
+      <div className="border-t border-gray-800 pt-3">
+        <Bar title={t("Queue")} entries={activeEntries} emptyText={t("Nothing yet.")} currentFilename={current?.filename ?? null} onOpen={onOpen} onDelete={onDelete} />
       </div>
 
       {reviewedEntries.length > 0 && (
         <div className="border-t border-gray-800 pt-3 space-y-2">
-          <p className="text-xs text-gray-500 uppercase tracking-wide">{reviewedTitle}</p>
-          <Bar title="" entries={reviewedEntries} emptyText="" currentFilename={current?.filename ?? null} onOpen={onOpenReviewed} onDelete={onDelete} />
+          <Bar title={reviewedTitle} entries={reviewedEntries} emptyText="" currentFilename={current?.filename ?? null} onOpen={onOpenReviewed} onDelete={onDelete} />
         </div>
       )}
     </div>
