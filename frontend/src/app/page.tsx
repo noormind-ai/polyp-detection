@@ -6,8 +6,6 @@ import WarmupPanel from "@/components/WarmupPanel";
 import VideoPlayer from "@/components/VideoPlayer";
 import RealtimePlayer from "@/components/RealtimePlayer";
 import LiveCameraPlayer from "@/components/LiveCameraPlayer";
-import ReviewQueue from "@/components/ReviewQueue";
-import FeedbackGallery from "@/components/FeedbackGallery";
 import { useLanguage } from "@/lib/i18n";
 
 type Stage = "idle" | "warming" | "ready" | "processing" | "done";
@@ -47,8 +45,6 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [stopping, setStopping] = useState(false);
   const [caseId, setCaseId] = useState<string | null>(null);
-  const [showFeedbackQueue, setShowFeedbackQueue] = useState(false);
-  const [showFeedbackGallery, setShowFeedbackGallery] = useState(false);
   const gtInputRef = useRef<HTMLInputElement>(null);
   const lastActiveRef = useRef<number>(Date.now());
 
@@ -170,18 +166,6 @@ export default function Home() {
           </p>
         </div>
         <div className="flex gap-2 flex-shrink-0 flex-wrap justify-end">
-          <button
-            onClick={() => setShowFeedbackQueue(true)}
-            className="text-sm px-3 py-2 rounded-lg border border-gray-700 text-gray-400 hover:text-gray-200 hover:border-gray-500 transition-colors"
-          >
-            {t("📋 Review queue")}
-          </button>
-          <button
-            onClick={() => setShowFeedbackGallery(true)}
-            className="text-sm px-3 py-2 rounded-lg border border-gray-700 text-gray-400 hover:text-gray-200 hover:border-gray-500 transition-colors"
-          >
-            {t("🗂 Feedback mode")}
-          </button>
           <a href="/" className="text-sm px-3 py-2 rounded-lg border border-gray-700 text-gray-400 hover:text-gray-200 hover:border-gray-500 transition-colors">
             {t("Home")}
           </a>
@@ -193,15 +177,6 @@ export default function Home() {
           </button>
         </div>
       </div>
-
-      {/* Feedback mode is available any time, independent of an active GPU session —
-          reviews/browses across every case, not just the current one. */}
-      {showFeedbackQueue && (
-        <ReviewQueue onClose={() => setShowFeedbackQueue(false)} onReviewed={() => {}} />
-      )}
-      {showFeedbackGallery && (
-        <FeedbackGallery onClose={() => setShowFeedbackGallery(false)} />
-      )}
 
       {stage === "idle" && (
         <div className="flex flex-col items-center justify-center py-24 gap-6">
