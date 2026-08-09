@@ -18,7 +18,7 @@ interface Entry {
   bbox_y2?: string;
 }
 
-type Kind = "pending" | "dr_found" | "false_positive";
+type Kind = "pending" | "dr_found";
 type UserBox = [number, number, number, number];
 
 function keyOf(kind: Kind, filename: string) { return `${kind}:${filename}`; }
@@ -46,73 +46,63 @@ function clampBox(b: UserBox, w: number, h: number): UserBox {
   return [x1, y1, x2, y2];
 }
 
-// Always-visible feedback panel — three bars of everything captured (AI-flagged
-// needing a yes/no from staff; doctor-flagged frames the AI missed; and manually
-// flagged false alarms), plus one inline review card (not a popup) that walks
-// through them one at a time. Submitting/saving/deleting/skipping the current
-// one auto-advances to the next so a nurse can work a whole queue without
-// re-clicking a thumbnail each time.
+// Two labeled queues of thumbnails, plus one inline review card that walks
+// through them one at a time — deliberately minimal, no popups, no
+// explanatory copy. Acting on the current one (or skipping/discarding it)
+// auto-advances to the next so a nurse can work straight through.
 export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: string; refreshSignal?: number }) {
   const { t } = useLanguage();
   const [pending, setPending] = useState<Entry[]>([]);
   const [drFound, setDrFound] = useState<Entry[]>([]);
-  const [falsePos, setFalsePos] = useState<Entry[]>([]);
   const [currentKey, setCurrentKey] = useState<string | null>(null);
   const [box, setBox] = useState<UserBox | null>(null);
   const [dragMode, setDragMode] = useState<"move" | "draw" | null>(null);
   const [dragStart, setDragStart] = useState<[number, number] | null>(null); // draw-mode anchor corner
   const [moveOffset, setMoveOffset] = useState<[number, number] | null>(null); // move-mode: cursor offset from box top-left
   const [imgNatural, setImgNatural] = useState({ w: 0, h: 0 });
-  // dr_found/false_positive items never leave the backend queue just from being
-  // looked at (no further "reviewed" status to move them to) — track locally
-  // which ones the nurse already stepped past this session, so auto-advance
-  // doesn't loop on the same one forever.
+  // dr_found items never leave the backend list just from being looked at —
+  // track locally which ones the nurse already stepped past this session, so
+  // auto-advance doesn't loop on the same one forever.
   const dismissedRef = useRef<Set<string>>(new Set());
   // The box a pending item's editable box STARTED at (the AI's own detection,
   // or null) — compared against the current box at submit time to flag
   // whether the nurse actually corrected it.
   const originalBoxRef = useRef<UserBox | null>(null);
 
-  type Lists = { pending: Entry[]; drFound: Entry[]; falsePos: Entry[] };
+  type Lists = { pending: Entry[]; drFound: Entry[] };
 
   async function loadAll(): Promise<Lists> {
     try {
-      const [q, d, f] = await Promise.all([
+      const [q, d] = await Promise.all([
         fetch(`${API}/api/feedback/queue?case_id=${caseId}`).then((r) => r.json()),
         fetch(`${API}/api/feedback/list?status=dr_found&case_id=${caseId}`).then((r) => r.json()),
-        fetch(`${API}/api/feedback/list?status=false_positive&case_id=${caseId}`).then((r) => r.json()),
       ]);
-      setPending(q); setDrFound(d); setFalsePos(f);
-      return { pending: q, drFound: d, falsePos: f };
+      setPending(q); setDrFound(d);
+      return { pending: q, drFound: d };
     } catch {
-      return { pending, drFound, falsePos };
+      return { pending, drFound };
     }
   }
 
-  // Priority order: dr_found (doctor caught something the AI missed — the
-  // most clinically important gap) outranks pending (AI-detected, needs a
-  // yes/no), which outranks false_positive (already resolved, just needs
-  // filing/correcting when someone gets to it).
+  // Priority: a doctor-found miss always jumps to the front — it's the more
+  // clinically important gap. Within that group, newest capture first (so a
+  // just-captured one is reviewed right away); once handled, whichever was
+  // next-newest naturally becomes the new front of the queue.
   function pickNext(lists: Lists, excludeKey?: string): { kind: Kind; entry: Entry } | null {
-    const notDismissed = (kind: Kind, entry: Entry) => !dismissedRef.current.has(keyOf(kind, entry.filename)) && keyOf(kind, entry.filename) !== excludeKey;
-    const byTimestamp = (a: Entry, b: Entry) => Number(a.timestamp || 0) - Number(b.timestamp || 0);
-
-    const dr = lists.drFound.filter((e) => notDismissed("dr_found", e)).sort(byTimestamp);
+    const dr = lists.drFound
+      .filter((e) => !dismissedRef.current.has(keyOf("dr_found", e.filename)) && keyOf("dr_found", e.filename) !== excludeKey)
+      .sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0));
     if (dr.length) return { kind: "dr_found", entry: dr[0] };
 
-    const p = lists.pending.filter((e) => notDismissed("pending", e));
+    const p = lists.pending.filter((e) => keyOf("pending", e.filename) !== excludeKey);
     if (p.length) return { kind: "pending", entry: p[0] };
-
-    const fp = lists.falsePos.filter((e) => notDismissed("false_positive", e)).sort(byTimestamp);
-    if (fp.length) return { kind: "false_positive", entry: fp[0] };
 
     return null;
   }
 
   function stillPresent(lists: Lists, key: string): boolean {
     return lists.pending.some((e) => keyOf("pending", e.filename) === key)
-      || lists.drFound.some((e) => keyOf("dr_found", e.filename) === key)
-      || lists.falsePos.some((e) => keyOf("false_positive", e.filename) === key);
+      || lists.drFound.some((e) => keyOf("dr_found", e.filename) === key);
   }
 
   // Poll for new captures. Only auto-pick a "current" entry when there isn't
@@ -135,8 +125,8 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [caseId]);
 
-  // A save/capture elsewhere in the app (auto-capture, manual dr-found/FP save)
-  // bumps this — refresh right away instead of waiting for the next poll tick.
+  // A capture elsewhere in the app bumps this — refresh right away instead of
+  // waiting for the next poll tick.
   useEffect(() => {
     if (refreshSignal === undefined) return;
     (async () => {
@@ -155,10 +145,10 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
     const sep = currentKey.indexOf(":");
     const kind = currentKey.slice(0, sep) as Kind;
     const filename = currentKey.slice(sep + 1);
-    const list = kind === "pending" ? pending : kind === "dr_found" ? drFound : falsePos;
+    const list = kind === "pending" ? pending : drFound;
     const entry = list.find((e) => e.filename === filename);
     return entry ? { kind, entry } : null;
-  }, [currentKey, pending, drFound, falsePos]);
+  }, [currentKey, pending, drFound]);
 
   const aiBoxes: Box[] = current ? (() => { try { return JSON.parse(current.entry.ai_detections || "[]"); } catch { return []; } })() : [];
 
@@ -227,35 +217,36 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
   }
 
   async function advanceAfter(kind: Kind, filename: string) {
-    if (kind !== "pending") dismissedRef.current.add(keyOf(kind, filename));
+    if (kind === "dr_found") dismissedRef.current.add(keyOf(kind, filename));
     const lists = await loadAll();
     const next = pickNext(lists, keyOf(kind, filename));
     setCurrentKey(next ? keyOf(next.kind, next.entry.filename) : null);
   }
 
-  async function submitReview(correct: boolean, noticedFirst: "dr" | "ai") {
+  // noticed_first is always "ai" here — this queue only ever holds frames the
+  // AI itself flagged, so the AI is definitionally what triggered the capture.
+  async function submitReview(correct: boolean) {
     if (!current || current.kind !== "pending") return;
     const rounded = box ? (box.map((n) => Math.round(n)) as UserBox) : null;
     const origRounded = originalBoxRef.current ? (originalBoxRef.current.map((n) => Math.round(n)) as UserBox) : null;
     const corrected = JSON.stringify(rounded) !== JSON.stringify(origRounded);
     const fd = new FormData();
     fd.append("correct", String(correct));
-    fd.append("noticed_first", noticedFirst);
+    fd.append("noticed_first", "ai");
     fd.append("box_corrected", String(corrected));
     if (rounded) fd.append("bbox", JSON.stringify(rounded));
     await fetch(`${API}/api/feedback/${current.entry.case_id}/${current.entry.filename}/review`, { method: "POST", body: fd });
     await advanceAfter("pending", current.entry.filename);
   }
 
-  // Box is optional here — saving with no box clears any previously saved one
-  // (the backend's PATCH treats an absent bbox as "clear"), so this doubles as
-  // the "remove the box" action, not just "add/adjust one".
+  // Box is optional — saving with none clears any previously saved one (the
+  // backend's PATCH treats an absent bbox as "clear").
   async function saveBox() {
-    if (!current || current.kind === "pending") return;
+    if (!current || current.kind !== "dr_found") return;
     const fd = new FormData();
     if (box) fd.append("bbox", JSON.stringify(box.map((n) => Math.round(n))));
     await fetch(`${API}/api/feedback/${current.entry.case_id}/${current.entry.filename}`, { method: "PATCH", body: fd });
-    await advanceAfter(current.kind, current.entry.filename);
+    await advanceAfter("dr_found", current.entry.filename);
   }
 
   function skip() {
@@ -271,7 +262,7 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
   return (
     <div className="space-y-4 bg-gray-900/50 border border-gray-800 rounded-xl p-4">
       <Bar
-        title={t("🤖 AI detected — needs review")}
+        title={t("🤖 AI detected")}
         entries={pending}
         kind="pending"
         emptyText={t("Nothing yet.")}
@@ -288,26 +279,13 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
         onOpen={(e) => setCurrentKey(keyOf("dr_found", e.filename))}
         onDelete={(e) => deleteCapture("dr_found", e)}
       />
-      <Bar
-        title={t("🚫 False positives")}
-        entries={falsePos}
-        kind="false_positive"
-        emptyText={t("Nothing yet.")}
-        currentKey={currentKey}
-        onOpen={(e) => setCurrentKey(keyOf("false_positive", e.filename))}
-        onDelete={(e) => deleteCapture("false_positive", e)}
-      />
 
       <div className="border-t border-gray-800 pt-4">
         {!current ? (
-          <p className="text-sm text-gray-500 text-center py-6">{t("✓ All caught up — nothing waiting for review.")}</p>
+          <p className="text-sm text-gray-500 text-center py-6">{t("✓ All caught up")}</p>
         ) : (
           <div className="space-y-3">
-            <div className="flex items-center justify-between">
-              <h3 className="text-sm font-medium text-gray-300">
-                {current.kind === "pending" ? t("Review AI detection") :
-                  current.kind === "dr_found" ? t("Dr. found, AI missed") : t("False alarms")}
-              </h3>
+            <div className="flex items-center justify-end">
               <button onClick={skip} className="text-xs text-gray-500 hover:text-gray-300 transition-colors">{t("Skip → next")}</button>
             </div>
 
@@ -329,9 +307,7 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
                 const scaleX = 100 / imgNatural.w, scaleY = 100 / imgNatural.h;
                 return (
                   <div key={i} className="absolute border-2 border-[#39ff14] pointer-events-none"
-                    style={{ left: `${x1 * scaleX}%`, top: `${y1 * scaleY}%`, width: `${(x2 - x1) * scaleX}%`, height: `${(y2 - y1) * scaleY}%` }}>
-                    <span className="absolute -top-5 left-0 text-[10px] text-[#39ff14] font-mono">{Math.round(b.conf * 100)}%</span>
-                  </div>
+                    style={{ left: `${x1 * scaleX}%`, top: `${y1 * scaleY}%`, width: `${(x2 - x1) * scaleX}%`, height: `${(y2 - y1) * scaleY}%` }} />
                 );
               })}
               {box && imgNatural.w > 0 && (() => {
@@ -344,34 +320,25 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
               })()}
             </div>
 
-            <div className="text-xs text-gray-500 space-y-0.5">
-              {aiBoxes.length > 0 && <p>{t("Green shows what the AI detected.")}</p>}
-              <p>{t("Click inside the box to move it, or click empty space to draw a new one.")}</p>
-            </div>
-            {box && (
-              <button onClick={() => setBox(null)} className="text-xs text-gray-500 hover:text-gray-300 transition-colors">{t("Clear box")}</button>
-            )}
-
             {current.kind === "pending" ? (
-              <div className="grid grid-cols-1 gap-2">
-                <button onClick={() => submitReview(true, "dr")} className="py-2.5 bg-emerald-600 hover:bg-emerald-500 rounded-xl text-white font-medium text-sm transition-colors">
-                  {t("✓ Dr. already found this")}
+              <div className="grid grid-cols-2 gap-2">
+                <button onClick={() => submitReview(true)} className="py-2.5 bg-emerald-600 hover:bg-emerald-500 rounded-xl text-white font-medium text-sm transition-colors">
+                  {t("✓ Confirm polyp")}
                 </button>
-                <button onClick={() => submitReview(true, "ai")} className="py-2.5 bg-sky-600 hover:bg-sky-500 rounded-xl text-white font-medium text-sm transition-colors">
-                  {t("✓ Dr. didn't notice at first — confirms correct")}
-                </button>
-                <button onClick={() => submitReview(false, "ai")} className="py-2.5 bg-amber-600 hover:bg-amber-500 rounded-xl text-white font-medium text-sm transition-colors">
-                  {t("✗ Dr. says this is wrong")}
+                <button onClick={() => submitReview(false)} className="py-2.5 bg-amber-600 hover:bg-amber-500 rounded-xl text-white font-medium text-sm transition-colors">
+                  {t("✗ Not a polyp")}
                 </button>
               </div>
             ) : (
-              <button onClick={saveBox} className="w-full py-2.5 bg-sky-600 hover:bg-sky-500 rounded-xl text-white font-medium text-sm transition-colors">
-                {t("Save box")}
-              </button>
+              <div className="grid grid-cols-2 gap-2">
+                <button onClick={saveBox} className="py-2.5 bg-sky-600 hover:bg-sky-500 rounded-xl text-white font-medium text-sm transition-colors">
+                  {t("💾 Save")}
+                </button>
+                <button onClick={() => deleteCapture(current.kind, current.entry)} className="py-2.5 bg-gray-800 hover:bg-gray-700 rounded-xl text-red-400 font-medium text-sm transition-colors">
+                  {t("🗑 Discard")}
+                </button>
+              </div>
             )}
-            <button onClick={() => deleteCapture(current.kind, current.entry)} className="w-full text-xs text-red-400 hover:text-red-300 transition-colors py-1">
-              {t("Delete this capture")}
-            </button>
           </div>
         )}
       </div>

@@ -173,4 +173,12 @@ export const FA: Record<string, string> = {
   "AI currently shows {n} box(es) here — save to record this as a false alarm.": "هوش مصنوعی هم‌اکنون {n} کادر اینجا نشان می‌دهد — برای ثبت این هشدار کاذب ذخیره کنید.",
   "AI shows nothing right now — if it flagged something moments ago, save anyway to record the false alarm.": "هوش مصنوعی در حال حاضر چیزی نشان نمی‌دهد — اگر لحظاتی پیش چیزی را علامت زده بود، برای ثبت هشدار کاذب باز هم ذخیره کنید.",
   "AI": "هوش مصنوعی",
+
+  // Simplified 2-queue panel: compact labels, minimal chrome
+  "🤖 AI detected": "🤖 هوش مصنوعی تشخیص داد",
+  "✓ All caught up": "✓ همه بررسی شد",
+  "✓ Confirm polyp": "✓ تأیید پولیپ",
+  "✗ Not a polyp": "✗ پولیپ نیست",
+  "💾 Save": "💾 ذخیره",
+  "🗑 Discard": "🗑 حذف",
 };

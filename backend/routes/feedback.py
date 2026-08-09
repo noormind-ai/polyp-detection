@@ -175,42 +175,6 @@ async def dr_found_capture(
     return {"filename": filename}
 
 
-@router.post("/feedback/{case_id}/false-positive/capture")
-async def false_positive_capture(
-    case_id: str,
-    file: UploadFile = File(...),
-    bbox: Optional[str] = Form(default=None),
-    ai_detections: Optional[str] = Form(default=None),
-    video: Optional[UploadFile] = File(default=None),
-):
-    """Manual capture — staff flags what the AI is showing right now as wrong,
-    on the spot, without waiting for auto-capture + review."""
-    image_bytes = await file.read()
-    if not image_bytes:
-        raise HTTPException(status_code=400, detail="empty image")
-    video_bytes = await video.read() if video else None
-    filename, ts, has_video = _save_capture(case_id, image_bytes, video_bytes)
-
-    x1 = y1 = x2 = y2 = ""
-    if bbox:
-        try:
-            coords = json.loads(bbox)
-            if len(coords) == 4:
-                x1, y1, x2, y2 = coords
-        except (ValueError, TypeError):
-            log.warning("false_positive_capture: could not parse bbox %r", bbox)
-
-    rows = _read_manifest()
-    rows.append({
-        "case_id": case_id, "filename": filename, "has_video": has_video,
-        "timestamp": ts, "source": "manual", "status": "false_positive", "noticed_first": "",
-        "bbox_x1": x1, "bbox_y1": y1, "bbox_x2": x2, "bbox_y2": y2,
-        "ai_detections": ai_detections or "", "box_corrected": "",
-    })
-    _write_manifest(rows)
-    return {"filename": filename}
-
-
 @router.get("/feedback/queue")
 async def get_queue(case_id: Optional[str] = None):
     """Pending auto-captures awaiting review, oldest first. Pass case_id to

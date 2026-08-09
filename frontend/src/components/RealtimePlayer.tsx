@@ -130,7 +130,7 @@ export default function RealtimePlayer({
   // right now (staff can scrub the seek bar above first to line up an exact
   // moment) and drops it straight into the side-panel queue. Any box
   // drawing/correction happens there, not in a popup.
-  function captureManual(kind: "dr_found" | "false_positive") {
+  function captureDrFound() {
     const video = videoRef.current;
     if (!video || !video.videoWidth) return;
     const cap = document.createElement("canvas");
@@ -144,9 +144,8 @@ export default function RealtimePlayer({
       fd.append("ai_detections", JSON.stringify(lastBoxesRef.current));
       const clip = getClip();
       if (clip) fd.append("video", clip, "clip.webm");
-      const endpoint = kind === "dr_found" ? "dr-found/capture" : "false-positive/capture";
       try {
-        await fetch(`${API}/api/feedback/${caseId}/${endpoint}`, { method: "POST", body: fd });
+        await fetch(`${API}/api/feedback/${caseId}/dr-found/capture`, { method: "POST", body: fd });
         setFeedbackRefreshKey((k) => k + 1);
       } catch { /* best-effort */ }
     }, "image/jpeg", 0.9);
@@ -413,24 +412,15 @@ export default function RealtimePlayer({
               </span>
             </div>
 
-            {/* Manual capture — the two cases auto-capture can't cover on its own:
-                a doctor pointing out something the model missed, or staff flagging
-                what the model is showing right now as wrong. Everything else shows
-                up on its own in the side panel, no button needed to go look for it. */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <button
-                onClick={() => captureManual("dr_found")}
-                className="py-3 px-4 rounded-xl bg-emerald-700 hover:bg-emerald-600 text-white font-medium text-sm transition-colors"
-              >
-                {t("👁 Dr. found a polyp AI missed")}
-              </button>
-              <button
-                onClick={() => captureManual("false_positive")}
-                className="py-3 px-4 rounded-xl bg-amber-700 hover:bg-amber-600 text-white font-medium text-sm transition-colors"
-              >
-                {t("🚫 Mark current AI box as false positive")}
-              </button>
-            </div>
+            {/* The one case auto-capture can't cover on its own: a doctor pointing
+                out something the model missed. Everything else shows up on its
+                own in the side panel, no button needed to go look for it. */}
+            <button
+              onClick={captureDrFound}
+              className="w-full py-3 px-4 rounded-xl bg-emerald-700 hover:bg-emerald-600 text-white font-medium text-sm transition-colors"
+            >
+              {t("👁 Dr. found a polyp AI missed")}
+            </button>
 
             <button
               onClick={() => { scanRef.current = false; setVideoUrl(null); }}
