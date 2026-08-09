@@ -89,16 +89,24 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
     }
   }
 
+  // Priority order: dr_found (doctor caught something the AI missed — the
+  // most clinically important gap) outranks pending (AI-detected, needs a
+  // yes/no), which outranks false_positive (already resolved, just needs
+  // filing/correcting when someone gets to it).
   function pickNext(lists: Lists, excludeKey?: string): { kind: Kind; entry: Entry } | null {
-    const p = lists.pending.filter((e) => keyOf("pending", e.filename) !== excludeKey);
+    const notDismissed = (kind: Kind, entry: Entry) => !dismissedRef.current.has(keyOf(kind, entry.filename)) && keyOf(kind, entry.filename) !== excludeKey;
+    const byTimestamp = (a: Entry, b: Entry) => Number(a.timestamp || 0) - Number(b.timestamp || 0);
+
+    const dr = lists.drFound.filter((e) => notDismissed("dr_found", e)).sort(byTimestamp);
+    if (dr.length) return { kind: "dr_found", entry: dr[0] };
+
+    const p = lists.pending.filter((e) => notDismissed("pending", e));
     if (p.length) return { kind: "pending", entry: p[0] };
-    const rest: Array<{ kind: Kind; entry: Entry }> = [
-      ...lists.drFound.map((entry) => ({ kind: "dr_found" as Kind, entry })),
-      ...lists.falsePos.map((entry) => ({ kind: "false_positive" as Kind, entry })),
-    ]
-      .filter(({ kind, entry }) => !dismissedRef.current.has(keyOf(kind, entry.filename)) && keyOf(kind, entry.filename) !== excludeKey)
-      .sort((a, b) => Number(a.entry.timestamp || 0) - Number(b.entry.timestamp || 0));
-    return rest.length ? rest[0] : null;
+
+    const fp = lists.falsePos.filter((e) => notDismissed("false_positive", e)).sort(byTimestamp);
+    if (fp.length) return { kind: "false_positive", entry: fp[0] };
+
+    return null;
   }
 
   function stillPresent(lists: Lists, key: string): boolean {

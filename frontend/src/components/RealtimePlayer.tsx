@@ -2,7 +2,6 @@
 
 import { useEffect, useRef, useState } from "react";
 import DemoVideoPicker from "./DemoVideoPicker";
-import FeedbackCapture from "./FeedbackCapture";
 import FeedbackPanel from "./FeedbackPanel";
 import { useLanguage } from "@/lib/i18n";
 import { useRollingClip } from "@/lib/useRollingClip";
@@ -47,12 +46,11 @@ export default function RealtimePlayer({
   const [lastError, setLastError] = useState("");
   const [duration, setDuration]   = useState(0);
   const [curTime, setCurTime]     = useState(0);
-  const [showCapture, setShowCapture]     = useState(false);
-  const [showFPCapture, setShowFPCapture] = useState(false);
   const [feedbackRefreshKey, setFeedbackRefreshKey] = useState(0);
   const [videoEnded, setVideoEnded]   = useState(false);
   const msHistory = useRef<number[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const lastBoxesRef = useRef<Box[]>([]); // AI's most recent detections — attached as context to manual captures
 
   const { getClip } = useRollingClip(videoRef.current);
 
@@ -126,7 +124,33 @@ export default function RealtimePlayer({
     }
   }
 
-  function updateBoxes(b: Box[]) { setPolyp(b.length > 0); }
+  function updateBoxes(b: Box[]) { setPolyp(b.length > 0); lastBoxesRef.current = b; }
+
+  // Instant, no-dialog manual capture — grabs whatever frame is on screen
+  // right now (staff can scrub the seek bar above first to line up an exact
+  // moment) and drops it straight into the side-panel queue. Any box
+  // drawing/correction happens there, not in a popup.
+  function captureManual(kind: "dr_found" | "false_positive") {
+    const video = videoRef.current;
+    if (!video || !video.videoWidth) return;
+    const cap = document.createElement("canvas");
+    cap.width = video.videoWidth;
+    cap.height = video.videoHeight;
+    cap.getContext("2d")!.drawImage(video, 0, 0);
+    cap.toBlob(async (blob) => {
+      if (!blob) return;
+      const fd = new FormData();
+      fd.append("file", blob, "frame.jpg");
+      fd.append("ai_detections", JSON.stringify(lastBoxesRef.current));
+      const clip = getClip();
+      if (clip) fd.append("video", clip, "clip.webm");
+      const endpoint = kind === "dr_found" ? "dr-found/capture" : "false-positive/capture";
+      try {
+        await fetch(`${API}/api/feedback/${caseId}/${endpoint}`, { method: "POST", body: fd });
+        setFeedbackRefreshKey((k) => k + 1);
+      } catch { /* best-effort */ }
+    }, "image/jpeg", 0.9);
+  }
 
   // Auto-capture — the clean (no-overlay) frame that was already grabbed for
   // inference, plus what the model saw, plus a rolling clip if available.
@@ -395,13 +419,13 @@ export default function RealtimePlayer({
                 up on its own in the side panel, no button needed to go look for it. */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <button
-                onClick={() => setShowCapture(true)}
+                onClick={() => captureManual("dr_found")}
                 className="py-3 px-4 rounded-xl bg-emerald-700 hover:bg-emerald-600 text-white font-medium text-sm transition-colors"
               >
                 {t("👁 Dr. found a polyp AI missed")}
               </button>
               <button
-                onClick={() => setShowFPCapture(true)}
+                onClick={() => captureManual("false_positive")}
                 className="py-3 px-4 rounded-xl bg-amber-700 hover:bg-amber-600 text-white font-medium text-sm transition-colors"
               >
                 {t("🚫 Mark current AI box as false positive")}
@@ -425,27 +449,6 @@ export default function RealtimePlayer({
       <p className="text-xs text-gray-600">
         {t("Frames scaled to {width}px before sending · one frame in flight at a time", { width: INFER_WIDTH })}
       </p>
-
-      {showCapture && videoRef.current && (
-        <FeedbackCapture
-          mode="dr_found"
-          video={videoRef.current}
-          caseId={caseId}
-          getClip={getClip}
-          onClose={() => setShowCapture(false)}
-          onSaved={() => setFeedbackRefreshKey((k) => k + 1)}
-        />
-      )}
-      {showFPCapture && videoRef.current && (
-        <FeedbackCapture
-          mode="false_positive"
-          video={videoRef.current}
-          caseId={caseId}
-          getClip={getClip}
-          onClose={() => setShowFPCapture(false)}
-          onSaved={() => setFeedbackRefreshKey((k) => k + 1)}
-        />
-      )}
     </div>
   );
 }
