@@ -10,7 +10,7 @@ interface Entry {
   case_id: string;
   filename: string;
   timestamp: string;
-  status?: string;
+  status: string;
   ai_detections: string;
   bbox_x1?: string;
   bbox_y1?: string;
@@ -18,10 +18,8 @@ interface Entry {
   bbox_y2?: string;
 }
 
-type Kind = "pending" | "dr_found";
 type UserBox = [number, number, number, number];
-
-function keyOf(kind: Kind, filename: string) { return `${kind}:${filename}`; }
+type Lists = { pending: Entry[]; drFound: Entry[]; reviewed: Entry[] };
 
 function parseSavedBox(e: Entry): UserBox | null {
   const vals = [e.bbox_x1, e.bbox_y1, e.bbox_x2, e.bbox_y2];
@@ -46,78 +44,101 @@ function clampBox(b: UserBox, w: number, h: number): UserBox {
   return [x1, y1, x2, y2];
 }
 
-// Two labeled queues of thumbnails, plus one inline review card that walks
-// through them one at a time — deliberately minimal, no popups, no
-// explanatory copy. Acting on the current one (or skipping/discarding it)
-// auto-advances to the next so a nurse can work straight through.
+const byNewest = (a: Entry, b: Entry) => Number(b.timestamp || 0) - Number(a.timestamp || 0);
+
+// Two active queues (drive the review card) + one "already reviewed" history
+// split the same way. A brand new dr-found capture always jumps to the front
+// (FILO — newest reviewed first, then whatever it interrupted). Nothing else
+// steals focus from whatever the nurse is currently looking at.
 export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: string; refreshSignal?: number }) {
   const { t } = useLanguage();
   const [pending, setPending] = useState<Entry[]>([]);
   const [drFound, setDrFound] = useState<Entry[]>([]);
-  const [currentKey, setCurrentKey] = useState<string | null>(null);
+  const [reviewed, setReviewed] = useState<Entry[]>([]); // confirmed + false_positive (former pending, resolved)
+  const [currentKey, setCurrentKey] = useState<string | null>(null); // filename
   const [box, setBox] = useState<UserBox | null>(null);
   const [dragMode, setDragMode] = useState<"move" | "draw" | null>(null);
   const [dragStart, setDragStart] = useState<[number, number] | null>(null); // draw-mode anchor corner
   const [moveOffset, setMoveOffset] = useState<[number, number] | null>(null); // move-mode: cursor offset from box top-left
   const [imgNatural, setImgNatural] = useState({ w: 0, h: 0 });
-  // dr_found items never leave the backend list just from being looked at —
-  // track locally which ones the nurse already stepped past this session, so
-  // auto-advance doesn't loop on the same one forever.
+  // dr_found items never leave the drFound list just from being handled (no
+  // status change) — once "saved"/"discarded"/skipped, mark it dismissed so
+  // it moves from the active bar into the reviewed one instead of resurfacing.
   const dismissedRef = useRef<Set<string>>(new Set());
+  // Which dr_found filenames we've already seen — lets a genuinely NEW capture
+  // be told apart from "same list, routine poll" so only real new arrivals
+  // interrupt the current review.
+  const seenDrFoundRef = useRef<Set<string>>(new Set());
+  const hasLoadedRef = useRef(false);
   // The box a pending item's editable box STARTED at (the AI's own detection,
   // or null) — compared against the current box at submit time to flag
   // whether the nurse actually corrected it.
   const originalBoxRef = useRef<UserBox | null>(null);
 
-  type Lists = { pending: Entry[]; drFound: Entry[] };
-
   async function loadAll(): Promise<Lists> {
     try {
-      const [q, d] = await Promise.all([
+      const [q, rest] = await Promise.all([
         fetch(`${API}/api/feedback/queue?case_id=${caseId}`).then((r) => r.json()),
-        fetch(`${API}/api/feedback/list?status=dr_found&case_id=${caseId}`).then((r) => r.json()),
+        fetch(`${API}/api/feedback/list?case_id=${caseId}`).then((r) => r.json()),
       ]);
-      setPending(q); setDrFound(d);
-      return { pending: q, drFound: d };
+      const dr: Entry[] = rest.filter((e: Entry) => e.status === "dr_found");
+      const rev: Entry[] = rest.filter((e: Entry) => e.status !== "dr_found");
+      setPending(q); setDrFound(dr); setReviewed(rev);
+      return { pending: q, drFound: dr, reviewed: rev };
     } catch {
-      return { pending, drFound };
+      return { pending, drFound, reviewed };
     }
   }
 
-  // Priority: a doctor-found miss always jumps to the front — it's the more
-  // clinically important gap. Within that group, newest capture first (so a
-  // just-captured one is reviewed right away); once handled, whichever was
-  // next-newest naturally becomes the new front of the queue.
-  function pickNext(lists: Lists, excludeKey?: string): { kind: Kind; entry: Entry } | null {
+  // Priority: an active (not-yet-dismissed) dr-found capture always outranks
+  // a pending AI detection, newest dr-found first.
+  function pickNext(lists: Lists, excludeFilename?: string): Entry | null {
     const dr = lists.drFound
-      .filter((e) => !dismissedRef.current.has(keyOf("dr_found", e.filename)) && keyOf("dr_found", e.filename) !== excludeKey)
-      .sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0));
-    if (dr.length) return { kind: "dr_found", entry: dr[0] };
-
-    const p = lists.pending.filter((e) => keyOf("pending", e.filename) !== excludeKey);
-    if (p.length) return { kind: "pending", entry: p[0] };
-
+      .filter((e) => !dismissedRef.current.has(e.filename) && e.filename !== excludeFilename)
+      .sort(byNewest);
+    if (dr.length) return dr[0];
+    const p = lists.pending.filter((e) => e.filename !== excludeFilename);
+    if (p.length) return p[0];
     return null;
   }
 
-  function stillPresent(lists: Lists, key: string): boolean {
-    return lists.pending.some((e) => keyOf("pending", e.filename) === key)
-      || lists.drFound.some((e) => keyOf("dr_found", e.filename) === key);
+  function stillPresent(lists: Lists, filename: string): boolean {
+    return lists.pending.some((e) => e.filename === filename)
+      || lists.drFound.some((e) => e.filename === filename)
+      || lists.reviewed.some((e) => e.filename === filename);
   }
 
-  // Poll for new captures. Only auto-pick a "current" entry when there isn't
-  // one yet, or the one showing was just removed elsewhere — never yank the
-  // panel away from whatever the nurse is actively looking at.
+  async function reconcile(lists: Lists) {
+    if (!hasLoadedRef.current) {
+      lists.drFound.forEach((e) => seenDrFoundRef.current.add(e.filename));
+      hasLoadedRef.current = true;
+      setCurrentKey((prev) => {
+        if (prev && stillPresent(lists, prev)) return prev;
+        const next = pickNext(lists);
+        return next ? next.filename : null;
+      });
+      return;
+    }
+    const fresh = lists.drFound.filter((e) => !seenDrFoundRef.current.has(e.filename));
+    fresh.forEach((e) => seenDrFoundRef.current.add(e.filename));
+    if (fresh.length > 0) {
+      setCurrentKey(fresh.sort(byNewest)[0].filename); // interrupt — newest wins
+      return;
+    }
+    setCurrentKey((prev) => {
+      if (prev && stillPresent(lists, prev)) return prev;
+      const next = pickNext(lists);
+      return next ? next.filename : null;
+    });
+  }
+
+  // Poll for new captures.
   useEffect(() => {
     let alive = true;
     async function tick() {
       const lists = await loadAll();
       if (!alive) return;
-      setCurrentKey((prev) => {
-        if (prev && stillPresent(lists, prev)) return prev;
-        const next = pickNext(lists);
-        return next ? keyOf(next.kind, next.entry.filename) : null;
-      });
+      await reconcile(lists);
     }
     tick();
     const iv = setInterval(tick, 5000);
@@ -131,26 +152,17 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
     if (refreshSignal === undefined) return;
     (async () => {
       const lists = await loadAll();
-      setCurrentKey((prev) => {
-        if (prev && stillPresent(lists, prev)) return prev;
-        const next = pickNext(lists);
-        return next ? keyOf(next.kind, next.entry.filename) : null;
-      });
+      await reconcile(lists);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshSignal]);
 
   const current = useMemo(() => {
     if (!currentKey) return null;
-    const sep = currentKey.indexOf(":");
-    const kind = currentKey.slice(0, sep) as Kind;
-    const filename = currentKey.slice(sep + 1);
-    const list = kind === "pending" ? pending : drFound;
-    const entry = list.find((e) => e.filename === filename);
-    return entry ? { kind, entry } : null;
-  }, [currentKey, pending, drFound]);
+    return [...pending, ...drFound, ...reviewed].find((e) => e.filename === currentKey) ?? null;
+  }, [currentKey, pending, drFound, reviewed]);
 
-  const aiBoxes: Box[] = current ? (() => { try { return JSON.parse(current.entry.ai_detections || "[]"); } catch { return []; } })() : [];
+  const aiBoxes: Box[] = current ? (() => { try { return JSON.parse(current.ai_detections || "[]"); } catch { return []; } })() : [];
 
   // Reset the edit box only when the SELECTED entry changes — not on every
   // poll refresh, which would otherwise wipe an in-progress edit every 5s.
@@ -168,8 +180,8 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
   // the new onLoad fires anyway.
   useEffect(() => {
     setDragMode(null); setDragStart(null); setMoveOffset(null);
-    let initial: UserBox | null = current ? parseSavedBox(current.entry) : null;
-    if (current && current.kind === "pending" && !initial && aiBoxes.length > 0) {
+    let initial: UserBox | null = current ? parseSavedBox(current) : null;
+    if (current && current.status === "pending" && !initial && aiBoxes.length > 0) {
       initial = [...aiBoxes[0].bbox];
     }
     setBox(initial);
@@ -216,17 +228,17 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
     setDragMode(null); setDragStart(null); setMoveOffset(null);
   }
 
-  async function advanceAfter(kind: Kind, filename: string) {
-    if (kind === "dr_found") dismissedRef.current.add(keyOf(kind, filename));
+  async function advanceAfter(entry: Entry) {
+    if (entry.status === "dr_found") dismissedRef.current.add(entry.filename);
     const lists = await loadAll();
-    const next = pickNext(lists, keyOf(kind, filename));
-    setCurrentKey(next ? keyOf(next.kind, next.entry.filename) : null);
+    const next = pickNext(lists, entry.filename);
+    setCurrentKey(next ? next.filename : null);
   }
 
   // noticed_first is always "ai" here — this queue only ever holds frames the
   // AI itself flagged, so the AI is definitionally what triggered the capture.
   async function submitReview(correct: boolean) {
-    if (!current || current.kind !== "pending") return;
+    if (!current || current.status !== "pending") return;
     const rounded = box ? (box.map((n) => Math.round(n)) as UserBox) : null;
     const origRounded = originalBoxRef.current ? (originalBoxRef.current.map((n) => Math.round(n)) as UserBox) : null;
     const corrected = JSON.stringify(rounded) !== JSON.stringify(origRounded);
@@ -235,49 +247,50 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
     fd.append("noticed_first", "ai");
     fd.append("box_corrected", String(corrected));
     if (rounded) fd.append("bbox", JSON.stringify(rounded));
-    await fetch(`${API}/api/feedback/${current.entry.case_id}/${current.entry.filename}/review`, { method: "POST", body: fd });
-    await advanceAfter("pending", current.entry.filename);
+    await fetch(`${API}/api/feedback/${current.case_id}/${current.filename}/review`, { method: "POST", body: fd });
+    await advanceAfter(current);
   }
 
   // Box is optional — saving with none clears any previously saved one (the
   // backend's PATCH treats an absent bbox as "clear").
   async function saveBox() {
-    if (!current || current.kind !== "dr_found") return;
+    if (!current || current.status === "pending") return;
     const fd = new FormData();
     if (box) fd.append("bbox", JSON.stringify(box.map((n) => Math.round(n))));
-    await fetch(`${API}/api/feedback/${current.entry.case_id}/${current.entry.filename}`, { method: "PATCH", body: fd });
-    await advanceAfter("dr_found", current.entry.filename);
+    await fetch(`${API}/api/feedback/${current.case_id}/${current.filename}`, { method: "PATCH", body: fd });
+    await advanceAfter(current);
   }
 
   function skip() {
     if (!current) return;
-    advanceAfter(current.kind, current.entry.filename);
+    advanceAfter(current);
   }
 
-  async function deleteCapture(kind: Kind, entry: Entry) {
+  async function deleteCapture(entry: Entry) {
     await fetch(`${API}/api/feedback/${entry.case_id}/${entry.filename}`, { method: "DELETE" });
-    await advanceAfter(kind, entry.filename);
+    await advanceAfter(entry);
   }
+
+  const activeDrFound = drFound.filter((e) => !dismissedRef.current.has(e.filename));
+  const reviewedDrFound = drFound.filter((e) => dismissedRef.current.has(e.filename));
 
   return (
     <div className="space-y-4 bg-gray-900/50 border border-gray-800 rounded-xl p-4">
       <Bar
         title={t("🤖 AI detected")}
         entries={pending}
-        kind="pending"
         emptyText={t("Nothing yet.")}
         currentKey={currentKey}
-        onOpen={(e) => setCurrentKey(keyOf("pending", e.filename))}
-        onDelete={(e) => deleteCapture("pending", e)}
+        onOpen={(e) => setCurrentKey(e.filename)}
+        onDelete={deleteCapture}
       />
       <Bar
         title={t("👁 Dr. found, AI missed")}
-        entries={drFound}
-        kind="dr_found"
+        entries={activeDrFound}
         emptyText={t("Nothing yet.")}
         currentKey={currentKey}
-        onOpen={(e) => setCurrentKey(keyOf("dr_found", e.filename))}
-        onDelete={(e) => deleteCapture("dr_found", e)}
+        onOpen={(e) => setCurrentKey(e.filename)}
+        onDelete={deleteCapture}
       />
 
       <div className="border-t border-gray-800 pt-4">
@@ -291,7 +304,7 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
 
             <div className="relative w-full max-w-xl mx-auto rounded-xl overflow-hidden border border-gray-800 bg-black">
               <img
-                src={`${API}/api/feedback/${current.entry.case_id}/image/${current.entry.filename}`}
+                src={`${API}/api/feedback/${current.case_id}/image/${current.filename}`}
                 alt=""
                 draggable={false}
                 className="w-full h-auto block cursor-crosshair select-none"
@@ -320,7 +333,7 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
               })()}
             </div>
 
-            {current.kind === "pending" ? (
+            {current.status === "pending" ? (
               <div className="grid grid-cols-2 gap-2">
                 <button onClick={() => submitReview(true)} className="py-2.5 bg-emerald-600 hover:bg-emerald-500 rounded-xl text-white font-medium text-sm transition-colors">
                   {t("✓ Confirm polyp")}
@@ -334,7 +347,7 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
                 <button onClick={saveBox} className="py-2.5 bg-sky-600 hover:bg-sky-500 rounded-xl text-white font-medium text-sm transition-colors">
                   {t("💾 Save")}
                 </button>
-                <button onClick={() => deleteCapture(current.kind, current.entry)} className="py-2.5 bg-gray-800 hover:bg-gray-700 rounded-xl text-red-400 font-medium text-sm transition-colors">
+                <button onClick={() => deleteCapture(current)} className="py-2.5 bg-gray-800 hover:bg-gray-700 rounded-xl text-red-400 font-medium text-sm transition-colors">
                   {t("🗑 Discard")}
                 </button>
               </div>
@@ -342,12 +355,32 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
           </div>
         )}
       </div>
+
+      <div className="border-t border-gray-800 pt-4 space-y-3">
+        <p className="text-xs text-gray-500 uppercase tracking-wide">{t("Already reviewed")}</p>
+        <Bar
+          title={t("🤖 AI detected")}
+          entries={reviewed}
+          emptyText={t("Nothing yet.")}
+          currentKey={currentKey}
+          onOpen={(e) => setCurrentKey(e.filename)}
+          onDelete={deleteCapture}
+        />
+        <Bar
+          title={t("👁 Dr. found, AI missed")}
+          entries={reviewedDrFound}
+          emptyText={t("Nothing yet.")}
+          currentKey={currentKey}
+          onOpen={(e) => setCurrentKey(e.filename)}
+          onDelete={deleteCapture}
+        />
+      </div>
     </div>
   );
 }
 
-function Bar({ title, entries, kind, emptyText, currentKey, onOpen, onDelete }: {
-  title: string; entries: Entry[]; kind: Kind; emptyText: string; currentKey: string | null;
+function Bar({ title, entries, emptyText, currentKey, onOpen, onDelete }: {
+  title: string; entries: Entry[]; emptyText: string; currentKey: string | null;
   onOpen: (e: Entry) => void; onDelete: (e: Entry) => void;
 }) {
   return (
@@ -358,7 +391,7 @@ function Bar({ title, entries, kind, emptyText, currentKey, onOpen, onDelete }: 
       ) : (
         <div className="flex gap-2 overflow-x-auto pb-1">
           {entries.map((e) => {
-            const isCurrent = currentKey === keyOf(kind, e.filename);
+            const isCurrent = currentKey === e.filename;
             return (
               <div key={e.filename} className="relative flex-shrink-0">
                 <button

@@ -181,4 +181,5 @@ export const FA: Record<string, string> = {
   "✗ Not a polyp": "✗ پولیپ نیست",
   "💾 Save": "💾 ذخیره",
   "🗑 Discard": "🗑 حذف",
+  "Already reviewed": "بررسی‌شده",
 };
