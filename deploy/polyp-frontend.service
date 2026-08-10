@@ -1,0 +1,15 @@
+[Unit]
+Description=Polyp Detection frontend (Next.js)
+After=network-online.target polyp-backend.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__APP_DIR__/frontend
+Environment=NODE_ENV=production
+ExecStart=__APP_DIR__/frontend/node_modules/.bin/next start --port __PORT__
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

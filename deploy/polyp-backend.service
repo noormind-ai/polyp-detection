@@ -1,0 +1,18 @@
+[Unit]
+Description=Polyp Detection backend (FastAPI, local GPU inference)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__APP_DIR__
+Environment=PYTHONUNBUFFERED=1
+# Ultralytics writes a settings file on first use; without a writable location it
+# warns and falls back to /tmp on every boot.
+Environment=YOLO_CONFIG_DIR=/root/.config/Ultralytics
+ExecStart=__VENV_DIR__/bin/uvicorn backend.main:app --host 0.0.0.0 --port __PORT__
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
