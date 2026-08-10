@@ -55,6 +55,8 @@ export const FA: Record<string, string> = {
   "closed ({code})": "بسته شد ({code})",
   "Polyp detected": "پولیپ شناسایی شد",
   "Stop": "توقف",
+  "Hide": "پنهان کردن",
+  "Show": "نمایش",
   "Frames sent": "فریم‌های ارسال‌شده",
   "Responses back": "پاسخ‌های دریافتی",
   "Modal latency (avg)": "تأخیر Modal (میانگین)",

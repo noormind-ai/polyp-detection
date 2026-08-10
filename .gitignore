@@ -29,3 +29,9 @@ logs/
 .idea/
 *.swp
 .DS_Store
+
+# local build/runtime artifacts (not for the repo)
+venv/
+frontend/.next.bak-*/
+frontend/frontend.log
+.git.broken-bak/

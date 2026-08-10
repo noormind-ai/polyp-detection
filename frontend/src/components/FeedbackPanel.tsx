@@ -65,6 +65,8 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
   const dismissedPendingRef = useRef<Set<string>>(new Set());
   const seenDrRef = useRef<Set<string>>(new Set());
   const hasLoadedRef = useRef(false);
+  const seenPendingRef = useRef<Set<string>>(new Set());
+  const hasLoadedPendingRef = useRef(false);
 
   type Lists = { pending: Entry[]; drFound: Entry[]; reviewed: Entry[] };
 
@@ -83,11 +85,30 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
     }
   }
 
+  // Mirrors reconcileDrFound: a newly-arrived capture takes over the window, so
+  // the panel always shows the most recent detection rather than pinning to
+  // whatever was on screen first. Trade-off is deliberate — a detection landing
+  // mid-review will pull the window to the new frame; the queue strip below
+  // keeps the older ones reachable.
   function reconcilePending(pendingList: Entry[], reviewedList: Entry[]) {
-    setPendingKey((prev) => {
-      if (prev && (pendingList.some((e) => e.filename === prev) || reviewedList.some((e) => e.filename === prev))) return prev;
-      return pendingList.find((e) => !dismissedPendingRef.current.has(e.filename))?.filename ?? null;
-    });
+    const stillValid = (k: string) =>
+      pendingList.some((e) => e.filename === k) || reviewedList.some((e) => e.filename === k);
+    const active = pendingList.filter((e) => !dismissedPendingRef.current.has(e.filename));
+
+    if (!hasLoadedPendingRef.current) {
+      active.forEach((e) => seenPendingRef.current.add(e.filename));
+      hasLoadedPendingRef.current = true;
+      setPendingKey((prev) => (prev && stillValid(prev) ? prev : [...active].sort(byNewest)[0]?.filename ?? null));
+      return;
+    }
+
+    const fresh = active.filter((e) => !seenPendingRef.current.has(e.filename));
+    fresh.forEach((e) => seenPendingRef.current.add(e.filename));
+    if (fresh.length > 0) {
+      setPendingKey(fresh.sort(byNewest)[0].filename);
+      return;
+    }
+    setPendingKey((prev) => (prev && stillValid(prev) ? prev : [...active].sort(byNewest)[0]?.filename ?? null));
   }
 
   function reconcileDrFound(drList: Entry[]) {
@@ -193,7 +214,9 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
   const reviewedDrFound = drFound.filter((e) => dismissedRef.current.has(e.filename));
 
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-start">
+    // Two lanes side by side — the feedback column is given the wider half of
+    // the layout precisely so this fits without stacking.
+    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 items-start">
       <Lane
         title={t("🤖 AI detected")}
         activeEntries={pending}
@@ -259,7 +282,7 @@ function Lane({
 }) {
   const { t } = useLanguage();
   return (
-    <div className="space-y-4 bg-gray-900/50 border border-gray-800 rounded-xl p-4">
+    <div className="space-y-3 bg-gray-900/50 border border-gray-800 rounded-xl p-3">
       <p className="text-sm text-gray-300 font-medium">{title}</p>
 
       {current ? (

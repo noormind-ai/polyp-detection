@@ -157,7 +157,11 @@ export default function Home() {
   }
 
   return (
-    <main className="min-h-screen bg-gray-950 text-white p-8 max-w-4xl mx-auto">
+    // The player modes lay video and feedback out side by side, so they get the
+    // full desktop width; the pickers/upload screens stay narrow and readable.
+    <main className={`min-h-screen bg-gray-950 text-white mx-auto p-8 ${
+      mode && mode !== "upload" ? "max-w-[1700px]" : "max-w-4xl"
+    }`}>
       <div className="flex items-start justify-between mb-10">
         <div>
           <h1 className="text-2xl font-semibold mb-1">{t("Polyp Detection AI")}</h1>
