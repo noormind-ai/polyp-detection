@@ -18,6 +18,7 @@ export const FA: Record<string, string> = {
   "Always on · no network hop": "همیشه روشن · بدون رفت‌وبرگشت شبکه",
   "Serverless · released after 5 min idle": "بدون سرور · پس از 5 دقیقه بی‌فعالیتی آزاد می‌شود",
   "~250ms per frame from here": "حدود 250 میلی‌ثانیه بر فریم از اینجا",
+  "Not configured on this server": "روی این سرور پیکربندی نشده است",
   "Runs on this server's own GPU. The model loads once, on first start.": "روی GPU خودِ این سرور اجرا می‌شود. مدل فقط یک‌بار، در اولین راه‌اندازی، بارگذاری می‌شود.",
   "GPU ready · Model loaded · {gpu}": "GPU آماده · مدل بارگذاری شده · {gpu}",
   "local GPU": "GPU محلی",

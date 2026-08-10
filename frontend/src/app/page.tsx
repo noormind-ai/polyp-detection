@@ -214,8 +214,9 @@ export default function Home() {
 
       {stage === "idle" && (
         <div className="flex flex-col items-center justify-center py-20 gap-6">
-          {/* Only worth asking when this deployment can genuinely serve both. */}
-          {backends && BACKEND_ORDER.filter((b) => backends.available?.[b]).length > 1 && (
+          {/* Both options are always shown so the choice is visible; one that this
+              deployment can't serve is disabled with the reason, rather than hidden. */}
+          {backends && (
             <div className="w-full max-w-xl space-y-2">
               <p className="text-sm text-gray-400 text-center">{t("Where should inference run?")}</p>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -245,7 +246,9 @@ export default function Home() {
                           : t("Serverless · released after 5 min idle")}
                       </span>
                       <span className="text-gray-600 text-xs block mt-0.5">
-                        {b === "local"
+                        {!usable
+                          ? t("Not configured on this server")
+                          : b === "local"
                           ? t("Always on · no network hop")
                           : t("~250ms per frame from here")}
                       </span>
