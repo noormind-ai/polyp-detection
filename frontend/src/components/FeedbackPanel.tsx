@@ -52,10 +52,10 @@ const byNewest = (a: Entry, b: Entry) => Number(b.timestamp || 0) - Number(a.tim
 // urgent) — but this NEVER touches the AI-detected lane or vice versa.
 export default function FeedbackPanel({ caseId, refreshSignal, onVisibleLanes }: { caseId: string; refreshSignal?: number; onVisibleLanes?: (n: number) => void }) {
   const { t } = useLanguage();
-  // The dr-found lane stays out of the way until it has something in it, or the
-  // user asks for it — during a normal session nothing lands there, and an empty
-  // lane was just taking width away from the two panels being read.
-  const [drLaneRequested, setDrLaneRequested] = useState(false);
+  // Dr-found lane on by default: the three-column view (video, AI-detected,
+  // dr-found) is the layout in use, and the "doctor found it, AI missed it"
+  // button needs a visible destination for what it captures.
+  const [drLaneRequested, setDrLaneRequested] = useState(true);
   const [pending, setPending] = useState<Entry[]>([]);
   const [drFound, setDrFound] = useState<Entry[]>([]);
   const [reviewed, setReviewed] = useState<Entry[]>([]); // confirmed + false_positive (ex-pending)

@@ -10,6 +10,13 @@ const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001";
 const API_WS = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001").replace(/^http/, "ws");
 const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 const INFER_TIMEOUT_MS = 6000;
+// Frames allowed in flight at once. With one, every frame pays the full round
+// trip before the next is even captured, which capped the analysed panel at
+// ~15fps regardless of how fast the GPU answered (~22ms). The server handles a
+// socket strictly serially and replies in order, so a small queue just hides the
+// network leg; it does not reorder anything and does not reduce any single
+// frame's latency. RESULTS.md part 2 flagged this as the throughput lever.
+const MAX_IN_FLIGHT = 3;
 // Resize frames to this width before sending — faster inference, smaller payload
 const INFER_WIDTH = 320;
 const SPEEDS = [0.1, 0.25, 0.5, 1, 1.5, 2];
@@ -35,7 +42,11 @@ export default function RealtimePlayer({
   const lastAutoCaptureRef = useRef(0);
 
   // Pending response promise resolver — one in-flight request at a time
-  const pendingRef = useRef<((v: { boxes: Box[]; timing: Timing } | null) => void) | null>(null);
+  // FIFO of in-flight frames. Responses come back in send order because the
+  // server's socket loop is serial, so the oldest waiter always matches the next
+  // message to arrive.
+  type Waiter = (v: { boxes: Box[]; timing: Timing } | null) => void;
+  const pendingRef = useRef<Waiter[]>([]);
 
   const [videoUrl, setVideoUrl]   = useState<string | null>(null);
   const [tab, setTab]             = useState<"upload" | "demo">("demo");
@@ -48,6 +59,9 @@ export default function RealtimePlayer({
   // so there is no longer a reason to play the footage in slow motion.
   const [speed, setSpeed]         = useState(1);
   const [stats, setStats]         = useState({ sent: 0, received: 0, avgMs: 0 });
+  const sentRef = useRef(0);
+  const recvRef = useRef(0);
+  const avgRef  = useRef(0);
   const [lastError, setLastError] = useState("");
   const [duration, setDuration]   = useState(0);
   const [curTime, setCurTime]     = useState(0);
@@ -61,12 +75,28 @@ export default function RealtimePlayer({
   const [showLive, setShowLive]         = useState(false);
   // How many feedback lanes are on screen, reported by FeedbackPanel. Drives the
   // column count so video and every visible lane stay equal width.
-  const [feedbackLanes, setFeedbackLanes] = useState(1);
+  const [feedbackLanes, setFeedbackLanes] = useState(2);
+  // Whether the analysed canvas has ever been painted — see startLoop.
+  const hasDrawnRef = useRef(false);
   const msHistory = useRef<number[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const lastBoxesRef = useRef<Box[]>([]); // AI's most recent detections — attached as context to manual captures
 
   const { getClip } = useRollingClip(videoRef.current);
+
+  // Push the accumulated counters into state a few times a second. The numbers
+  // are for a human reading them, so 4Hz is plenty and it keeps re-renders off
+  // the per-frame path.
+  useEffect(() => {
+    const id = setInterval(() => {
+      setStats((s) =>
+        s.sent === sentRef.current && s.received === recvRef.current && s.avgMs === avgRef.current
+          ? s
+          : { sent: sentRef.current, received: recvRef.current, avgMs: avgRef.current }
+      );
+    }, 250);
+    return () => clearInterval(id);
+  }, []);
 
   // WebSocket — connect once on mount
   useEffect(() => {
@@ -75,7 +105,12 @@ export default function RealtimePlayer({
 
     ws.onopen  = () => setWsStatus("open");
     ws.onerror = () => setWsStatus("error");
-    ws.onclose = (e) => { setWsStatus("closed"); setCloseCode(e.code); pendingRef.current?.(null); };
+    ws.onclose = (e) => {
+      setWsStatus("closed");
+      setCloseCode(e.code);
+      // Release every waiter, or the capture loop blocks forever on a dead socket.
+      pendingRef.current.splice(0).forEach((w) => w(null));
+    };
 
     ws.onmessage = (e) => {
       let data: unknown;
@@ -84,8 +119,7 @@ export default function RealtimePlayer({
       if (data && typeof data === "object" && "error" in data) {
         const err = (data as { error: string }).error;
         setLastError(err);
-        pendingRef.current?.(null);
-        pendingRef.current = null;
+        pendingRef.current.shift()?.(null);
         return;
       }
 
@@ -93,11 +127,13 @@ export default function RealtimePlayer({
       onActivity?.();
       msHistory.current.push(timing.modal_ms);
       if (msHistory.current.length > 10) msHistory.current.shift();
-      const avg = Math.round(msHistory.current.reduce((a, b) => a + b, 0) / msHistory.current.length);
-      setStats((s) => ({ sent: s.sent, received: s.received + 1, avgMs: avg }));
+      // Counters accumulate in a ref and are flushed on a timer — a setState per
+      // frame re-rendered this whole tree 15-30 times a second, which was a real
+      // slice of the per-frame client cost.
+      recvRef.current += 1;
+      avgRef.current = Math.round(msHistory.current.reduce((a, b) => a + b, 0) / msHistory.current.length);
 
-      pendingRef.current?.({ boxes, timing });
-      pendingRef.current = null;
+      pendingRef.current.shift()?.({ boxes, timing });
     };
 
     return () => { ws.close(); scanRef.current = false; };
@@ -194,6 +230,7 @@ export default function RealtimePlayer({
   async function startLoop(video: HTMLVideoElement) {
     if (scanRef.current) return;
     scanRef.current = true;
+    hasDrawnRef.current = false; // new clip — allow the seed draw again
     video.loop = false;
     video.playbackRate = speed;
     await video.play();
@@ -216,20 +253,47 @@ export default function RealtimePlayer({
       const blob: Blob = await new Promise((res) => cap.toBlob((b) => res(b!), "image/jpeg", 0.85));
       const buf = await blob.arrayBuffer();
 
-      const result = await new Promise<{ boxes: Box[]; timing: Timing } | null>((resolve) => {
-        pendingRef.current = resolve;
+      // First frame only: paint it immediately so the panel isn't a black box
+      // while the very first round trip is in flight. Deliberately not done for
+      // every frame — a frame shown without boxes reads as "the AI saw nothing
+      // here", which must only ever be said after the model has actually
+      // answered for that frame.
+      if (!hasDrawnRef.current) {
+        hasDrawnRef.current = true;
+        drawAnalyzedFrame(cap, []);
+      }
+
+      const pending = new Promise<{ boxes: Box[]; timing: Timing } | null>((resolve) => {
+        let settled = false;
+        const waiter: Waiter = (v) => { if (!settled) { settled = true; resolve(v); } };
+        pendingRef.current.push(waiter);
         ws.send(buf);
-        setStats((s) => ({ ...s, sent: s.sent + 1 }));
+        sentRef.current += 1;
         setTimeout(() => {
-          if (pendingRef.current === resolve) { pendingRef.current = null; resolve(null); }
+          if (settled) return;
+          // Drop this waiter by identity — splicing blind would desync the queue
+          // against responses still in flight for other frames.
+          const i = pendingRef.current.indexOf(waiter);
+          if (i !== -1) pendingRef.current.splice(i, 1);
+          waiter(null);
         }, INFER_TIMEOUT_MS);
       });
 
-      // Draw the frame + its boxes together, win or lose (a timeout leaves the last good frame up)
-      if (result) {
+      // Draw the frame + its boxes together, win or lose (a timeout leaves the
+      // last good frame up). Responses arrive in send order, so these fire in
+      // order too and the panel never jumps backwards.
+      pending.then((result) => {
+        if (!result) return;
         updateBoxes(result.boxes);
         drawAnalyzedFrame(cap, result.boxes);
         maybeAutoCapture(cap, result.boxes);
+      });
+
+      // Capture the next frame without waiting for this one's answer, up to
+      // MAX_IN_FLIGHT. This is what lifts the panel above ~15fps: the round trip
+      // overlaps with capture and encode instead of blocking them.
+      while (scanRef.current && pendingRef.current.length >= MAX_IN_FLIGHT) {
+        await new Promise<void>((res) => requestAnimationFrame(() => res()));
       }
     }
   }
