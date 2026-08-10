@@ -399,7 +399,7 @@ export default function LiveCameraPlayer({ onStop, onActivity, wsPath = "/api/ws
         <span className="text-white">{stats.sent}</span>
         <span className="text-gray-500">{t("Responses back")}</span>
         <span className="text-white">{stats.received}</span>
-        <span className="text-gray-500">{t("Modal latency (avg)")}</span>
+        <span className="text-gray-500">{backend === "local" ? t("Inference latency (avg)") : t("Modal latency (avg)")}</span>
         <span className={stats.avgMs > 800 ? "text-red-400" : "text-green-400"}>
           {stats.avgMs > 0 ? t("{avgMs} ms", { avgMs: stats.avgMs }) : "—"}
         </span>

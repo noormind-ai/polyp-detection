@@ -3,7 +3,11 @@
 import { useEffect, useState } from "react";
 import { useLanguage } from "@/lib/i18n";
 
-const STEPS = [
+// Two very different waits, so two different scripts. Modal has to provision a
+// container from cold (~60s); the local GPU only has to pull weights off disk and
+// build a CUDA context (~7s measured), so its steps are paced to match rather
+// than narrating a provisioning process that isn't happening.
+const MODAL_STEPS = [
   { at: 0,     text: "Requesting A100 GPU on Modal..." },
   { at: 5000,  text: "Container provisioning..." },
   { at: 12000, text: "Loading runtime environment..." },
@@ -12,22 +16,32 @@ const STEPS = [
   { at: 52000, text: "Warming up inference pipeline..." },
 ];
 
-export default function WarmupPanel() {
+const LOCAL_STEPS = [
+  { at: 0,    text: "Opening the local GPU..." },
+  { at: 800,  text: "Reading model weights from disk..." },
+  { at: 2200, text: "Loading YOLOv5 into GPU memory..." },
+  { at: 4200, text: "Warming up inference pipeline..." },
+];
+
+export default function WarmupPanel({ backend }: { backend?: string }) {
   const { t } = useLanguage();
   const [logs, setLogs] = useState<string[]>([]);
+  const isLocal = backend === "local";
+  const steps = isLocal ? LOCAL_STEPS : MODAL_STEPS;
+
   const cliCommand = "modal app stop polyp-detection";
   const [footerBefore, footerAfter] = t(
     "Cold start ~60s · Warm starts are instant · Stop with modal app stop polyp-detection"
   ).split(cliCommand);
 
   useEffect(() => {
-    const timers = STEPS.map(({ at, text }) =>
+    const timers = steps.map(({ at, text }) =>
       setTimeout(() => setLogs((prev) => [...prev, text]), at)
     );
     return () => timers.forEach(clearTimeout);
-  }, []);
+  }, [steps]);
 
-  const progress = Math.min(90, Math.round((logs.length / STEPS.length) * 100));
+  const progress = Math.min(90, Math.round((logs.length / steps.length) * 100));
 
   return (
     <div className="space-y-5 py-4">
@@ -59,9 +73,15 @@ export default function WarmupPanel() {
       </div>
 
       <p className="text-xs text-gray-600 text-center">
-        {footerBefore}
-        <code className="text-gray-500">{cliCommand}</code>
-        {footerAfter}
+        {isLocal ? (
+          t("Loads once per backend restart · every start after that is instant")
+        ) : (
+          <>
+            {footerBefore}
+            <code className="text-gray-500">{cliCommand}</code>
+            {footerAfter}
+          </>
+        )}
       </p>
     </div>
   );

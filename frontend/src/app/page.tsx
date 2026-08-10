@@ -273,7 +273,7 @@ export default function Home() {
         </div>
       )}
 
-      {stage === "warming" && <WarmupPanel />}
+      {stage === "warming" && <WarmupPanel backend={backend} />}
 
       {stage === "ready" && (
         <div className="space-y-4">
@@ -309,7 +309,9 @@ export default function Home() {
               >
                 <span className="text-3xl">📷</span>
                 <span className="text-white font-medium">{t("Real-time")}</span>
-                <span className="text-gray-500 text-sm">{t("Frame-by-frame · ~600ms/frame")}</span>
+                <span className="text-gray-500 text-sm">
+                  {backend === "local" ? t("Frame-by-frame · ~25ms/frame") : t("Frame-by-frame · ~600ms/frame")}
+                </span>
               </button>
               <button
                 onClick={() => setMode("camera")}
@@ -372,7 +374,7 @@ export default function Home() {
         <div className="space-y-4">
           <div className="flex items-center gap-2 text-yellow-400 text-sm animate-pulse">
             <span className="w-2 h-2 rounded-full bg-yellow-400 inline-block" />
-            {t("Running inference on Modal...")}
+            {backend === "local" ? t("Running inference on the local GPU...") : t("Running inference on Modal...")}
           </div>
           {videoUrl && (
             <video src={videoUrl} autoPlay loop muted
