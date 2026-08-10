@@ -11,9 +11,10 @@ const INFER_WIDTH = 320;
 interface Box { bbox: [number, number, number, number]; conf: number; }
 interface Timing { recv_ms: number; modal_ms: number; total_ms: number; }
 
-export default function LiveCameraPlayer({ onStop, onActivity, wsPath = "/api/ws/infer", initialMode = "camera" }: { onStop: () => void; onActivity?: () => void; wsPath?: string; initialMode?: "camera" | "screen" }) {
+export default function LiveCameraPlayer({ onStop, onActivity, wsPath = "/api/ws/infer", initialMode = "camera", backend }: { onStop: () => void; onActivity?: () => void; wsPath?: string; initialMode?: "camera" | "screen"; backend?: string }) {
   const { t } = useLanguage();
-  const WS_URL = `${API_WS}${wsPath}`;
+  // Pinned for the life of the socket — see RealtimePlayer.
+  const WS_URL = `${API_WS}${wsPath}${backend ? `?backend=${encodeURIComponent(backend)}` : ""}`;
   const videoRef    = useRef<HTMLVideoElement>(null);
   const analyzedRef = useRef<HTMLCanvasElement>(null); // last frame actually sent to the model, with boxes burned on
   const wsRef       = useRef<WebSocket | null>(null);

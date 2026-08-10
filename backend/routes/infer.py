@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi import APIRouter, File, HTTPException, UploadFile, WebSocket
 from fastapi.responses import JSONResponse
 
-from backend.services import modal_client
+from backend.services import inference
 
 log = logging.getLogger("infer")
 
@@ -23,15 +23,30 @@ def _new_case_id() -> str:
     return secrets.token_hex(4)  # e.g. "a1b2c3d4"
 
 
+@router.get("/backends")
+async def backends():
+    """Which inference backends this deployment can serve, and which is default.
+    The UI calls this before offering the choice so it never lists one that fails."""
+    return inference.availability()
+
+
 @router.post("/session/start")
-async def session_start():
+async def session_start(backend: str | None = None):
     try:
-        await modal_client.warmup()
-        return {"status": "ready", "case_id": _new_case_id()}
+        name, _ = await inference.warmup(backend)
+        return {"status": "ready", "case_id": _new_case_id(), "backend": name}
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
     except Exception as e:
+        wanted = backend or inference.default_backend()
+        hint = (
+            "Is the GPU model loadable? Check torch.cuda.is_available() and the weights path."
+            if wanted == "local"
+            else "Is the app deployed? Run: modal deploy inference/app.py"
+        )
         return JSONResponse(
             status_code=503,
-            content={"error": f"Modal unreachable: {str(e)[:200]}. Is the app deployed? Run: modal deploy inference/app.py"},
+            content={"error": f"{wanted} backend unreachable: {str(e)[:200]}. {hint}"},
         )
 
 
@@ -41,7 +56,7 @@ async def session_stop():
 
 
 @router.post("/infer-video")
-async def infer_video(file: UploadFile = File(...)):
+async def infer_video(file: UploadFile = File(...), backend: str | None = None):
     if not file.content_type or not file.content_type.startswith("video/"):
         raise HTTPException(status_code=400, detail="File must be a video")
 
@@ -50,7 +65,7 @@ async def infer_video(file: UploadFile = File(...)):
         raise HTTPException(status_code=413, detail=f"File exceeds {MAX_UPLOAD_MB} MB limit")
 
     try:
-        return await modal_client.infer_video(content)
+        return await inference.infer_video(content, backend)
     except Exception as e:
         return JSONResponse(
             status_code=503,
@@ -63,8 +78,18 @@ async def infer_stream(websocket: WebSocket):
     import json
     import time
     await websocket.accept()
+    # Backend is fixed for the life of the socket: switching mid-stream would make
+    # the latency average a blend of two very different numbers.
+    requested = websocket.query_params.get("backend")
+    try:
+        backend_name, _ = inference.resolve(requested)
+    except ValueError as e:
+        await websocket.send_text(json.dumps({"error": str(e)}))
+        await websocket.close()
+        return
+
     frame_n = 0
-    log.info("WS session opened")
+    log.info("WS session opened | backend=%s", backend_name)
     while True:
         try:
             t_recv = time.perf_counter()
@@ -77,12 +102,12 @@ async def infer_stream(websocket: WebSocket):
         frame_n += 1
         t_total = time.perf_counter()
         try:
-            detections, timing = await modal_client.infer_frame(frame_bytes)
+            detections, timing = await inference.infer_frame(frame_bytes, backend_name)
             timing["recv_ms"] = recv_ms
             timing["total_ms"] = int((time.perf_counter() - t_total) * 1000)
             log.info(
-                "frame %d | %d bytes | modal=%dms total=%dms | %d boxes",
-                frame_n, len(frame_bytes), timing["modal_ms"], timing["total_ms"], len(detections),
+                "frame %d | %s | %d bytes | infer=%dms total=%dms | %d boxes",
+                frame_n, backend_name, len(frame_bytes), timing["modal_ms"], timing["total_ms"], len(detections),
             )
             await websocket.send_text(json.dumps({"boxes": detections, "timing": timing}))
         except Exception as e:

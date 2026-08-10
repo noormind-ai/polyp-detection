@@ -44,7 +44,7 @@ from typing import Optional
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
-from backend.services import modal_client
+from backend.services import inference
 
 log = logging.getLogger("feedback")
 
@@ -102,13 +102,13 @@ def _save_capture(case_id: str, image: bytes, video: Optional[bytes]) -> tuple[s
 
 
 @router.post("/feedback/check-frame")
-async def check_frame(file: UploadFile = File(...)):
+async def check_frame(file: UploadFile = File(...), backend: str | None = None):
     """One-off inference on a single frame — used by the manual dr-found
     capture flow to show what the model currently thinks of that exact
     frame, without needing the continuous WebSocket loop for it."""
     content = await file.read()
     try:
-        detections, _timing = await modal_client.infer_frame(content)
+        detections, _timing = await inference.infer_frame(content, backend)
         return {"detections": detections}
     except Exception as e:
         return {"detections": [], "error": str(e)[:200]}

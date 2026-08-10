@@ -22,10 +22,12 @@ interface Box { bbox: [number, number, number, number]; conf: number; }
 interface Timing { recv_ms: number; modal_ms: number; total_ms: number; }
 
 export default function RealtimePlayer({
-  caseId, onStop, onActivity, wsPath = "/api/ws/infer",
-}: { caseId: string; onStop: () => void; onActivity?: () => void; wsPath?: string }) {
+  caseId, onStop, onActivity, wsPath = "/api/ws/infer", backend,
+}: { caseId: string; onStop: () => void; onActivity?: () => void; wsPath?: string; backend?: string }) {
   const { t } = useLanguage();
-  const WS_URL = `${API_WS}${wsPath}`;
+  // The backend is pinned for the life of the socket — the server reads it once
+  // on connect, so switching would need a reconnect, not just a different param.
+  const WS_URL = `${API_WS}${wsPath}${backend ? `?backend=${encodeURIComponent(backend)}` : ""}`;
   const videoRef    = useRef<HTMLVideoElement>(null);
   const analyzedRef = useRef<HTMLCanvasElement>(null); // last frame actually sent to the model, with boxes burned on
   const wsRef       = useRef<WebSocket | null>(null);

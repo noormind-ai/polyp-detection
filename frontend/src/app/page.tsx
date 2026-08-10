@@ -31,8 +31,19 @@ interface GtData {
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001";
 // Must match scaledown_window in inference/app.py — Modal releases the GPU container
 // this long after its last request, so we bounce back to "Start Session" at the same
-// point instead of letting the user hit a surprise cold-start delay.
+// point instead of letting the user hit a surprise cold-start delay. Applies to the
+// Modal backend only; a local GPU is always on and never released.
 const MODAL_IDLE_MS = 5 * 60 * 1000;
+
+type BackendName = "local" | "modal";
+
+interface BackendInfo {
+  default: BackendName;
+  available: Record<BackendName, boolean>;
+  gpu: string | null;
+}
+
+const BACKEND_ORDER: BackendName[] = ["local", "modal"];
 
 export default function Home() {
   const { t, lang, toggleLang } = useLanguage();
@@ -45,16 +56,35 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [stopping, setStopping] = useState(false);
   const [caseId, setCaseId] = useState<string | null>(null);
+  const [backends, setBackends] = useState<BackendInfo | null>(null);
+  const [backend, setBackend] = useState<BackendName>("modal");
   const gtInputRef = useRef<HTMLInputElement>(null);
   const lastActiveRef = useRef<number>(Date.now());
 
   function markActive() { lastActiveRef.current = Date.now(); }
+
+  // Ask the backend what it can actually serve. A box with no GPU shouldn't offer
+  // "local", and one with no Modal credentials shouldn't offer "modal" — the
+  // choice is only shown when there is a real choice to make.
+  useEffect(() => {
+    fetch(`${API}/api/backends`)
+      .then((r) => r.json())
+      .then((d: BackendInfo) => {
+        setBackends(d);
+        const usable = BACKEND_ORDER.filter((b) => d.available?.[b]);
+        setBackend(usable.includes(d.default) ? d.default : usable[0] ?? d.default);
+      })
+      .catch(() => {});
+  }, []);
 
   // While a session is active, watch for the GPU having gone idle long enough that
   // Modal already released the container — return to the start screen so the UI
   // reflects reality instead of letting the next request eat a cold-start delay.
   useEffect(() => {
     if (stage !== "ready" && stage !== "processing") return;
+    // Only Modal releases its GPU. The local card stays loaded, so timing the user
+    // out would be an invented limitation.
+    if (backend !== "modal") return;
     const interval = setInterval(() => {
       if (Date.now() - lastActiveRef.current > MODAL_IDLE_MS) {
         fetch(`${API}/api/session/stop`, { method: "POST" }).catch(() => {});
@@ -68,7 +98,7 @@ export default function Home() {
       }
     }, 5000);
     return () => clearInterval(interval);
-  }, [stage, t]);
+  }, [stage, t, backend]);
 
   async function handleStop() {
     setStopping(true);
@@ -89,7 +119,7 @@ export default function Home() {
     setStage("warming");
     setError(null);
     try {
-      const res = await fetch(`${API}/api/session/start`, { method: "POST" });
+      const res = await fetch(`${API}/api/session/start?backend=${backend}`, { method: "POST" });
       if (!res.ok) {
         const text = await res.text();
         throw new Error(t("Backend error {status}: {text}", { status: res.status, text }));
@@ -183,9 +213,53 @@ export default function Home() {
       </div>
 
       {stage === "idle" && (
-        <div className="flex flex-col items-center justify-center py-24 gap-6">
+        <div className="flex flex-col items-center justify-center py-20 gap-6">
+          {/* Only worth asking when this deployment can genuinely serve both. */}
+          {backends && BACKEND_ORDER.filter((b) => backends.available?.[b]).length > 1 && (
+            <div className="w-full max-w-xl space-y-2">
+              <p className="text-sm text-gray-400 text-center">{t("Where should inference run?")}</p>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {BACKEND_ORDER.map((b) => {
+                  const usable = backends.available?.[b];
+                  const selected = backend === b;
+                  return (
+                    <button
+                      key={b}
+                      disabled={!usable}
+                      onClick={() => setBackend(b)}
+                      className={`text-left p-4 rounded-xl border-2 transition-colors ${
+                        selected
+                          ? "border-blue-500 bg-blue-950/20"
+                          : "border-gray-700 hover:border-gray-500"
+                      } ${usable ? "" : "opacity-40 cursor-not-allowed"}`}
+                    >
+                      <div className="flex items-center gap-2 mb-1">
+                        <span className="text-lg">{b === "local" ? "⚡" : "☁️"}</span>
+                        <span className="text-white font-medium text-sm">
+                          {b === "local" ? t("This server's GPU") : t("Modal A100 (cloud)")}
+                        </span>
+                      </div>
+                      <span className="text-gray-500 text-xs block">
+                        {b === "local"
+                          ? backends.gpu ?? t("Local NVIDIA GPU")
+                          : t("Serverless · released after 5 min idle")}
+                      </span>
+                      <span className="text-gray-600 text-xs block mt-0.5">
+                        {b === "local"
+                          ? t("Always on · no network hop")
+                          : t("~250ms per frame from here")}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           <p className="text-gray-400 text-center max-w-sm">
-            {t("Starts a GPU session on Modal. First start takes ~60 seconds to load the model.")}
+            {backend === "local"
+              ? t("Runs on this server's own GPU. The model loads once, on first start.")
+              : t("Starts a GPU session on Modal. First start takes ~60 seconds to load the model.")}
           </p>
           <button
             onClick={handleStart}
@@ -203,7 +277,9 @@ export default function Home() {
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2 text-green-400 text-sm">
               <span className="w-2 h-2 rounded-full bg-green-400 inline-block animate-pulse" />
-              {t("GPU ready · Model loaded · A100 active")}
+              {backend === "local"
+                ? t("GPU ready · Model loaded · {gpu}", { gpu: backends?.gpu ?? t("local GPU") })
+                : t("GPU ready · Model loaded · A100 active")}
             </div>
             <button
               onClick={handleStop}
@@ -265,7 +341,7 @@ export default function Home() {
               <button onClick={() => setMode(null)} className="text-sm text-gray-500 hover:text-gray-300 transition-colors">
                 {t("← Back")}
               </button>
-              <RealtimePlayer caseId={caseId ?? "no-case"} onStop={() => setMode(null)} onActivity={markActive} />
+              <RealtimePlayer caseId={caseId ?? "no-case"} onStop={() => setMode(null)} onActivity={markActive} backend={backend} />
             </div>
           )}
 
@@ -274,7 +350,7 @@ export default function Home() {
               <button onClick={() => setMode(null)} className="text-sm text-gray-500 hover:text-gray-300 transition-colors">
                 {t("← Back")}
               </button>
-              <LiveCameraPlayer onStop={() => setMode(null)} onActivity={markActive} />
+              <LiveCameraPlayer onStop={() => setMode(null)} onActivity={markActive} backend={backend} />
             </div>
           )}
 
@@ -283,7 +359,7 @@ export default function Home() {
               <button onClick={() => setMode(null)} className="text-sm text-gray-500 hover:text-gray-300 transition-colors">
                 {t("← Back")}
               </button>
-              <LiveCameraPlayer onStop={() => setMode(null)} onActivity={markActive} initialMode="screen" />
+              <LiveCameraPlayer onStop={() => setMode(null)} onActivity={markActive} initialMode="screen" backend={backend} />
             </div>
           )}
         </div>
