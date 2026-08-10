@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useRef, useState } from "react";
 import DemoVideoPicker from "./DemoVideoPicker";
 import FeedbackPanel from "./FeedbackPanel";
 import { useLanguage } from "@/lib/i18n";
@@ -280,13 +280,10 @@ export default function RealtimePlayer({
   // the other. Hidden panels are clipped, never unmounted: the <video> has to
   // keep decoding and the <canvas> has to keep being drawn into for inference
   // to continue while it's out of sight.
-  // The video column is sized from the clip's own ratio, so a panel that fills
-  // the column width lands exactly on the height budget below — no leftover
-  // margin around the frame, and every pixel not needed here goes to feedback.
-  const [aspW, aspH] = aspect.split("/").map(Number);
-  const aspRatio = aspH > 0 ? aspW / aspH : 560 / 480;
-  const panelVh = showDetected && showLive ? 32 : 56;
-  const vidCol = `min(calc(${aspRatio.toFixed(4)} * ${panelVh}vh), 46vw)`;
+  // Width comes from the 3-column grid below, not from viewport height: the video
+  // column and the two feedback lanes are each 1/3, so the frames get as much
+  // width as a review thumbnail column. Panel height then follows the clip's own
+  // ratio, which is what makes a polyp big enough to actually judge.
   const panelBox = "relative w-full rounded-xl overflow-hidden border border-gray-800 bg-black";
   const toggleBtn = "text-xs px-2 py-0.5 rounded-md border border-gray-800 text-gray-500 hover:text-gray-300 hover:border-gray-600 transition-colors flex-shrink-0";
 
@@ -373,10 +370,7 @@ export default function RealtimePlayer({
           viewport height (not aspect ratio) for the same reason; they letterbox
           rather than push the controls off-screen. Stacks on narrow screens. */}
       {videoUrl && (
-        <div
-          className="grid grid-cols-1 xl:grid-cols-[var(--vidcol)_minmax(0,1fr)] gap-4 items-start"
-          style={{ "--vidcol": vidCol } as CSSProperties}
-        >
+        <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 items-start">
           <div className="space-y-2 min-w-0">
             {/* Detected on top — it's the panel being read during the procedure */}
             <div className="space-y-1">
@@ -472,8 +466,10 @@ export default function RealtimePlayer({
             </button>
           </div>
 
-          {/* Feedback box — scrolls internally so it never lengthens the page */}
-          <div className="min-w-0 rounded-2xl border border-gray-800 bg-gray-900/40 p-3 xl:sticky xl:top-4 xl:max-h-[calc(100vh-2rem)] xl:overflow-y-auto">
+          {/* Feedback box spans the remaining two columns and splits them into its
+              own two lanes, so video / AI-detected / dr-found all end up 1/3 wide.
+              Scrolls internally so it never lengthens the page. */}
+          <div className="min-w-0 xl:col-span-2 rounded-2xl border border-gray-800 bg-gray-900/40 p-3 xl:sticky xl:top-4 xl:max-h-[calc(100vh-2rem)] xl:overflow-y-auto">
             <FeedbackPanel caseId={caseId} refreshSignal={feedbackRefreshKey} />
           </div>
         </div>
