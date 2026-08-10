@@ -54,10 +54,13 @@ export default function RealtimePlayer({
   const [wsStatus, setWsStatus]   = useState<"connecting" | "open" | "error" | "closed">("connecting");
   const [closeCode, setCloseCode] = useState<number | null>(null);
   const [polyp, setPolyp]         = useState(false);
-  // 1x default: the slow default existed because a ~250ms round trip made the two
-  // panels drift badly at real speed. At ~20ms on a local GPU they stay in step,
-  // so there is no longer a reason to play the footage in slow motion.
-  const [speed, setSpeed]         = useState(1);
+  // 0.5x default. The old 0.1x existed because a ~250ms round trip made the two
+  // panels drift badly at real speed; on a local GPU (~20ms) that reason is gone.
+  // Half speed rather than full for two reasons: the footage is easier to follow,
+  // and AUTO_CAPTURE_COOLDOWN_MS is wall-clock, so a clip that plays in half the
+  // time yields half the review captures — sequence 1 is only 2.1s long, which at
+  // 1x leaves room for a single auto-capture.
+  const [speed, setSpeed]         = useState(0.5);
   const [stats, setStats]         = useState({ sent: 0, received: 0, avgMs: 0 });
   const sentRef = useRef(0);
   const recvRef = useRef(0);
