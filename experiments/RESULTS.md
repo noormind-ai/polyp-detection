@@ -149,3 +149,77 @@ compute located close to Helsinki** — not GPU vs. CPU, not payload size:
 - None of this has been benchmarked yet — the network-distance hypothesis is well-supported
   (raw TCP connect ~107ms to `api.modal.com`) but the actual fix needs testing against a real
   EU-region deployment before committing to it.
+
+## Part 4: a local GPU, in-process — the predicted fix, measured
+
+The "small always-on GPU box" option above was taken: a rented IranServer VM with a dedicated
+**RTX 2080 Ti** (11 GB, compute 7.5, driver 580.65.06), Ubuntu 24.04, torch 2.5.1+cu124. The model
+runs **inside the FastAPI process** (`backend/services/local_gpu.py`, `INFERENCE_BACKEND=local`) —
+no Modal, no separate inference service, no network hop at all between backend and GPU. Same
+weights (`goktug14/yolov5_kvasir_polyp`, revision `a1fe72b5`), same `conf=0.3`, so the numbers are
+comparable to parts 1–3 rather than measuring a different model.
+
+### 4a. Compute alone (same method as part 2)
+
+200 frames of `test_polyp_seq2.mp4` at 320px/q0.85, timed inside the process, `cuda.synchronize()`
+after each forward pass:
+
+| | mean | p50 | p95 |
+|---|---|---|---|
+| JPEG decode | 0.52 ms | — | — |
+| GPU forward | **17.67 ms** | 17.33 | 18.91 |
+| decode + forward | 18.18 ms | 17.86 | 19.51 |
+
+55.0 fps serial. Peak VRAM 134 MiB allocated / 156 MiB reserved — the 11 GB card is barely touched.
+
+The 2080 Ti is ~1.6x slower than Modal's A100 at the forward pass (17.7ms vs ~11ms), exactly as
+expected for the class of card. That difference is irrelevant next to the ~245ms of invocation
+overhead it removes.
+
+### 4b. End-to-end through the real pipeline (same harness as part 1)
+
+`experiments/latency_bench.py` against the live backend, one frame in flight, full width x quality
+matrix. Raw data: `results/latency_20260810_135543.csv` / `..._summary.csv`.
+
+| width | quality | payload (KB) | e2e mean (ms) | e2e p50 | e2e p90 | e2e p95 | infer (ms) | network (ms) | fps | part 1 e2e | speedup |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 160 | 0.60 | 3.1  | **23.2** | 22.6 | 24.8 | 25.8 | 21.8 | 1.4 | 43.19 | 255.3 | 11.0x |
+| 160 | 0.85 | 5.4  | **23.6** | 23.2 | 25.2 | 25.7 | 22.1 | 1.4 | 42.45 | 250.4 | 10.6x |
+| 224 | 0.60 | 4.8  | **23.5** | 23.2 | 25.1 | 25.4 | 22.0 | 1.4 | 42.63 | 254.0 | 10.8x |
+| 224 | 0.85 | 8.7  | **24.0** | 24.0 | 25.2 | 26.6 | 22.4 | 1.5 | 41.69 | 260.0 | 10.8x |
+| 320 | 0.60 | 8.2  | **24.4** | 23.9 | 26.3 | 28.0 | 22.9 | 1.5 | 41.02 | 256.9 | 10.5x |
+| 320 | 0.85 | 15.1 | **25.3** | 24.7 | 28.4 | 29.3 | 23.5 | 1.8 | 39.47 | 259.6 | 10.3x |
+| 480 | 0.60 | 15.4 | **24.9** | 24.8 | 25.8 | 27.0 | 22.9 | 2.0 | 40.11 | 270.9 | 10.9x |
+| 480 | 0.85 | 28.3 | **25.6** | 25.4 | 27.1 | 27.7 | 23.0 | 2.6 | 39.04 | 260.3 | 10.2x |
+| 640 | 0.60 | 24.0 | **25.1** | 25.0 | 26.6 | 27.0 | 22.9 | 2.2 | 39.77 | 261.1 | 10.4x |
+| 640 | 0.85 | 43.2 | **26.0** | 25.6 | 27.4 | 28.0 | 22.9 | 3.1 | 38.51 | 264.6 | 10.2x |
+
+*(0 failed frames in every config, as before.)*
+
+**Every config now passes the 200ms target. In part 1, none did.**
+
+### What this confirms
+
+The part 2 diagnosis was correct and the fix behaves exactly as it predicted. Removing the
+transatlantic hop cut ~250ms to ~24ms — a **~10x end-to-end improvement** — while the GPU itself
+got *slower* (A100 → 2080 Ti). Latency is now dominated by actual compute (~22ms of the ~24ms),
+which is the regime you want: it means further gains have to come from the model or from FP16,
+not from plumbing.
+
+Two things that stayed true from part 1 and are worth noting because they're now clearly visible:
+payload size still barely matters (23.2ms at 3 KB vs 26.0ms at 43 KB — a 14x payload increase
+costs 2.8ms, all of it transport), and the model still resizes internally regardless of what it is
+handed. The practical consequence is that **there is no longer any reason to downscale aggressively
+for latency** — 640px costs ~3ms over 160px, so the width choice can be made on detection quality
+instead.
+
+### Caveat, same shape as part 1's
+
+This was measured from the server itself against `127.0.0.1`, so it excludes the browser↔backend
+leg. That leg is now the dominant unknown: at ~24ms of server-side latency, a clinic's network path
+to the box will contribute more than inference does. Worth a second pass from a machine on the
+actual clinical network before quoting a motion-to-photon figure.
+
+Note also that both deployments still exist and are selectable at runtime
+(`/api/backends`, backend chooser in the UI) — Modal was not removed, so this comparison can be
+re-run on the same box whenever the Modal credentials are present.
