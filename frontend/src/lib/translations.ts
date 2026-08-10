@@ -20,6 +20,8 @@ export const FA: Record<string, string> = {
   "~250ms per frame from here": "حدود 250 میلی‌ثانیه بر فریم از اینجا",
   "Not configured on this server": "روی این سرور پیکربندی نشده است",
   "Inference latency (avg)": "تأخیر استنتاج (میانگین)",
+  "Show dr-found lane": "نمایش ستون «پزشک یافت»",
+  "Hide dr-found lane": "پنهان کردن ستون «پزشک یافت»",
   "Frame-by-frame · ~25ms/frame": "فریم‌به‌فریم · حدود 25 میلی‌ثانیه بر فریم",
   "Running inference on the local GPU...": "در حال اجرای استنتاج روی GPU محلی...",
   "Opening the local GPU...": "در حال باز کردن GPU محلی...",

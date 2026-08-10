@@ -43,7 +43,10 @@ export default function RealtimePlayer({
   const [wsStatus, setWsStatus]   = useState<"connecting" | "open" | "error" | "closed">("connecting");
   const [closeCode, setCloseCode] = useState<number | null>(null);
   const [polyp, setPolyp]         = useState(false);
-  const [speed, setSpeed]         = useState(0.1); // slow default — demo footage moves too fast to react to otherwise
+  // 1x default: the slow default existed because a ~250ms round trip made the two
+  // panels drift badly at real speed. At ~20ms on a local GPU they stay in step,
+  // so there is no longer a reason to play the footage in slow motion.
+  const [speed, setSpeed]         = useState(1);
   const [stats, setStats]         = useState({ sent: 0, received: 0, avgMs: 0 });
   const [lastError, setLastError] = useState("");
   const [duration, setDuration]   = useState(0);
@@ -52,7 +55,13 @@ export default function RealtimePlayer({
   const [videoEnded, setVideoEnded]   = useState(false);
   const [aspect, setAspect]           = useState("560/480"); // replaced with the clip's real ratio on load
   const [showDetected, setShowDetected] = useState(true);
-  const [showLive, setShowLive]         = useState(true);
+  // Raw feed off by default — it's the reference copy, and hiding it hands its
+  // height to the analysed panel, which is the one actually being read during a
+  // procedure. Still mounted while hidden so capture and inference keep running.
+  const [showLive, setShowLive]         = useState(false);
+  // How many feedback lanes are on screen, reported by FeedbackPanel. Drives the
+  // column count so video and every visible lane stay equal width.
+  const [feedbackLanes, setFeedbackLanes] = useState(1);
   const msHistory = useRef<number[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const lastBoxesRef = useRef<Box[]>([]); // AI's most recent detections — attached as context to manual captures
@@ -370,7 +379,9 @@ export default function RealtimePlayer({
           viewport height (not aspect ratio) for the same reason; they letterbox
           rather than push the controls off-screen. Stacks on narrow screens. */}
       {videoUrl && (
-        <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 items-start">
+        <div className={`grid grid-cols-1 gap-4 items-start ${
+          feedbackLanes === 2 ? "xl:grid-cols-3" : "xl:grid-cols-2"
+        }`}>
           <div className="space-y-2 min-w-0">
             {/* Detected on top — it's the panel being read during the procedure */}
             <div className="space-y-1">
@@ -466,11 +477,13 @@ export default function RealtimePlayer({
             </button>
           </div>
 
-          {/* Feedback box spans the remaining two columns and splits them into its
-              own two lanes, so video / AI-detected / dr-found all end up 1/3 wide.
+          {/* Feedback box spans one column per visible lane, so video and every
+              lane are the same width whether one lane is showing or two.
               Scrolls internally so it never lengthens the page. */}
-          <div className="min-w-0 xl:col-span-2 rounded-2xl border border-gray-800 bg-gray-900/40 p-3 xl:sticky xl:top-4 xl:max-h-[calc(100vh-2rem)] xl:overflow-y-auto">
-            <FeedbackPanel caseId={caseId} refreshSignal={feedbackRefreshKey} />
+          <div className={`min-w-0 rounded-2xl border border-gray-800 bg-gray-900/40 p-3 xl:sticky xl:top-4 xl:max-h-[calc(100vh-2rem)] xl:overflow-y-auto ${
+            feedbackLanes === 2 ? "xl:col-span-2" : "xl:col-span-1"
+          }`}>
+            <FeedbackPanel caseId={caseId} refreshSignal={feedbackRefreshKey} onVisibleLanes={setFeedbackLanes} />
           </div>
         </div>
       )}

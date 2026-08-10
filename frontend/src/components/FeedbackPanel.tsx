@@ -50,8 +50,12 @@ const byNewest = (a: Entry, b: Entry) => Number(b.timestamp || 0) - Number(a.tim
 // never interrupts whatever's open. Dr-found: newest-first, a new capture
 // always takes over its own window immediately (doctor-caught misses are
 // urgent) — but this NEVER touches the AI-detected lane or vice versa.
-export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: string; refreshSignal?: number }) {
+export default function FeedbackPanel({ caseId, refreshSignal, onVisibleLanes }: { caseId: string; refreshSignal?: number; onVisibleLanes?: (n: number) => void }) {
   const { t } = useLanguage();
+  // The dr-found lane stays out of the way until it has something in it, or the
+  // user asks for it — during a normal session nothing lands there, and an empty
+  // lane was just taking width away from the two panels being read.
+  const [drLaneRequested, setDrLaneRequested] = useState(false);
   const [pending, setPending] = useState<Entry[]>([]);
   const [drFound, setDrFound] = useState<Entry[]>([]);
   const [reviewed, setReviewed] = useState<Entry[]>([]); // confirmed + false_positive (ex-pending)
@@ -212,11 +216,29 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
   }
 
   const reviewedDrFound = drFound.filter((e) => dismissedRef.current.has(e.filename));
+  const drLaneVisible = drLaneRequested || drFound.length > 0;
+
+  // Tell the parent how many lanes are showing so it can match the column count
+  // and keep video and lanes the same width.
+  useEffect(() => {
+    onVisibleLanes?.(drLaneVisible ? 2 : 1);
+  }, [drLaneVisible, onVisibleLanes]);
 
   return (
-    // Two lanes side by side — the feedback column is given the wider half of
-    // the layout precisely so this fits without stacking.
-    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 items-start">
+    <>
+      {/* Only offer the toggle when the lane is empty; once anything lands in it
+          the lane appears on its own and hiding it would bury unreviewed work. */}
+      {drFound.length === 0 && (
+        <div className="flex justify-end mb-2">
+          <button
+            onClick={() => setDrLaneRequested((v) => !v)}
+            className="text-xs px-2 py-0.5 rounded-md border border-gray-800 text-gray-500 hover:text-gray-300 hover:border-gray-600 transition-colors"
+          >
+            {drLaneRequested ? t("Hide dr-found lane") : t("Show dr-found lane")}
+          </button>
+        </div>
+      )}
+    <div className={`grid grid-cols-1 gap-3 items-start ${drLaneVisible ? "md:grid-cols-2" : ""}`}>
       <Lane
         title={t("🤖 AI detected")}
         activeEntries={pending}
@@ -239,7 +261,7 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
         onOpenReviewed={(e) => setPendingKey(e.filename)}
       />
 
-      <Lane
+      {drLaneVisible && <Lane
         title={t("👁 Dr. found, AI missed")}
         activeEntries={drFound.filter((e) => !dismissedRef.current.has(e.filename))}
         current={drCurrent}
@@ -259,8 +281,9 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
         reviewedTitle={t("Already reviewed")}
         reviewedEntries={reviewedDrFound}
         onOpenReviewed={(e) => setDrKey(e.filename)}
-      />
+      />}
     </div>
+    </>
   );
 }
 
@@ -376,7 +399,10 @@ function ReviewCard({ entry, onSkip, renderActions }: {
         <button onClick={onSkip} className="text-xs text-gray-500 hover:text-gray-300 transition-colors">{t("Skip → next")}</button>
       </div>
 
-      <div className="relative w-full max-w-xl mx-auto rounded-xl overflow-hidden border border-gray-800 bg-black">
+      {/* No max-width: the review frame fills its lane so it matches the video
+          panel beside it. Both come from the same clip, so equal width means
+          equal size — which is the point, since they're compared side by side. */}
+      <div className="relative w-full rounded-xl overflow-hidden border border-gray-800 bg-black">
         <img
           src={`${API}/api/feedback/${entry.case_id}/image/${entry.filename}`}
           alt=""
