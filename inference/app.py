@@ -33,7 +33,15 @@ HF_FILE = "weights/best.pt"
 
 
 @app.cls(
-    gpu="A100",
+    # T4, not A100. The latency benchmark (experiments/RESULTS.md) measured the
+    # forward pass at ~11ms against a ~255ms round trip — GPU compute is under 5%
+    # of what the user waits for, the other 95% is RPC/network distance to Modal's
+    # US region. Paying A100 rates to shave milliseconds off the 5% was buying
+    # nothing anyone can perceive. A T4 is several times cheaper per hour and runs
+    # a 320px YOLOv5 comfortably; the extra few ms disappear inside the network
+    # noise. If latency ever becomes the priority, the lever is GPU *location*
+    # (an EU region), not a bigger card.
+    gpu="T4",
     image=image,
     volumes={MODELS_DIR: volume},
     scaledown_window=300,  # container stops 5min after last request — short enough to control cost, long enough to survive normal UI setup time between warmup and first frame
