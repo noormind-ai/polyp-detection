@@ -274,7 +274,7 @@ export default function Home() {
               <button onClick={() => setMode(null)} className="text-sm text-gray-500 hover:text-gray-300 transition-colors">
                 {t("← Back")}
               </button>
-              <LiveCameraPlayer onStop={() => setMode(null)} onActivity={markActive} />
+              <LiveCameraPlayer caseId={caseId ?? "no-case"} onStop={() => setMode(null)} onActivity={markActive} />
             </div>
           )}
 
@@ -283,7 +283,7 @@ export default function Home() {
               <button onClick={() => setMode(null)} className="text-sm text-gray-500 hover:text-gray-300 transition-colors">
                 {t("← Back")}
               </button>
-              <LiveCameraPlayer onStop={() => setMode(null)} onActivity={markActive} initialMode="screen" />
+              <LiveCameraPlayer caseId={caseId ?? "no-case"} onStop={() => setMode(null)} onActivity={markActive} initialMode="screen" />
             </div>
           )}
         </div>

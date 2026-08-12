@@ -214,9 +214,10 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
   const reviewedDrFound = drFound.filter((e) => dismissedRef.current.has(e.filename));
 
   return (
-    // Two lanes side by side — the feedback column is given the wider half of
-    // the layout precisely so this fits without stacking.
-    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 items-start">
+    // Two lanes side by side — one per column of the parent's three equal
+    // tracks. The gap has to match the parent grid's (gap-4) or the lanes come
+    // out a few pixels wider than the video column next to them.
+    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-start">
       <Lane
         title={t("🤖 AI detected")}
         activeEntries={pending}
@@ -376,7 +377,9 @@ function ReviewCard({ entry, onSkip, renderActions }: {
         <button onClick={onSkip} className="text-xs text-gray-500 hover:text-gray-300 transition-colors">{t("Skip → next")}</button>
       </div>
 
-      <div className="relative w-full max-w-xl mx-auto rounded-xl overflow-hidden border border-gray-800 bg-black">
+      {/* Fills the lane, no width cap — the captured frame has the same ratio as
+          the live video, so at equal column widths it renders at the same size. */}
+      <div className="relative w-full rounded-xl overflow-hidden border border-gray-800 bg-black">
         <img
           src={`${API}/api/feedback/${entry.case_id}/image/${entry.filename}`}
           alt=""

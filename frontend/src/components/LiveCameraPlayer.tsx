@@ -1,17 +1,23 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import FeedbackPanel from "./FeedbackPanel";
 import { useLanguage } from "@/lib/i18n";
+import { useRollingClip } from "@/lib/useRollingClip";
 
+const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001";
 const API_WS = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001").replace(/^http/, "ws");
 const INFER_TIMEOUT_MS = 6000;
 // Resize frames to this width before sending — faster inference, smaller payload
 const INFER_WIDTH = 320;
+// Same throttle as the real-time player: once a polyp is flagged, wait this long
+// before auto-capturing again so the queue fills with distinct moments.
+const AUTO_CAPTURE_COOLDOWN_MS = 4000;
 
 interface Box { bbox: [number, number, number, number]; conf: number; }
 interface Timing { recv_ms: number; modal_ms: number; total_ms: number; }
 
-export default function LiveCameraPlayer({ onStop, onActivity, wsPath = "/api/ws/infer", initialMode = "camera" }: { onStop: () => void; onActivity?: () => void; wsPath?: string; initialMode?: "camera" | "screen" }) {
+export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = "/api/ws/infer", initialMode = "camera" }: { caseId: string; onStop: () => void; onActivity?: () => void; wsPath?: string; initialMode?: "camera" | "screen" }) {
   const { t } = useLanguage();
   const WS_URL = `${API_WS}${wsPath}`;
   const videoRef    = useRef<HTMLVideoElement>(null);
@@ -19,6 +25,8 @@ export default function LiveCameraPlayer({ onStop, onActivity, wsPath = "/api/ws
   const wsRef       = useRef<WebSocket | null>(null);
   const scanRef     = useRef(false); // capture loop running?
   const streamRef   = useRef<MediaStream | null>(null);
+  const lastAutoCaptureRef = useRef(0);
+  const lastBoxesRef = useRef<Box[]>([]); // AI's most recent detections — attached as context to manual captures
 
   // Pending response promise resolver — one in-flight request at a time
   const pendingRef = useRef<((v: { boxes: Box[]; timing: Timing } | null) => void) | null>(null);
@@ -34,7 +42,18 @@ export default function LiveCameraPlayer({ onStop, onActivity, wsPath = "/api/ws
   const [lastError, setLastError]         = useState("");
   const [cameraBusy, setCameraBusy]       = useState(false); // device held by another app — offer screen-share fallback
   const [captureMode, setCaptureMode]     = useState<"camera" | "screen">("camera");
+  // Mirrored into a ref because the capture loop is a long-running closure that
+  // would otherwise read whatever the mode was when it started.
+  const captureModeRef = useRef<"camera" | "screen">("camera");
+  const [feedbackRefreshKey, setFeedbackRefreshKey] = useState(0);
+  const [aspect, setAspect]               = useState("560/480"); // replaced with the stream's real ratio once it starts
+  const [showDetected, setShowDetected]   = useState(true);
+  const [showLive, setShowLive]           = useState(true);
   const msHistory = useRef<number[]>([]);
+
+  // Only starts recording once there's actually a stream on the element —
+  // captureStream() on an empty <video> yields no tracks and MediaRecorder refuses it.
+  const { getClip } = useRollingClip(streaming ? videoRef.current : null);
 
   // Crop applied to screen-share frames before sending (normalized 0..1, relative to native frame size).
   // Lets you box just the video-feed area out of a shared app window that also shows toolbars/UI chrome.
@@ -45,6 +64,11 @@ export default function LiveCameraPlayer({ onStop, onActivity, wsPath = "/api/ws
   const dragStartRef = useRef<{ x: number; y: number } | null>(null);
   const snapshotCanvasRef = useRef<HTMLCanvasElement>(null);
   const CROP_KEY = "polyp_screen_crop_rect";
+
+  function switchCaptureMode(mode: "camera" | "screen") {
+    captureModeRef.current = mode;
+    setCaptureMode(mode);
+  }
 
   function setCropRect(rect: typeof cropRect) {
     cropRectRef.current = rect;
@@ -154,7 +178,72 @@ export default function LiveCameraPlayer({ onStop, onActivity, wsPath = "/api/ws
     }
   }
 
-  function updateBoxes(b: Box[]) { setPolyp(b.length > 0); }
+  function updateBoxes(b: Box[]) { setPolyp(b.length > 0); lastBoxesRef.current = b; }
+
+  // The region of the live frame that actually gets sent to the model — the
+  // crop for screen-share, the whole frame otherwise. Manual captures use the
+  // same region so a saved frame matches what the AI was looking at.
+  // The crop is persisted in localStorage and restored on mount, so it has to
+  // be gated on the mode: otherwise a region drawn during an earlier screen
+  // share silently keeps cropping the camera feed, with no UI to clear it.
+  function sourceRect(video: HTMLVideoElement) {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const crop = captureModeRef.current === "screen" ? cropRectRef.current : null;
+    return {
+      x: crop ? Math.round(crop.x * vw) : 0,
+      y: crop ? Math.round(crop.y * vh) : 0,
+      w: crop ? Math.round(crop.w * vw) : vw,
+      h: crop ? Math.round(crop.h * vh) : vh,
+    };
+  }
+
+  // Auto-capture — the clean (no-overlay) frame that was already grabbed for
+  // inference, plus what the model saw, plus a rolling clip if available.
+  // Throttled so a polyp staying in view for a while doesn't flood the queue.
+  function maybeAutoCapture(cap: HTMLCanvasElement, boxes: Box[]) {
+    if (boxes.length === 0) return;
+    const now = Date.now();
+    if (now - lastAutoCaptureRef.current < AUTO_CAPTURE_COOLDOWN_MS) return;
+    lastAutoCaptureRef.current = now;
+
+    cap.toBlob(async (blob) => {
+      if (!blob) return;
+      const fd = new FormData();
+      fd.append("file", blob, "frame.jpg");
+      fd.append("ai_detections", JSON.stringify(boxes));
+      const clip = getClip();
+      if (clip) fd.append("video", clip, "clip.webm");
+      try {
+        await fetch(`${API}/api/feedback/${caseId}/auto-capture`, { method: "POST", body: fd });
+        setFeedbackRefreshKey((k) => k + 1);
+      } catch { /* best-effort — never interrupt the live loop over this */ }
+    }, "image/jpeg", 0.85);
+  }
+
+  // Instant, no-dialog manual capture of whatever is on screen right now — the
+  // one case auto-capture can't cover, a doctor spotting something the model
+  // missed. Box drawing/correction happens in the side panel, not in a popup.
+  function captureDrFound() {
+    const video = videoRef.current;
+    if (!video || !video.videoWidth) return;
+    const src = sourceRect(video);
+    const cap = document.createElement("canvas");
+    cap.width = src.w;
+    cap.height = src.h;
+    cap.getContext("2d")!.drawImage(video, src.x, src.y, src.w, src.h, 0, 0, src.w, src.h);
+    cap.toBlob(async (blob) => {
+      if (!blob) return;
+      const fd = new FormData();
+      fd.append("file", blob, "frame.jpg");
+      fd.append("ai_detections", JSON.stringify(lastBoxesRef.current));
+      const clip = getClip();
+      if (clip) fd.append("video", clip, "clip.webm");
+      try {
+        await fetch(`${API}/api/feedback/${caseId}/dr-found/capture`, { method: "POST", body: fd });
+        setFeedbackRefreshKey((k) => k + 1);
+      } catch { /* best-effort */ }
+    }, "image/jpeg", 0.9);
+  }
 
   // Live loop — send current frame → wait for result → send next. No seeking:
   // the video plays continuously, we just grab whatever frame is current each time.
@@ -170,12 +259,10 @@ export default function LiveCameraPlayer({ onStop, onActivity, wsPath = "/api/ws
         continue;
       }
 
-      const vw = video.videoWidth, vh = video.videoHeight;
-      const crop  = cropRectRef.current;
-      const srcX  = crop ? Math.round(crop.x * vw) : 0;
-      const srcY  = crop ? Math.round(crop.y * vh) : 0;
-      const srcW  = crop ? Math.round(crop.w * vw) : vw;
-      const srcH  = crop ? Math.round(crop.h * vh) : vh;
+      const { x: srcX, y: srcY, w: srcW, h: srcH } = sourceRect(video);
+      // Size the panels to the region actually being analyzed, so the two live
+      // panels and the captured feedback frames all share one aspect ratio.
+      setAspect(`${srcW}/${srcH}`);
 
       const scale = INFER_WIDTH / srcW;
       const capW  = INFER_WIDTH;
@@ -201,6 +288,7 @@ export default function LiveCameraPlayer({ onStop, onActivity, wsPath = "/api/ws
       if (result) {
         updateBoxes(result.boxes);
         drawAnalyzedFrame(cap, result.boxes);
+        maybeAutoCapture(cap, result.boxes);
       }
     }
   }
@@ -242,7 +330,7 @@ export default function LiveCameraPlayer({ onStop, onActivity, wsPath = "/api/ws
         video.srcObject = stream;
         await video.play();
       }
-      setCaptureMode("camera");
+      switchCaptureMode("camera");
       setCameraBusy(false);
       setLastError("");
       setStreaming(true);
@@ -272,7 +360,7 @@ export default function LiveCameraPlayer({ onStop, onActivity, wsPath = "/api/ws
         await video.play();
       }
       stream.getVideoTracks()[0].addEventListener("ended", stopCamera);
-      setCaptureMode("screen");
+      switchCaptureMode("screen");
       setCameraBusy(false);
       setStreaming(true);
       startLoop();
@@ -354,6 +442,26 @@ export default function LiveCameraPlayer({ onStop, onActivity, wsPath = "/api/ws
   }
 
   const wsOk = wsStatus === "open";
+  // Both panels show the same frame at the same size — one just carries the AI
+  // mask and trails by the inference round-trip. Hidden panels are clipped,
+  // never unmounted: the <video> holds the MediaStream and the <canvas> has to
+  // keep being drawn into for inference to continue while it's out of sight.
+  const panelBox = "relative w-full rounded-xl overflow-hidden border border-gray-800 bg-black";
+  // When a screen-share crop is active the Detected panel shows only that region,
+  // so the Live panel has to be blown up and offset to the same region — otherwise
+  // it sits next to a panel that looks zoomed in relative to it. The scaled <video>
+  // keeps its native ratio exactly (the panel box is already the crop's ratio), so
+  // this crops without distorting.
+  const liveCrop = captureMode === "screen" ? cropRect : null;
+  const liveStyle = liveCrop
+    ? {
+        width: `${100 / liveCrop.w}%`,
+        height: `${100 / liveCrop.h}%`,
+        left: `${(-liveCrop.x * 100) / liveCrop.w}%`,
+        top: `${(-liveCrop.y * 100) / liveCrop.h}%`,
+      }
+    : undefined;
+  const toggleBtn = "text-xs px-2 py-0.5 rounded-md border border-gray-800 text-gray-500 hover:text-gray-300 hover:border-gray-600 transition-colors flex-shrink-0";
   const wsStatusText =
     wsStatus === "open" ? t("connected") :
     wsStatus === "closed" ? t("closed ({code})", { code: closeCode ?? "" }) :
@@ -486,44 +594,90 @@ export default function LiveCameraPlayer({ onStop, onActivity, wsPath = "/api/ws
 
       {/* Always mounted (just hidden) so the <video> node exists before `streaming` flips true —
           otherwise startStream() has nowhere to attach the MediaStream. */}
-      <div className={streaming ? "space-y-3" : "hidden"}>
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          <div className="space-y-1.5">
-            <p className="text-xs text-gray-500 uppercase tracking-wide">{t("Live · no lag")}</p>
-            <div className="relative w-full rounded-xl overflow-hidden border border-gray-800 bg-black"
-              style={{ aspectRatio: "560/480" }}>
-              <video ref={videoRef} muted playsInline className="absolute inset-0 w-full h-full object-cover" />
-            </div>
-          </div>
-          <div className="space-y-1.5">
-            <p className="text-xs text-gray-500 uppercase tracking-wide">
-              {t("Detected · ~{avgMs}ms behind live", { avgMs: stats.avgMs || 250 })}
-            </p>
-            <div className="relative w-full rounded-xl overflow-hidden border border-gray-800 bg-black"
-              style={{ aspectRatio: "560/480" }}>
-              <canvas ref={analyzedRef} className="absolute inset-0 w-full h-full object-contain" />
-            </div>
-          </div>
-        </div>
-
-        {captureMode === "camera" && devices.length > 1 && deviceSelect}
-
-        {captureMode === "screen" && (
-          <div className="flex items-center gap-3 text-sm">
-            <button onClick={openRegionSelector} className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg text-white transition-colors">
-              {cropRect ? t("Change capture region") : t("Select capture region")}
+      <div className={streaming ? "" : "hidden"}>
+        {/* Three equal columns — capture on the left, the two feedback lanes
+            taking the other two. Same structure (and same card chrome) as the
+            real-time player, so the live panels and the captured feedback
+            frames render at identical size. Stacks on narrow screens. */}
+        <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 items-start">
+          <div className="space-y-2 min-w-0 bg-gray-900/50 border border-gray-800 rounded-xl p-3">
+            {/* Right at the top of the column — it's pressed mid-procedure, so it
+                should never be somewhere you have to look for or scroll to. */}
+            <button
+              onClick={captureDrFound}
+              className="w-full py-2.5 px-4 rounded-xl bg-emerald-700 hover:bg-emerald-600 text-white font-medium text-sm transition-colors"
+            >
+              {t("👁 Dr. found a polyp AI missed")}
             </button>
-            {cropRect && (
-              <button onClick={() => setCropRect(null)} className="text-gray-500 hover:text-gray-300 transition-colors">
-                {t("Reset (use full frame)")}
-              </button>
-            )}
-          </div>
-        )}
 
-        <button onClick={stopCamera} className="text-sm text-gray-500 hover:text-gray-300 transition-colors">
-          {captureMode === "screen" ? t("← Disconnect screen share") : t("← Disconnect camera")}
-        </button>
+            {/* Detected next — it's the panel being read during the procedure */}
+            <div className="space-y-1">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-xs text-gray-500 uppercase tracking-wide truncate">
+                  {t("Detected · ~{avgMs}ms behind live", { avgMs: stats.avgMs || 250 })}
+                </p>
+                <button onClick={() => setShowDetected(!showDetected)} className={toggleBtn}>
+                  {showDetected ? t("Hide") : t("Show")}
+                </button>
+              </div>
+              <div className={showDetected ? "" : "h-0 overflow-hidden opacity-0"}>
+                <div className={panelBox} style={{ aspectRatio: aspect }}>
+                  <canvas ref={analyzedRef} className="absolute inset-0 w-full h-full object-contain" />
+                </div>
+              </div>
+            </div>
+
+            {/* Live source underneath, as the reference feed. Never unmounted —
+                the <video> is where startStream() attaches the MediaStream. */}
+            <div className="space-y-1">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-xs text-gray-500 uppercase tracking-wide truncate">{t("Live · no lag")}</p>
+                <button onClick={() => setShowLive(!showLive)} className={toggleBtn}>
+                  {showLive ? t("Hide") : t("Show")}
+                </button>
+              </div>
+              <div className={showLive ? "" : "h-0 overflow-hidden opacity-0"}>
+                <div className={panelBox} style={{ aspectRatio: aspect }}>
+                  <video
+                    ref={videoRef}
+                    muted
+                    playsInline
+                    className={liveStyle ? "absolute object-contain" : "absolute inset-0 w-full h-full object-contain"}
+                    style={liveStyle}
+                  />
+                </div>
+              </div>
+            </div>
+
+            {captureMode === "camera" && devices.length > 1 && deviceSelect}
+
+            {captureMode === "screen" && (
+              <div className="flex flex-wrap items-center gap-3 text-sm">
+                <button onClick={openRegionSelector} className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg text-white transition-colors">
+                  {cropRect ? t("Change capture region") : t("Select capture region")}
+                </button>
+                {cropRect && (
+                  <button onClick={() => setCropRect(null)} className="text-gray-500 hover:text-gray-300 transition-colors">
+                    {t("Reset (use full frame)")}
+                  </button>
+                )}
+              </div>
+            )}
+
+            <button onClick={stopCamera} className="text-sm text-gray-500 hover:text-gray-300 transition-colors">
+              {captureMode === "screen" ? t("← Disconnect screen share") : t("← Disconnect camera")}
+            </button>
+          </div>
+
+          {/* Feedback box — spans the remaining two tracks (one per lane) and
+              scrolls internally so it never lengthens the page. Mounted only
+              while streaming so it isn't polling behind the setup screen. */}
+          {streaming && (
+            <div className="min-w-0 xl:col-span-2 xl:sticky xl:top-4 xl:max-h-[calc(100vh-2rem)] xl:overflow-y-auto">
+              <FeedbackPanel caseId={caseId} refreshSignal={feedbackRefreshKey} />
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Always mounted (just hidden) so snapshotCanvasRef exists before openRegionSelector()

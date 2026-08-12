@@ -35,3 +35,5 @@ venv/
 frontend/.next.bak-*/
 frontend/frontend.log
 .git.broken-bak/
+
+frontend/tsconfig.tsbuildinfo
