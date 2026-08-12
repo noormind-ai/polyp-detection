@@ -52,6 +52,15 @@ async def session_start():
 
 @router.post("/session/stop")
 async def session_stop():
+    """Marks the end of a session from the UI's point of view.
+
+    It does NOT force the GPU container down, and deliberately does not
+    pretend to: Modal exposes no API to kill a deployed app's running
+    containers without undeploying the app itself, which would break the next
+    user. Release happens through scaledown_window in inference/app.py (120s)
+    instead — so the real saving comes from keeping that window short and from
+    never starting a container we do not need, not from this call.
+    """
     return {"status": "stopped"}
 
 

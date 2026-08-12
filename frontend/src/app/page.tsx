@@ -35,10 +35,15 @@ interface GtData {
 }
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001";
-// Must match scaledown_window in inference/app.py — Modal releases the GPU container
-// this long after its last request, so we drop back out of the live modes at the same
-// point instead of letting the user hit a surprise cold-start delay mid-procedure.
-const MODAL_IDLE_MS = 5 * 60 * 1000;
+// MUST match scaledown_window in inference/app.py (120s). Modal releases the GPU
+// container that long after its last request; we drop out of the live modes at the
+// same moment so the UI never claims a GPU that is already gone. Waiting longer
+// than the container lives would leave the next frame eating a cold start with a
+// green "GPU ready" indicator above it.
+//
+// This cannot fire mid-procedure: the capture loop calls onActivity on every
+// response, so the timer only counts down once streaming has actually stopped.
+const MODAL_IDLE_MS = 2 * 60 * 1000;
 
 /** The modes that spend GPU on a video the user supplied, and so need an account. */
 const NEEDS_ACCOUNT: Mode[] = ["upload"];
@@ -89,7 +94,7 @@ export default function Home() {
       if (Date.now() - lastActiveRef.current > MODAL_IDLE_MS) {
         stopGpu();
         setMode(null);
-        setError(t("Session timed out after 5 minutes idle — the GPU was released to save cost. Open live camera or screen share again to reconnect."));
+        setError(t("Session timed out after 2 minutes idle — the GPU was released to save cost. Open live camera or screen share again to reconnect."));
       }
     }, 5000);
     return () => clearInterval(interval);

@@ -210,8 +210,8 @@ export const FA: Record<string, string> = {
   "Demo clips replay saved results instantly. Live camera and screen share start a GPU when you open them.":
     "کلیپ‌های نمونه بلافاصله نتایج ذخیره‌شده را پخش می‌کنند. دوربین زنده و اشتراک صفحه هنگام باز شدن، یک GPU راه‌اندازی می‌کنند.",
   "Frame-by-frame on a demo or your own clip": "فریم‌به‌فریم روی یک نمونه یا کلیپ خودتان",
-  "Session timed out after 5 minutes idle — the GPU was released to save cost. Open live camera or screen share again to reconnect.":
-    "نشست پس از ۵ دقیقه بی‌فعالیتی به پایان رسید — برای صرفه‌جویی در هزینه، GPU آزاد شد. برای اتصال مجدد، دوربین زنده یا اشتراک صفحه را دوباره باز کنید.",
+  "Session timed out after 2 minutes idle — the GPU was released to save cost. Open live camera or screen share again to reconnect.":
+    "نشست پس از ۲ دقیقه بی‌فعالیتی به پایان رسید — برای صرفه‌جویی در هزینه، GPU آزاد شد. برای اتصال مجدد، دوربین زنده یا اشتراک صفحه را دوباره باز کنید.",
 
   // Saved-result replay for the bundled demo clips
   "saved results · no GPU": "نتایج ذخیره‌شده · بدون GPU",

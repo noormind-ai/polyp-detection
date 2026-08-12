@@ -44,7 +44,21 @@ HF_FILE = "weights/best.pt"
     gpu="T4",
     image=image,
     volumes={MODELS_DIR: volume},
-    scaledown_window=300,  # container stops 5min after last request — short enough to control cost, long enough to survive normal UI setup time between warmup and first frame
+    # Idle time is paid time: the container bills until this window expires
+    # after the last request. 2 minutes rather than the original 5.
+    #
+    # Safe to shorten because it cannot fire during actual use — the capture
+    # loop sends frames continuously while streaming, so the window only ever
+    # counts down once a session has genuinely stopped. The one case it has to
+    # survive is the gap between opening a live mode (which warms the GPU) and
+    # the first frame, while the operator is still granting camera permission
+    # and picking a device; 2 minutes is comfortably longer than that, and the
+    # cost of being wrong is one slow frame, not a failure.
+    #
+    # MODAL_IDLE_MS in frontend/src/app/page.tsx MUST match this — the UI uses
+    # it to decide when to drop out of a live mode, and if the UI waited longer
+    # than the container lives it would report a GPU that is already gone.
+    scaledown_window=120,
 )
 class PolypDetector:
 
