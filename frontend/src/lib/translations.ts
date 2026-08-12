@@ -185,4 +185,43 @@ export const FA: Record<string, string> = {
   "🗑 Discard": "🗑 حذف",
   "Already reviewed": "بررسی‌شده",
   "Queue": "صف",
+
+  // Sign-in — gates only the two modes that push a new video through the GPU
+  "Sign in": "ورود",
+  "Sign out": "خروج",
+  "Signed in as {user}": "واردشده به‌عنوان {user}",
+  "Create account": "ساخت حساب",
+  "Username": "نام کاربری",
+  "Password": "رمز عبور",
+  "Invite code": "کد دعوت",
+  "Please wait…": "لطفاً صبر کنید…",
+  "Sign in to analyse your own video": "برای تحلیل ویدیوی خودتان وارد شوید",
+  "Uploading runs the model on a GPU, so it needs an account. Live camera, screen share and the demo clips are open to everyone.":
+    "بارگذاری ویدیو مدل را روی GPU اجرا می‌کند و به همین دلیل نیاز به حساب کاربری دارد. دوربین زنده، اشتراک صفحه و کلیپ‌های نمونه برای همه آزاد است.",
+  "Accounts are issued by an administrator.": "حساب‌های کاربری توسط مدیر سامانه ایجاد می‌شوند.",
+  "← Try a demo clip instead (no account needed)": "← به‌جای آن یک کلیپ نمونه ببینید (بدون نیاز به حساب)",
+  "Sign-in failed.": "ورود ناموفق بود.",
+  "Registration failed.": "ثبت‌نام ناموفق بود.",
+  "Your session expired. Sign in again to upload.": "نشست شما منقضی شد. برای بارگذاری دوباره وارد شوید.",
+  "🔒 Sign-in required": "🔒 نیازمند ورود",
+
+  // Mode picker — no GPU runs until a live capture mode is opened
+  "⚡ Starts a GPU session": "⚡ یک نشست GPU آغاز می‌کند",
+  "Demo clips replay saved results instantly. Live camera and screen share start a GPU when you open them.":
+    "کلیپ‌های نمونه بلافاصله نتایج ذخیره‌شده را پخش می‌کنند. دوربین زنده و اشتراک صفحه هنگام باز شدن، یک GPU راه‌اندازی می‌کنند.",
+  "Frame-by-frame on a demo or your own clip": "فریم‌به‌فریم روی یک نمونه یا کلیپ خودتان",
+  "Session timed out after 5 minutes idle — the GPU was released to save cost. Open live camera or screen share again to reconnect.":
+    "نشست پس از ۵ دقیقه بی‌فعالیتی به پایان رسید — برای صرفه‌جویی در هزینه، GPU آزاد شد. برای اتصال مجدد، دوربین زنده یا اشتراک صفحه را دوباره باز کنید.",
+
+  // Saved-result replay for the bundled demo clips
+  "saved results · no GPU": "نتایج ذخیره‌شده · بدون GPU",
+  "idle · nothing running": "بی‌کار · چیزی در حال اجرا نیست",
+  "Frames replayed": "فریم‌های پخش‌شده",
+  "Detections precomputed once — this clip costs no GPU time":
+    "تشخیص‌ها یک‌بار از پیش محاسبه شده‌اند — این کلیپ هیچ زمان GPU مصرف نمی‌کند",
+  "Detected · saved result, in sync": "تشخیص‌شده · نتیجهٔ ذخیره‌شده، هم‌زمان",
+  "Replaying detections computed once at {width}px — identical to a live run, without the GPU":
+    "پخش تشخیص‌هایی که یک‌بار در {width} پیکسل محاسبه شده‌اند — مانند اجرای زنده، اما بدون GPU",
+  "Saved results for this clip are missing. Run data/precompute_demos.py to generate them.":
+    "نتایج ذخیره‌شدهٔ این کلیپ موجود نیست. برای ساخت آن‌ها data/precompute_demos.py را اجرا کنید.",
 };

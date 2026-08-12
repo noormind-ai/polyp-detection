@@ -3,6 +3,8 @@
 import { useEffect, useRef, useState } from "react";
 import DemoVideoPicker from "./DemoVideoPicker";
 import FeedbackPanel from "./FeedbackPanel";
+import LoginPanel from "./LoginPanel";
+import { useAuth } from "@/lib/auth";
 import { useLanguage } from "@/lib/i18n";
 import { useRollingClip } from "@/lib/useRollingClip";
 
@@ -10,7 +12,9 @@ const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001";
 const API_WS = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001").replace(/^http/, "ws");
 const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 const INFER_TIMEOUT_MS = 6000;
-// Resize frames to this width before sending — faster inference, smaller payload
+// Resize frames to this width before sending — faster inference, smaller payload.
+// data/precompute_demos.py encodes the saved demo results at this same width, so
+// replayed boxes land in the same coordinate space as live ones. Change both together.
 const INFER_WIDTH = 320;
 const SPEEDS = [0.1, 0.25, 0.5, 1, 1.5, 2];
 // Don't auto-capture the same ongoing detection every single frame — once a
@@ -21,9 +25,18 @@ const AUTO_CAPTURE_COOLDOWN_MS = 4000;
 interface Box { bbox: [number, number, number, number]; conf: number; }
 interface Timing { recv_ms: number; modal_ms: number; total_ms: number; }
 
+/** A demo clip's detections, precomputed once by data/precompute_demos.py. */
+interface PredData {
+  fps: number;
+  width: number;    // capture size the boxes are in — INFER_WIDTH at bake time
+  height: number;
+  frames: Box[][];  // index IS the frame number
+}
+
 export default function RealtimePlayer({
-  caseId, onStop, onActivity, wsPath = "/api/ws/infer",
+  caseId, onStop, onActivity, wsPath = "/api/ws/infer-file",
 }: { caseId: string; onStop: () => void; onActivity?: () => void; wsPath?: string }) {
+  const { user } = useAuth();
   const { t } = useLanguage();
   const WS_URL = `${API_WS}${wsPath}`;
   const videoRef    = useRef<HTMLVideoElement>(null);
@@ -31,11 +44,21 @@ export default function RealtimePlayer({
   const wsRef       = useRef<WebSocket | null>(null);
   const scanRef     = useRef(false); // capture loop running?
   const lastAutoCaptureRef = useRef(0);
+  // Replay reuses one scratch canvas instead of allocating per animation frame —
+  // the live loop can get away with allocating because it runs at inference
+  // speed (a few per second), replay runs at frame rate.
+  const replayCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const lastReplayIdxRef = useRef(-1);
 
   // Pending response promise resolver — one in-flight request at a time
   const pendingRef = useRef<((v: { boxes: Box[]; timing: Timing } | null) => void) | null>(null);
 
   const [videoUrl, setVideoUrl]   = useState<string | null>(null);
+  // Non-null => this clip replays saved detections and never opens a socket.
+  // The bundled demos always take this path: their footage never changes, so
+  // inferring it again on every visit was paying a GPU to recompute a constant.
+  const [pred, setPred]           = useState<PredData | null>(null);
+  const [loadingDemo, setLoadingDemo] = useState<string | null>(null);
   const [tab, setTab]             = useState<"upload" | "demo">("demo");
   const [dragging, setDragging]   = useState(false);
   const [wsStatus, setWsStatus]   = useState<"connecting" | "open" | "error" | "closed">("connecting");
@@ -57,8 +80,16 @@ export default function RealtimePlayer({
 
   const { getClip } = useRollingClip(videoRef.current);
 
-  // WebSocket — connect once on mount
+  /** True while showing a clip whose detections come from the GPU, live. */
+  const liveInference = videoUrl !== null && pred === null;
+
+  // WebSocket — opened only for a clip that actually needs the GPU, and torn
+  // down as soon as one isn't loaded. Connecting on mount (as this used to)
+  // meant merely opening Real-time held a socket against the GPU backend even
+  // if all you ever did was watch a demo.
   useEffect(() => {
+    if (!liveInference) return;
+    setWsStatus("connecting");
     const ws = new WebSocket(WS_URL);
     wsRef.current = ws;
 
@@ -90,7 +121,7 @@ export default function RealtimePlayer({
     };
 
     return () => { ws.close(); scanRef.current = false; };
-  }, []);
+  }, [liveInference, WS_URL]);
 
   // Apply the chosen playback speed to whatever video is currently loaded
   useEffect(() => {
@@ -223,6 +254,50 @@ export default function RealtimePlayer({
     }
   }
 
+  // Replay loop — the saved-results counterpart of startLoop.
+  //
+  // It deliberately reproduces what the live path puts on screen rather than
+  // taking a shortcut: the frame is downscaled to the same capture size the
+  // detections were computed at, and drawn through the same drawAnalyzedFrame,
+  // so the overlay is pixel-identical to a live run. Auto-capture still fires,
+  // because reviewing demo footage is a real workflow and it costs no GPU.
+  //
+  // The only honest difference: there is no round trip, so the "Detected" panel
+  // does not lag behind the source. The status bar says so instead of inventing
+  // a latency figure.
+  async function startReplayLoop(video: HTMLVideoElement, data: PredData) {
+    if (scanRef.current) return;
+    scanRef.current = true;
+    lastReplayIdxRef.current = -1;
+    video.loop = false;
+    video.playbackRate = speed;
+    await video.play();
+
+    if (!replayCanvasRef.current) replayCanvasRef.current = document.createElement("canvas");
+    const cap = replayCanvasRef.current;
+    cap.width = data.width;
+    cap.height = data.height;
+    const ctx = cap.getContext("2d")!;
+
+    while (scanRef.current) {
+      await new Promise<void>((res) => requestAnimationFrame(() => res()));
+      if (!video.videoWidth) continue;
+
+      // The frame index IS the array index — that is the contract the bake
+      // script writes to. Clamp so the final frame holds rather than blanking.
+      const idx = Math.min(data.frames.length - 1, Math.floor(video.currentTime * data.fps));
+      if (idx === lastReplayIdxRef.current) continue;
+      lastReplayIdxRef.current = idx;
+
+      const boxes = data.frames[idx] ?? [];
+      ctx.drawImage(video, 0, 0, cap.width, cap.height);
+      updateBoxes(boxes);
+      drawAnalyzedFrame(cap, boxes);
+      maybeAutoCapture(cap, boxes);
+      setStats((s) => ({ sent: s.sent + 1, received: s.received + 1, avgMs: 0 }));
+    }
+  }
+
   function handleVideoLoad() {
     const video = videoRef.current;
     if (!video) return;
@@ -230,7 +305,8 @@ export default function RealtimePlayer({
     // Size the panels to the clip's own shape — a fixed guess letterboxes
     // anything that isn't exactly that ratio.
     if (video.videoWidth && video.videoHeight) setAspect(`${video.videoWidth}/${video.videoHeight}`);
-    startLoop(video);
+    if (pred) startReplayLoop(video, pred);
+    else startLoop(video);
   }
 
   function handleTimeUpdate() {
@@ -252,24 +328,69 @@ export default function RealtimePlayer({
     setVideoEnded(false);
     video.currentTime = 0;
     setCurTime(0);
-    startLoop(video);
+    if (pred) startReplayLoop(video, pred);
+    else startLoop(video);
+  }
+
+  /** Counters and the detection flag describe ONE clip; carrying them across
+   *  clips leaves a stale "Polyp detected" lit over footage that has none. */
+  function resetClipState() {
+    scanRef.current = false;
+    setPolyp(false);
+    setStats({ sent: 0, received: 0, avgMs: 0 });
+    msHistory.current = [];
+    lastBoxesRef.current = [];
+    lastReplayIdxRef.current = -1;
+    setVideoEnded(false);
+    setLastError("");
+  }
+
+  /** Back to the picker: no clip, so nothing is running and nothing is connected. */
+  function unloadClip() {
+    resetClipState();
+    setVideoUrl(null);
+    setPred(null);
+  }
+
+  /** A user-supplied clip always means live GPU inference — clear any saved set. */
+  function loadUserFile(file: File) {
+    resetClipState();
+    setPred(null);
+    setVideoUrl(URL.createObjectURL(file));
   }
 
   function handleDrop(e: React.DragEvent) {
     e.preventDefault();
     setDragging(false);
     const file = e.dataTransfer.files[0];
-    if (file) { scanRef.current = false; setVideoUrl(URL.createObjectURL(file)); }
+    if (file) loadUserFile(file);
   }
 
   function handleFile(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
-    if (file) { scanRef.current = false; setVideoUrl(URL.createObjectURL(file)); }
+    if (file) loadUserFile(file);
   }
 
-  function handleDemoSelect(filename: string) {
-    scanRef.current = false;
-    setVideoUrl(`${BASE_PATH}/demos/${filename}`);
+  // Demos load their saved detections and play back from those. If the saved
+  // file is missing we deliberately do NOT silently fall back to live
+  // inference — that would quietly reintroduce exactly the GPU cost this
+  // removes, and the fix (re-run the bake script) belongs to whoever deploys.
+  async function handleDemoSelect(filename: string) {
+    resetClipState();
+    setLoadingDemo(filename);
+    try {
+      const stem = filename.replace(/\.mp4$/, "");
+      const res = await fetch(`${BASE_PATH}/demos/pred/${stem}_pred.json`);
+      if (!res.ok) throw new Error(String(res.status));
+      const data = (await res.json()) as PredData;
+      if (!data?.frames?.length) throw new Error("empty");
+      setPred(data);
+      setVideoUrl(`${BASE_PATH}/demos/${filename}`);
+    } catch {
+      setLastError(t("Saved results for this clip are missing. Run data/precompute_demos.py to generate them."));
+    } finally {
+      setLoadingDemo(null);
+    }
   }
 
   const wsOk = wsStatus === "open";
@@ -289,15 +410,36 @@ export default function RealtimePlayer({
     wsStatus === "closed" ? t("closed ({code})", { code: closeCode ?? "" }) :
     t(wsStatus);
 
+  // Replay has no socket and no GPU, so reporting a connection state (or a
+  // latency) would be describing something that isn't happening. Say what it
+  // actually is instead — the numbers below stay, they just count replayed
+  // frames rather than round trips.
+  const replaying = pred !== null;
+
   return (
     <div className="space-y-3">
       {/* Status bar */}
       <div className="flex items-center justify-between text-sm">
         <div className="flex items-center gap-3">
-          <span className={`flex items-center gap-1.5 ${wsOk ? "text-green-400" : "text-yellow-400"}`}>
-            <span className={`w-2 h-2 rounded-full inline-block ${wsOk ? "bg-green-400 animate-pulse" : "bg-yellow-400"}`} />
-            {wsStatusText}
-          </span>
+          {!videoUrl ? (
+            // Nothing loaded: no socket, no GPU. Showing the websocket's state
+            // here would report "connecting" at a moment when, by design,
+            // nothing is connecting at all.
+            <span className="flex items-center gap-1.5 text-gray-500">
+              <span className="w-2 h-2 rounded-full inline-block bg-gray-600" />
+              {t("idle · nothing running")}
+            </span>
+          ) : replaying ? (
+            <span className="flex items-center gap-1.5 text-cyan-400">
+              <span className="w-2 h-2 rounded-full inline-block bg-cyan-400" />
+              {t("saved results · no GPU")}
+            </span>
+          ) : (
+            <span className={`flex items-center gap-1.5 ${wsOk ? "text-green-400" : "text-yellow-400"}`}>
+              <span className={`w-2 h-2 rounded-full inline-block ${wsOk ? "bg-green-400 animate-pulse" : "bg-yellow-400"}`} />
+              {wsStatusText}
+            </span>
+          )}
           {polyp && <span className="text-[#39ff14] font-medium animate-pulse">{t("Polyp detected")}</span>}
         </div>
         <button onClick={onStop} className="text-sm text-red-400 hover:text-red-300 transition-colors">{t("Stop")}</button>
@@ -305,14 +447,21 @@ export default function RealtimePlayer({
 
       {/* Debug panel — one compact row, so it costs height only once */}
       <div className="bg-gray-900 border border-gray-800 rounded-lg px-3 py-1.5 font-mono text-xs flex flex-wrap items-center gap-x-5 gap-y-1">
-        <span><span className="text-gray-500">{t("Frames sent")} </span><span className="text-white">{stats.sent}</span></span>
-        <span><span className="text-gray-500">{t("Responses back")} </span><span className="text-white">{stats.received}</span></span>
-        <span>
-          <span className="text-gray-500">{t("Modal latency (avg)")} </span>
-          <span className={stats.avgMs > 800 ? "text-red-400" : "text-green-400"}>
-            {stats.avgMs > 0 ? t("{avgMs} ms", { avgMs: stats.avgMs }) : "—"}
-          </span>
-        </span>
+        <span><span className="text-gray-500">{replaying ? t("Frames replayed") : t("Frames sent")} </span><span className="text-white">{stats.sent}</span></span>
+        {!replaying && (
+          <>
+            <span><span className="text-gray-500">{t("Responses back")} </span><span className="text-white">{stats.received}</span></span>
+            <span>
+              <span className="text-gray-500">{t("Modal latency (avg)")} </span>
+              <span className={stats.avgMs > 800 ? "text-red-400" : "text-green-400"}>
+                {stats.avgMs > 0 ? t("{avgMs} ms", { avgMs: stats.avgMs }) : "—"}
+              </span>
+            </span>
+          </>
+        )}
+        {replaying && (
+          <span className="text-gray-500">{t("Detections precomputed once — this clip costs no GPU time")}</span>
+        )}
         {lastError && (
           <span className="min-w-0">
             <span className="text-gray-500">{t("Error")} </span>
@@ -336,11 +485,16 @@ export default function RealtimePlayer({
                 }`}
               >
                 {tabKey === "upload" ? t("Upload video") : t("Try a demo")}
+                {tabKey === "upload" && !user && <span className="ms-1.5 text-gray-600">🔒</span>}
               </button>
             ))}
           </div>
 
-          {tab === "upload" && (
+          {/* Your own clip means real per-frame GPU inference, so it needs an
+              account — unlike the demo tab next to it, which is free to run. */}
+          {tab === "upload" && !user && <LoginPanel onOpenDemos={() => setTab("demo")} />}
+
+          {tab === "upload" && user && (
             <div
               onDrop={handleDrop}
               onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
@@ -357,7 +511,7 @@ export default function RealtimePlayer({
           )}
 
           {tab === "demo" && (
-            <DemoVideoPicker onSelect={handleDemoSelect} />
+            <DemoVideoPicker onSelect={handleDemoSelect} loading={loadingDemo} />
           )}
         </div>
       )}
@@ -385,7 +539,9 @@ export default function RealtimePlayer({
             <div className="space-y-1">
               <div className="flex items-center justify-between gap-2">
                 <p className="text-xs text-gray-500 uppercase tracking-wide truncate">
-                  {t("Detected · ~{avgMs}ms behind live", { avgMs: stats.avgMs || 250 })}
+                  {replaying
+                    ? t("Detected · saved result, in sync")
+                    : t("Detected · ~{avgMs}ms behind live", { avgMs: stats.avgMs || 250 })}
                 </p>
                 <button onClick={() => setShowDetected(!showDetected)} className={toggleBtn}>
                   {showDetected ? t("Hide") : t("Show")}
@@ -458,7 +614,7 @@ export default function RealtimePlayer({
             </div>
 
             <button
-              onClick={() => { scanRef.current = false; setVideoUrl(null); }}
+              onClick={unloadClip}
               className="text-xs text-gray-500 hover:text-gray-300 transition-colors"
             >
               {t("← Load different video")}
@@ -476,7 +632,9 @@ export default function RealtimePlayer({
       )}
 
       <p className="text-xs text-gray-600">
-        {t("Frames scaled to {width}px before sending · one frame in flight at a time", { width: INFER_WIDTH })}
+        {replaying
+          ? t("Replaying detections computed once at {width}px — identical to a live run, without the GPU", { width: pred?.width ?? INFER_WIDTH })
+          : t("Frames scaled to {width}px before sending · one frame in flight at a time", { width: INFER_WIDTH })}
       </p>
     </div>
   );
