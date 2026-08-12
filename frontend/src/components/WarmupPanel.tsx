@@ -3,13 +3,16 @@
 import { useEffect, useState } from "react";
 import { useLanguage } from "@/lib/i18n";
 
+// Paced against a measured cold start (~13s on the T4, weights already in the
+// Modal Volume), not the ~60s this described when it named an A100 and assumed
+// a first-ever run that downloads the weights. Steps that scroll past long
+// after the GPU is ready read as a stalled system.
 const STEPS = [
-  { at: 0,     text: "Requesting A100 GPU on Modal..." },
-  { at: 5000,  text: "Container provisioning..." },
-  { at: 12000, text: "Loading runtime environment..." },
-  { at: 22000, text: "Downloading model weights (50 MB)..." },
-  { at: 38000, text: "Loading YOLOv5 into GPU memory..." },
-  { at: 52000, text: "Warming up inference pipeline..." },
+  { at: 0,     text: "Requesting T4 GPU on Modal..." },
+  { at: 2000,  text: "Container provisioning..." },
+  { at: 5000,  text: "Loading runtime environment..." },
+  { at: 8000,  text: "Loading YOLOv5 into GPU memory..." },
+  { at: 11000, text: "Warming up inference pipeline..." },
 ];
 
 export default function WarmupPanel() {
@@ -17,7 +20,7 @@ export default function WarmupPanel() {
   const [logs, setLogs] = useState<string[]>([]);
   const cliCommand = "modal app stop polyp-detection";
   const [footerBefore, footerAfter] = t(
-    "Cold start ~60s · Warm starts are instant · Stop with modal app stop polyp-detection"
+    "Cold start ~15s · Warm starts are instant · Stop with modal app stop polyp-detection"
   ).split(cliCommand);
 
   useEffect(() => {

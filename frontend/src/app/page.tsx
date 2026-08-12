@@ -317,7 +317,7 @@ export default function Home() {
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2 text-green-400 text-sm">
                     <span className="w-2 h-2 rounded-full bg-green-400 inline-block animate-pulse" />
-                    {t("GPU ready · Model loaded · A100 active")}
+                    {t("GPU ready · Model loaded · T4 active")}
                   </div>
                   <button
                     onClick={closeMode}

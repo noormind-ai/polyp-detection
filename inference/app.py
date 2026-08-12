@@ -1,5 +1,6 @@
 """
-Modal inference endpoint — runs on A100 GPU.
+Modal inference endpoint — runs on a T4 GPU (see the note on the gpu= arg below;
+training in train.py still uses an A100, which is a one-off, not per-request).
 Weights: goktug14/yolov5_kvasir_polyp (HuggingFace)
 Downloaded once to Modal Volume on first container start, reused forever after.
 
