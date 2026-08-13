@@ -71,7 +71,11 @@ function engineOptions(d: BackendInfo | null, t: (s: string) => string): EngineO
       icon: "☁️",
       title: t("Modal T4 (cloud GPU)"),
       detail: t("Serverless · released after 2 min idle"),
-      note: t("~25ms per frame · the current default"),
+      // Measured from this server, warm, three consecutive runs: 378/378/379ms.
+      // The T4 itself only spends ~17ms on a frame — the rest is the round trip
+      // to the US and back, per frame. Quoting the GPU time here would be a lie
+      // about what the user will actually experience.
+      note: t("~380ms per frame · round-trip to the US dominates"),
       usable: d.available?.modal !== false,
     },
   ];

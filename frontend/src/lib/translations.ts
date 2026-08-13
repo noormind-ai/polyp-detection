@@ -225,7 +225,7 @@ export const FA: Record<string, string> = {
   "Where should inference run?": "استنتاج کجا اجرا شود؟",
   "Modal T4 (cloud GPU)": "Modal T4 (پردازنده گرافیکی ابری)",
   "Serverless · released after 2 min idle": "بدون سرور · پس از ۲ دقیقه بیکاری آزاد می‌شود",
-  "~25ms per frame · the current default": "حدود ۲۵ میلی‌ثانیه برای هر فریم · پیش‌فرض فعلی",
+  "~380ms per frame · round-trip to the US dominates": "حدود ۳۸۰ میلی‌ثانیه برای هر فریم · رفت و برگشت به آمریکا غالب است",
   "This server's CPU": "پردازندهٔ همین سرور",
   "this server's CPU": "پردازندهٔ همین سرور",
   "Runs on this server's CPU · no GPU, no cloud": "روی پردازندهٔ همین سرور اجرا می‌شود · بدون GPU و بدون ابر",
