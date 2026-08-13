@@ -220,4 +220,20 @@ export const FA: Record<string, string> = {
     "پخش تشخیص‌هایی که یک‌بار در {width} پیکسل محاسبه شده‌اند — مانند اجرای زنده، اما بدون GPU",
   "Saved results for this clip are missing. Run data/precompute_demos.py to generate them.":
     "نتایج ذخیره‌شدهٔ این کلیپ موجود نیست. برای ساخت آن‌ها data/precompute_demos.py را اجرا کنید.",
+
+  // CPU inference engine picker
+  "Where should inference run?": "استنتاج کجا اجرا شود؟",
+  "Modal T4 (cloud GPU)": "Modal T4 (پردازنده گرافیکی ابری)",
+  "Serverless · released after 2 min idle": "بدون سرور · پس از ۲ دقیقه بیکاری آزاد می‌شود",
+  "~25ms per frame · the current default": "حدود ۲۵ میلی‌ثانیه برای هر فریم · پیش‌فرض فعلی",
+  "This server's CPU": "پردازندهٔ همین سرور",
+  "this server's CPU": "پردازندهٔ همین سرور",
+  "Runs on this server's CPU · no GPU, no cloud": "روی پردازندهٔ همین سرور اجرا می‌شود · بدون GPU و بدون ابر",
+  "Speed test only · will NOT detect polyps": "فقط سنجش سرعت · پولیپ را تشخیص نمی‌دهد",
+  "🖥️ Runs on this server's CPU": "🖥️ روی پردازندهٔ همین سرور اجرا می‌شود",
+  "CPU ready · Model loaded · {cpu}": "پردازنده آماده · مدل بارگذاری شد · {cpu}",
+  "Starting CPU session": "در حال شروع نشست پردازنده",
+  "Inference latency (avg)": "تأخیر استنتاج (میانگین)",
+  "Opening the ONNX Runtime session...": "در حال باز کردن نشست ONNX Runtime...",
+  "Reading model weights from disk...": "در حال خواندن وزن‌های مدل از دیسک...",
 };

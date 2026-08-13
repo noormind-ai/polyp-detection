@@ -34,6 +34,62 @@ interface GtData {
   frames: { bbox: [number, number, number, number] }[][];
 }
 
+/** A CPU model the server has actually deployed. `polyp_trained` is false for
+ *  the stock COCO nano models, which are carried only to measure CPU speed. */
+interface CpuModel {
+  name: string;
+  label: string;
+  polyp_trained: boolean;
+  backend: string;
+}
+
+interface BackendInfo {
+  default: string;
+  available: Record<string, boolean>;
+  cpu: string | null;
+  cpu_models?: CpuModel[];
+}
+
+interface EngineOption {
+  id: string;
+  icon: string;
+  title: string;
+  detail: string;
+  note: string;
+  usable: boolean;
+}
+
+const isCpuEngine = (b: string) => b.startsWith("cpu");
+
+/** Modal is always offered; the CPU entries come from whatever the server has
+ *  deployed, so a box with no onnx models simply shows the one option. */
+function engineOptions(d: BackendInfo | null, t: (s: string) => string): EngineOption[] {
+  if (!d) return [];
+  const opts: EngineOption[] = [
+    {
+      id: "modal",
+      icon: "☁️",
+      title: t("Modal T4 (cloud GPU)"),
+      detail: t("Serverless · released after 2 min idle"),
+      note: t("~25ms per frame · the current default"),
+      usable: d.available?.modal !== false,
+    },
+  ];
+  for (const m of d.cpu_models ?? []) {
+    opts.push({
+      id: m.backend,
+      icon: m.polyp_trained ? "🖥️" : "⏱️",
+      title: m.label,
+      detail: d.cpu ?? t("This server's CPU"),
+      note: m.polyp_trained
+        ? t("Runs on this server's CPU · no GPU, no cloud")
+        : t("Speed test only · will NOT detect polyps"),
+      usable: !!d.available?.cpu,
+    });
+  }
+  return opts;
+}
+
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001";
 // MUST match scaledown_window in inference/app.py (120s). Modal releases the GPU
 // container that long after its last request; we drop out of the live modes at the
@@ -63,6 +119,8 @@ export default function Home() {
   const [showGt, setShowGt] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [caseId, setCaseId] = useState<string | null>(null);
+  const [backends, setBackends] = useState<BackendInfo | null>(null);
+  const [backend, setBackend] = useState<string>("modal");
   const gtInputRef = useRef<HTMLInputElement>(null);
   const lastActiveRef = useRef<number>(Date.now());
 
@@ -76,6 +134,18 @@ export default function Home() {
       .then((r) => r.json())
       .then((d) => setCaseId(d.case_id ?? null))
       .catch(() => { /* feedback capture degrades on its own if this fails */ });
+  }, []);
+
+  // Ask the server which engines it can actually serve, so the UI never offers
+  // a choice that will fail. Read-only and starts nothing.
+  useEffect(() => {
+    fetch(`${API}/api/backends`)
+      .then((r) => r.json())
+      .then((d: BackendInfo) => {
+        setBackends(d);
+        if (d.default) setBackend(d.default);
+      })
+      .catch(() => { /* picker just stays on the Modal default */ });
   }, []);
 
   const stopGpu = useCallback(async () => {
@@ -108,7 +178,11 @@ export default function Home() {
 
     setGpu("starting");
     try {
-      const res = await fetch(`${API}/api/session/start`, { method: "POST", credentials: "include" });
+      // encode: CPU engines carry a colon, as in "cpu:yolo11n"
+      const res = await fetch(
+        `${API}/api/session/start?backend=${encodeURIComponent(backend)}`,
+        { method: "POST", credentials: "include" }
+      );
       if (!res.ok) {
         const text = await res.text();
         throw new Error(t("Backend error {status}: {text}", { status: res.status, text }));
@@ -274,6 +348,39 @@ export default function Home() {
           nothing here starts one; only the two live capture modes do. */}
       {mode === null && (
         <div className="space-y-4">
+          {/* Engine picker. Only rendered when the server offers more than one,
+              so a deployment with no CPU models looks exactly as it did. */}
+          {engineOptions(backends, t).length > 1 && (
+            <div className="space-y-2">
+              <p className="text-sm text-gray-400">{t("Where should inference run?")}</p>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {engineOptions(backends, t).map((o) => {
+                  const selected = backend === o.id;
+                  const warn = isCpuEngine(o.id) && o.note.includes("NOT");
+                  return (
+                    <button
+                      key={o.id}
+                      disabled={!o.usable}
+                      onClick={() => setBackend(o.id)}
+                      className={`text-left p-4 rounded-xl border-2 transition-colors ${
+                        selected ? "border-blue-500 bg-blue-950/20" : "border-gray-700 hover:border-gray-500"
+                      } ${o.usable ? "" : "opacity-40 cursor-not-allowed"}`}
+                    >
+                      <div className="flex items-center gap-2 mb-1">
+                        <span className="text-lg">{o.icon}</span>
+                        <span className="text-white font-medium text-sm">{o.title}</span>
+                      </div>
+                      <span className="text-gray-500 text-xs block">{o.detail}</span>
+                      <span className={`text-xs block mt-0.5 ${warn ? "text-amber-500" : "text-gray-600"}`}>
+                        {o.note}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           <p className="text-sm text-gray-500">
             {t("Demo clips replay saved results instantly. Live camera and screen share start a GPU when you open them.")}
           </p>
@@ -294,7 +401,9 @@ export default function Home() {
                     <span className="text-xs text-gray-600">{t("🔒 Sign-in required")}</span>
                   )}
                   {startsGpu && (
-                    <span className="text-xs text-gray-600">{t("⚡ Starts a GPU session")}</span>
+                    <span className="text-xs text-gray-600">
+                      {isCpuEngine(backend) ? t("🖥️ Runs on this server's CPU") : t("⚡ Starts a GPU session")}
+                    </span>
                   )}
                 </button>
               );
@@ -309,7 +418,7 @@ export default function Home() {
 
           {blockedOnLogin && <LoginPanel onOpenDemos={() => openMode("realtime")} />}
 
-          {!blockedOnLogin && warmingUp && <WarmupPanel />}
+          {!blockedOnLogin && warmingUp && <WarmupPanel backend={backend} />}
 
           {!blockedOnLogin && !warmingUp && (
             <>
@@ -317,7 +426,9 @@ export default function Home() {
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2 text-green-400 text-sm">
                     <span className="w-2 h-2 rounded-full bg-green-400 inline-block animate-pulse" />
-                    {t("GPU ready · Model loaded · T4 active")}
+                    {isCpuEngine(backend)
+                      ? t("CPU ready · Model loaded · {cpu}", { cpu: backends?.cpu ?? t("this server's CPU") })
+                      : t("GPU ready · Model loaded · T4 active")}
                   </div>
                   <button
                     onClick={closeMode}
@@ -329,15 +440,15 @@ export default function Home() {
               )}
 
               {mode === "realtime" && (
-                <RealtimePlayer caseId={caseId ?? "no-case"} onStop={closeMode} onActivity={markActive} />
+                <RealtimePlayer caseId={caseId ?? "no-case"} onStop={closeMode} onActivity={markActive} backend={backend} />
               )}
 
               {mode === "camera" && (
-                <LiveCameraPlayer caseId={caseId ?? "no-case"} onStop={closeMode} onActivity={markActive} />
+                <LiveCameraPlayer caseId={caseId ?? "no-case"} onStop={closeMode} onActivity={markActive} backend={backend} />
               )}
 
               {mode === "screen" && (
-                <LiveCameraPlayer caseId={caseId ?? "no-case"} onStop={closeMode} onActivity={markActive} initialMode="screen" />
+                <LiveCameraPlayer caseId={caseId ?? "no-case"} onStop={closeMode} onActivity={markActive} initialMode="screen" backend={backend} />
               )}
 
               {mode === "upload" && uploadStage === "idle" && <UploadPanel onUpload={handleUpload} />}

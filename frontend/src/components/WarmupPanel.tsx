@@ -15,28 +15,39 @@ const STEPS = [
   { at: 11000, text: "Warming up inference pipeline..." },
 ];
 
-export default function WarmupPanel() {
+// No container to provision and no GPU to open — building an ONNX session over a
+// local file is near-instant, so this only has to avoid narrating a cold start
+// that isn't happening.
+const CPU_STEPS = [
+  { at: 0,    text: "Opening the ONNX Runtime session..." },
+  { at: 400,  text: "Reading model weights from disk..." },
+  { at: 1100, text: "Warming up inference pipeline..." },
+];
+
+export default function WarmupPanel({ backend }: { backend?: string }) {
   const { t } = useLanguage();
   const [logs, setLogs] = useState<string[]>([]);
+  const isCpu = !!backend?.startsWith("cpu");
+  const steps = isCpu ? CPU_STEPS : STEPS;
   const cliCommand = "modal app stop polyp-detection";
   const [footerBefore, footerAfter] = t(
     "Cold start ~15s · Warm starts are instant · Stop with modal app stop polyp-detection"
   ).split(cliCommand);
 
   useEffect(() => {
-    const timers = STEPS.map(({ at, text }) =>
+    const timers = steps.map(({ at, text }) =>
       setTimeout(() => setLogs((prev) => [...prev, text]), at)
     );
     return () => timers.forEach(clearTimeout);
-  }, []);
+  }, [steps]);
 
-  const progress = Math.min(90, Math.round((logs.length / STEPS.length) * 100));
+  const progress = Math.min(90, Math.round((logs.length / steps.length) * 100));
 
   return (
     <div className="space-y-5 py-4">
       <div>
         <div className="flex justify-between text-sm text-gray-400 mb-2">
-          <span>{t("Starting GPU session")}</span>
+          <span>{isCpu ? t("Starting CPU session") : t("Starting GPU session")}</span>
           <span>{progress}%</span>
         </div>
         <div className="h-1.5 bg-gray-800 rounded-full overflow-hidden">

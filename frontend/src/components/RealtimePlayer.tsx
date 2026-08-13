@@ -34,11 +34,13 @@ interface PredData {
 }
 
 export default function RealtimePlayer({
-  caseId, onStop, onActivity, wsPath = "/api/ws/infer-file",
-}: { caseId: string; onStop: () => void; onActivity?: () => void; wsPath?: string }) {
+  caseId, onStop, onActivity, wsPath = "/api/ws/infer-file", backend,
+}: { caseId: string; onStop: () => void; onActivity?: () => void; wsPath?: string; backend?: string }) {
   const { user } = useAuth();
   const { t } = useLanguage();
-  const WS_URL = `${API_WS}${wsPath}`;
+  // The engine is pinned for the life of the socket — the server reads it once,
+  // so the latency average never blends two very different backends.
+  const WS_URL = `${API_WS}${wsPath}${backend ? `?backend=${encodeURIComponent(backend)}` : ""}`;
   const videoRef    = useRef<HTMLVideoElement>(null);
   const analyzedRef = useRef<HTMLCanvasElement>(null); // last frame actually sent to the model, with boxes burned on
   const wsRef       = useRef<WebSocket | null>(null);
@@ -452,7 +454,7 @@ export default function RealtimePlayer({
           <>
             <span><span className="text-gray-500">{t("Responses back")} </span><span className="text-white">{stats.received}</span></span>
             <span>
-              <span className="text-gray-500">{t("Modal latency (avg)")} </span>
+              <span className="text-gray-500">{backend && backend !== "modal" ? t("Inference latency (avg)") : t("Modal latency (avg)")} </span>
               <span className={stats.avgMs > 800 ? "text-red-400" : "text-green-400"}>
                 {stats.avgMs > 0 ? t("{avgMs} ms", { avgMs: stats.avgMs }) : "—"}
               </span>

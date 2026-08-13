@@ -12,22 +12,8 @@ node_modules/
 .next/
 out/
 
-# Data — large training sets and videos, not tracked in git.
-# Spelled "data/*" rather than "data/" so the small tooling and label files
-# under it can be re-included: git cannot un-ignore a file whose parent
-# DIRECTORY is excluded, only one whose contents are. With the old "data/"
-# rule, new scripts here were silently dropped from commits.
-data/*
-!data/*.py
-!data/samples/
-data/samples/*
-!data/samples/ground_truth/
-
-# Runtime data written by the backend — captured clinical frames and clips, and
-# registered accounts (password hashes). Never committed. This used to be
-# covered only by accident: the bare "data/" rule above matched at any depth,
-# so narrowing it to the repo root would have started tracking these.
-backend/data/
+# Data — large training sets and videos, not tracked in git
+data/
 
 # Logs
 logs/
@@ -50,5 +36,13 @@ frontend/.next.bak-*/
 frontend/frontend.log
 .git.broken-bak/
 
-frontend/tsconfig.tsbuildinfo
-backend/.env.bak-*
+# CPU benchmark artifacts — regenerate with training/bench_cpu.py export
+training/onnx/
+training/onnx-int8/
+training/*.pt
+training/bench-*.json
+
+# CPU-backend ONNX weights (~120 MB) — build artifacts, not source.
+# Regenerate with bench-cpu/export_cpu_backend.py
+backend/models/*.onnx
+backend/models/*.pt
