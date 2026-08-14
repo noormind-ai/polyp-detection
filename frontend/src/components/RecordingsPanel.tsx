@@ -46,25 +46,33 @@ const videoUrl = (r: Recording) => `${API}/api/recordings/${r.case_id}/${r.id}/v
 function useDurationFix(video: HTMLVideoElement | null) {
   useEffect(() => {
     if (!video) return;
-    let repaired = false;
+    let scanning = false;
+
     const onMeta = () => {
-      if (repaired || Number.isFinite(video.duration)) return;
-      repaired = true;
+      if (scanning || Number.isFinite(video.duration)) return;
+      scanning = true;
       video.currentTime = 1e101;
     };
-    const onSeeked = () => {
-      // Fires once the scan lands; duration is known by now.
-      if (repaired && video.currentTime > 0 && Number.isFinite(video.duration)) {
-        video.currentTime = 0;
-        repaired = false;                     // done — leave normal seeks alone
-        video.removeEventListener("seeked", onSeeked);
-      }
+
+    // Keyed on durationchange rather than on seeked. A seeked event cannot be
+    // told apart from one the viewer caused, so watching for it meant a scrub
+    // that landed while the scan was still running got yanked back to zero —
+    // which is exactly when someone is most likely to grab the scrub bar.
+    // durationchange fires once, when the scan teaches the browser the real
+    // length, and clearing the flag before restoring the playhead means every
+    // later seek is left alone.
+    const onDurationChange = () => {
+      if (!scanning || !Number.isFinite(video.duration)) return;
+      scanning = false;
+      video.currentTime = 0;
+      video.removeEventListener("durationchange", onDurationChange);
     };
+
     video.addEventListener("loadedmetadata", onMeta);
-    video.addEventListener("seeked", onSeeked);
+    video.addEventListener("durationchange", onDurationChange);
     return () => {
       video.removeEventListener("loadedmetadata", onMeta);
-      video.removeEventListener("seeked", onSeeked);
+      video.removeEventListener("durationchange", onDurationChange);
     };
   }, [video]);
 }
