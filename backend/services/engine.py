@@ -1,15 +1,22 @@
 """Chooses which inference engine serves a request.
 
-    modal        the serverless T4 reached over Modal's RPC — the default
+    modal        the serverless T4 reached over Modal's RPC
     cpu:<model>  this machine's own CPU, in-process, through ONNX Runtime
 
-The CPU engine carries its model in the name ("cpu:yolo11n") so that a single
-string still selects an engine everywhere one is passed — websocket query param,
-session/start, and the UI — with no second parameter to thread through.
+The CPU engine carries its model in the name ("cpu:yolo11n_polyp") so that a
+single string still selects an engine everywhere one is passed — websocket query
+param, session/start, and the UI — with no second parameter to thread through.
 
 Modules are imported lazily so a deployment that will never use one does not need
 its dependencies installed: call2fly has no torch, and a box with no onnx models
 should simply not offer the CPU engine rather than fail when it is picked.
+
+POLYP_CPU_ONLY=1 makes that refusal explicit. The Iran box has no GPU and no
+Modal account, so modal is not merely absent — asking for it is an error worth
+reporting rather than a request to satisfy. It is enforced in resolve(), not
+only hidden in the UI, because the websocket takes ?backend= straight from the
+client and a stale browser tab must not be able to reach for a GPU that is not
+there.
 """
 
 import logging
@@ -20,12 +27,42 @@ log = logging.getLogger("engine")
 DEFAULT = "modal"
 
 
+def cpu_only() -> bool:
+    return os.getenv("POLYP_CPU_ONLY", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def default_engine() -> str:
+    """What this deployment serves when the caller names no engine.
+
+    Read at call time, not import time, so .env is authoritative even though
+    resolve() may run before/after dotenv depending on import order.
+    """
+    return (os.getenv("INFERENCE_BACKEND") or DEFAULT).strip().lower()
+
+
+def modal_available() -> bool:
+    """Honest answer, not a hardcoded True. A box without the modal package —
+    or one pinned to CPU — cannot serve it, and the UI must not offer it."""
+    if cpu_only():
+        return False
+    try:
+        import modal  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def resolve(name: str | None):
     """Normalise an engine name and hand back something exposing warmup /
-    infer_frame / infer_video. Raises ValueError on an unknown name."""
-    chosen = (name or DEFAULT).strip().lower()
+    infer_frame / infer_video. Raises ValueError on an unknown or refused name."""
+    chosen = (name or default_engine()).strip().lower()
 
     if chosen == "modal":
+        if cpu_only():
+            raise ValueError(
+                "this deployment is CPU-only (POLYP_CPU_ONLY=1); "
+                "modal inference is not available here"
+            )
         from backend.services import modal_client
         return "modal", modal_client
 
@@ -45,7 +82,8 @@ def availability() -> dict:
     """What this process can actually serve right now.
 
     The UI reads this so it never offers a choice that is going to fail — a box
-    with no onnx models shouldn't advertise the CPU engine.
+    with no onnx models shouldn't advertise the CPU engine, and a box with no
+    modal package shouldn't advertise modal.
     """
     cpu_ok, cpu_models, cpu_device = False, [], None
     try:
@@ -57,8 +95,9 @@ def availability() -> dict:
         log.debug("cpu engine unavailable: %s", e)
 
     return {
-        "default": os.getenv("INFERENCE_BACKEND", DEFAULT),
-        "available": {"modal": True, "cpu": cpu_ok},
+        "default": default_engine(),
+        "available": {"modal": modal_available(), "cpu": cpu_ok},
+        "cpu_only": cpu_only(),
         "cpu": cpu_device,
         # One entry per selectable CPU model, each flagged with whether it is
         # actually polyp-trained. The nano models are stock COCO weights carried

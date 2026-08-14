@@ -1,7 +1,6 @@
 fastapi>=0.112.0
 uvicorn[standard]>=0.30.0
 python-multipart>=0.0.9
-modal>=0.64.0
 opencv-python-headless>=4.10.0
 numpy>=1.26.0
 aiofiles>=23.0.0

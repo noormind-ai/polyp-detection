@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 
 from backend import auth
 from backend.routes.auth import require_user
-from backend.services import engine, modal_client
+from backend.services import engine
 
 log = logging.getLogger("infer")
 
@@ -115,7 +115,8 @@ async def session_stop():
 
 
 @router.post("/infer-video")
-async def infer_video(file: UploadFile = File(...), user: str = Depends(require_user)):
+async def infer_video(file: UploadFile = File(...), user: str = Depends(require_user),
+                      backend: str | None = None):
     if not file.content_type or not file.content_type.startswith("video/"):
         raise HTTPException(status_code=400, detail="File must be a video")
 
@@ -125,7 +126,8 @@ async def infer_video(file: UploadFile = File(...), user: str = Depends(require_
 
     log.info("infer_video: %s (%d bytes) for user %s", file.filename, len(content), user)
     try:
-        return await modal_client.infer_video(content)
+        _, eng = engine.resolve(backend)
+        return await eng.infer_video(content)
     except Exception as e:
         return JSONResponse(
             status_code=503,
