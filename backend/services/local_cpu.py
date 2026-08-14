@@ -10,13 +10,18 @@ is hand-written against numpy rather than borrowed from ultralytics.
 Serves several models, selected as "cpu:<name>", so the UI can offer a real
 comparison from one box:
 
-    cpu:yolov5m   the deployed polyp detector. Real detections.
-    cpu:yolo11n   stock COCO weights. NOT polyp-trained — a speed probe only.
-    cpu:yolo26n   stock COCO weights. NOT polyp-trained — a speed probe only.
+    cpu:yolo11n_polyp  the polyp fine-tune (2026-08-13). Real detections, fastest.
+    cpu:yolov5m        the long-deployed polyp detector. Real detections.
+    cpu:yolo11n        stock COCO weights. NOT polyp-trained — a speed probe only.
+    cpu:yolo26n        stock COCO weights. NOT polyp-trained — a speed probe only.
 
-The two nano models exist to answer one question: is a 10x smaller model fast
-enough on this hardware to be worth fine-tuning for polyps? They will find
-essentially nothing on colonoscopy frames, and that is expected.
+The two stock models are what proved the CPU was fast enough to be worth
+fine-tuning for. They find essentially nothing on colonoscopy frames, and that
+is expected — they are kept only as a latency reference.
+
+Every model carries its own frame confidence threshold, because confidence
+scales are not comparable across architectures: scored on the 108 report-linked
+studies, yolov5m peaks at 0.30 and yolo11n_polyp at 0.50.
 
 Inference runs at 320 px because the frontend already downsizes frames to 320
 (RealtimePlayer.tsx:21) — running at ultralytics' default 640 pays 4x the compute
@@ -36,6 +41,11 @@ log = logging.getLogger("local_cpu")
 
 MODELS_DIR = Path(os.getenv("POLYP_CPU_MODELS", Path(__file__).resolve().parents[1] / "models"))
 IMGSZ = 320
+# Fallback only — each model carries its own threshold in MODELS below.
+# Confidence scales are NOT comparable across architectures: on the 108
+# report-linked studies yolov5m peaks at frame-conf 0.30 while the yolo11n
+# fine-tune peaks at 0.50. Serving the nano at 0.30 floods the screen; serving
+# it at 0.70 (the old study rule) found 6 of 31 studies instead of 24.
 CONF = 0.3
 IOU = 0.45
 
@@ -45,11 +55,12 @@ IOU = 0.45
 # total (62%) and would starve them.
 THREADS = int(os.getenv("POLYP_CPU_THREADS", "4"))
 
-# name -> (onnx file, label shown in the UI, whether it detects polyps)
+# name -> (onnx file, UI label, detects polyps?, frame confidence threshold)
 MODELS = {
-    "yolov5m": ("yolov5m.onnx", "YOLOv5m · polyp (deployed model)", True),
-    "yolo11n": ("yolo11n.onnx", "YOLO11n · NOT polyp-trained — speed test only", False),
-    "yolo26n": ("yolo26n.onnx", "YOLO26n · NOT polyp-trained — speed test only", False),
+    "yolo11n_polyp": ("yolo11n_polyp.onnx", "YOLO11n · polyp fine-tune · fastest", True, 0.50),
+    "yolov5m": ("yolov5m.onnx", "YOLOv5m · polyp (deployed model)", True, 0.30),
+    "yolo11n": ("yolo11n.onnx", "YOLO11n · NOT polyp-trained — speed test only", False, 0.30),
+    "yolo26n": ("yolo26n.onnx", "YOLO26n · NOT polyp-trained — speed test only", False, 0.30),
 }
 DEFAULT_MODEL = "yolov5m"
 
@@ -102,8 +113,9 @@ def available() -> bool:
 def available_models() -> list[dict]:
     """What the UI can actually offer, with labels that say which are real."""
     return [
-        {"name": n, "label": label, "polyp_trained": trained, "backend": f"cpu:{n}"}
-        for n, (_, label, trained) in MODELS.items()
+        {"name": n, "label": label, "polyp_trained": trained,
+         "conf": conf, "backend": f"cpu:{n}"}
+        for n, (_, label, trained, conf) in MODELS.items()
         if model_path(n).exists()
     ]
 
@@ -165,7 +177,7 @@ def _nms(boxes: np.ndarray, scores: np.ndarray, iou_thr: float) -> list[int]:
     return keep
 
 
-def _decode(out: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _decode(out: np.ndarray, conf_thr: float) -> tuple[np.ndarray, np.ndarray]:
     """Normalise the two output layouts these exports produce into (xyxy, conf).
 
     (1, 4+nc, N)  anchor-style raw output — YOLOv5m (nc=2) and YOLO11n (nc=80).
@@ -178,14 +190,14 @@ def _decode(out: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if o.ndim == 2 and o.shape[1] == 6 and o.shape[0] != 6:
         xyxy = o[:, :4].astype(np.float32)
         conf = o[:, 4].astype(np.float32)
-        m = conf >= CONF
+        m = conf >= conf_thr
         return xyxy[m], conf[m]
 
     p = o.T                                   # (N, 4+nc)
     xywh, cls_scores = p[:, :4], p[:, 4:]
     conf = cls_scores.max(axis=1)
     cls_id = cls_scores.argmax(axis=1)
-    m = conf >= CONF
+    m = conf >= conf_thr
     xywh, conf, cls_id = xywh[m], conf[m], cls_id[m]
     if not len(xywh):
         return np.empty((0, 4), np.float32), np.empty((0,), np.float32)
@@ -220,13 +232,14 @@ def _to_frame_coords(xyxy: np.ndarray, r: float, pad_x: int, pad_y: int,
 # ---------------------------------------------------------------------------
 def _predict(name: str, frame: np.ndarray) -> tuple[list[dict], float]:
     sess = _session(name)
+    conf_thr = MODELS[name][3]
     x, r, pad_x, pad_y = _letterbox(frame)
 
     t = time.perf_counter()
     out = sess.run(None, {sess.get_inputs()[0].name: x})[0]
     infer_ms = (time.perf_counter() - t) * 1000
 
-    xyxy, conf = _decode(out)
+    xyxy, conf = _decode(out, conf_thr)
     xyxy = _to_frame_coords(xyxy, r, pad_x, pad_y, frame.shape[:2])
     boxes = [
         {"bbox": [round(float(v)) for v in box], "conf": round(float(c), 3)}

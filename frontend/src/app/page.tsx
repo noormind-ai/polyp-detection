@@ -40,6 +40,7 @@ interface CpuModel {
   name: string;
   label: string;
   polyp_trained: boolean;
+  conf?: number;
   backend: string;
 }
 
@@ -91,6 +92,10 @@ function engineOptions(d: BackendInfo | null, t: (s: string) => string): EngineO
       usable: !!d.available?.cpu,
     });
   }
+  // Real detectors first, speed probes last — otherwise a stock COCO model can
+  // sit above the polyp models and read as a recommended option.
+  opts.sort((a, b) => Number(b.note !== t("Speed test only · will NOT detect polyps"))
+                    - Number(a.note !== t("Speed test only · will NOT detect polyps")));
   return opts;
 }
 
