@@ -49,6 +49,9 @@ interface BackendInfo {
   available: Record<string, boolean>;
   cpu: string | null;
   cpu_models?: CpuModel[];
+  // Set by a deployment with no GPU and no Modal account. Demos run live on the
+  // CPU there instead of replaying results baked by a different model.
+  cpu_only?: boolean;
 }
 
 interface EngineOption {
@@ -99,7 +102,7 @@ function engineOptions(d: BackendInfo | null, t: (s: string) => string): EngineO
   return opts;
 }
 
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001";
+const API = process.env.NEXT_PUBLIC_API_URL || "";
 // MUST match scaledown_window in inference/app.py (120s). Modal releases the GPU
 // container that long after its last request; we drop out of the live modes at the
 // same moment so the UI never claims a GPU that is already gone. Waiting longer
@@ -449,7 +452,7 @@ export default function Home() {
               )}
 
               {mode === "realtime" && (
-                <RealtimePlayer caseId={caseId ?? "no-case"} onStop={closeMode} onActivity={markActive} backend={backend} />
+                <RealtimePlayer caseId={caseId ?? "no-case"} onStop={closeMode} onActivity={markActive} backend={backend} cpuOnly={backends?.cpu_only ?? false} />
               )}
 
               {mode === "camera" && (

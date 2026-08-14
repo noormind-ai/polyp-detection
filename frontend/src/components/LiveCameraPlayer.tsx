@@ -5,8 +5,12 @@ import FeedbackPanel from "./FeedbackPanel";
 import { useLanguage } from "@/lib/i18n";
 import { useRollingClip } from "@/lib/useRollingClip";
 
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001";
-const API_WS = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001").replace(/^http/, "ws");
+const API = process.env.NEXT_PUBLIC_API_URL || "";
+// Resolve the socket origin explicitly rather than leaning on a relative
+// WebSocket URL: the spec allows it, but an absolute ws:// is unambiguous and
+// still follows the page from an IP to a domain with no rebuild.
+const API_WS = (process.env.NEXT_PUBLIC_API_URL
+  || (typeof window !== "undefined" ? window.location.origin : "")).replace(/^http/, "ws");
 const INFER_TIMEOUT_MS = 6000;
 // Resize frames to this width before sending — faster inference, smaller payload
 const INFER_WIDTH = 320;

@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useLanguage } from "@/lib/i18n";
 
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001";
+const API = process.env.NEXT_PUBLIC_API_URL || "";
 
 interface Box { bbox: [number, number, number, number]; conf: number; }
 interface Entry {

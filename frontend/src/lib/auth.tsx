@@ -14,7 +14,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useState, ReactNode } from "react";
 
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001";
+const API = process.env.NEXT_PUBLIC_API_URL || "";
 
 interface AuthContextValue {
   user: string | null;

@@ -8,8 +8,12 @@ import { useAuth } from "@/lib/auth";
 import { useLanguage } from "@/lib/i18n";
 import { useRollingClip } from "@/lib/useRollingClip";
 
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001";
-const API_WS = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001").replace(/^http/, "ws");
+const API = process.env.NEXT_PUBLIC_API_URL || "";
+// Resolve the socket origin explicitly rather than leaning on a relative
+// WebSocket URL: the spec allows it, but an absolute ws:// is unambiguous and
+// still follows the page from an IP to a domain with no rebuild.
+const API_WS = (process.env.NEXT_PUBLIC_API_URL
+  || (typeof window !== "undefined" ? window.location.origin : "")).replace(/^http/, "ws");
 const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 const INFER_TIMEOUT_MS = 6000;
 // Resize frames to this width before sending — faster inference, smaller payload.
@@ -34,13 +38,18 @@ interface PredData {
 }
 
 export default function RealtimePlayer({
-  caseId, onStop, onActivity, wsPath = "/api/ws/infer-file", backend,
-}: { caseId: string; onStop: () => void; onActivity?: () => void; wsPath?: string; backend?: string }) {
+  caseId, onStop, onActivity, wsPath = "/api/ws/infer-file", backend, cpuOnly = false,
+}: { caseId: string; onStop: () => void; onActivity?: () => void; wsPath?: string; backend?: string; cpuOnly?: boolean }) {
   const { user } = useAuth();
   const { t } = useLanguage();
   // The engine is pinned for the life of the socket — the server reads it once,
   // so the latency average never blends two very different backends.
-  const WS_URL = `${API_WS}${wsPath}${backend ? `?backend=${encodeURIComponent(backend)}` : ""}`;
+  const [isDemo, setIsDemo] = useState(false);
+  // A demo on a CPU-only box streams live like any other clip. The sign-in gate
+  // on /api/ws/infer-file guards GPU spend, and there is none here — so demos
+  // take the open socket rather than forcing a login just to watch one.
+  const demoLive = isDemo && cpuOnly;
+  const WS_URL = `${API_WS}${demoLive ? "/api/ws/infer" : wsPath}${backend ? `?backend=${encodeURIComponent(backend)}` : ""}`;
   const videoRef    = useRef<HTMLVideoElement>(null);
   const analyzedRef = useRef<HTMLCanvasElement>(null); // last frame actually sent to the model, with boxes burned on
   const wsRef       = useRef<WebSocket | null>(null);
@@ -337,6 +346,7 @@ export default function RealtimePlayer({
   /** Counters and the detection flag describe ONE clip; carrying them across
    *  clips leaves a stale "Polyp detected" lit over footage that has none. */
   function resetClipState() {
+    setIsDemo(false);
     scanRef.current = false;
     setPolyp(false);
     setStats({ sent: 0, received: 0, avgMs: 0 });
@@ -381,6 +391,14 @@ export default function RealtimePlayer({
     resetClipState();
     setLoadingDemo(filename);
     try {
+      setIsDemo(true);
+      if (cpuOnly) {
+        // The saved results were baked by yolov5m on Modal. Replaying them here
+        // would show a different model's output than the one this deployment
+        // serves, so run the clip through this server's CPU instead.
+        setVideoUrl(`${BASE_PATH}/demos/${filename}`);
+        return;
+      }
       const stem = filename.replace(/\.mp4$/, "");
       const res = await fetch(`${BASE_PATH}/demos/pred/${stem}_pred.json`);
       if (!res.ok) throw new Error(String(res.status));
