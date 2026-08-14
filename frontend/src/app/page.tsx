@@ -7,6 +7,7 @@ import VideoPlayer from "@/components/VideoPlayer";
 import RealtimePlayer from "@/components/RealtimePlayer";
 import LiveCameraPlayer from "@/components/LiveCameraPlayer";
 import LoginPanel from "@/components/LoginPanel";
+import RecordingsPanel from "@/components/RecordingsPanel";
 import { useAuth } from "@/lib/auth";
 import { useLanguage } from "@/lib/i18n";
 
@@ -14,7 +15,7 @@ import { useLanguage } from "@/lib/i18n";
 type UploadStage = "idle" | "processing" | "done";
 /** Modal GPU container state. Only the live capture modes ever move this. */
 type GpuState = "off" | "starting" | "ready";
-type Mode = "upload" | "realtime" | "camera" | "screen";
+type Mode = "upload" | "realtime" | "camera" | "screen" | "recordings";
 
 interface Detection {
   bbox: [number, number, number, number];
@@ -113,8 +114,9 @@ const API = process.env.NEXT_PUBLIC_API_URL || "";
 // response, so the timer only counts down once streaming has actually stopped.
 const MODAL_IDLE_MS = 2 * 60 * 1000;
 
-/** The modes that spend GPU on a video the user supplied, and so need an account. */
-const NEEDS_ACCOUNT: Mode[] = ["upload"];
+/** The modes that need an account: the one that spends GPU on a video the user
+ *  supplied, and the one that plays back patient video held on this server. */
+const NEEDS_ACCOUNT: Mode[] = ["upload", "recordings"];
 /** The modes that need a warm GPU container before they can do anything. */
 const NEEDS_GPU: Mode[] = ["camera", "screen"];
 
@@ -321,7 +323,7 @@ export default function Home() {
     // The player modes lay video and feedback out side by side, so they get the
     // full desktop width; the pickers/upload screens stay narrow and readable.
     <main className={`min-h-screen bg-gray-950 text-white mx-auto p-8 ${
-      mode && mode !== "upload" && !blockedOnLogin ? "max-w-[1700px]" : "max-w-4xl"
+      mode && mode !== "upload" && mode !== "recordings" && !blockedOnLogin ? "max-w-[1700px]" : "max-w-4xl"
     }`}>
       <div className="flex items-start justify-between mb-10">
         <div>
@@ -421,6 +423,23 @@ export default function Home() {
               );
             })}
           </div>
+
+          {/* Playback of sessions already recorded to this server. Deliberately
+              its own row rather than a fifth card: it starts nothing and
+              analyses nothing, it just opens the archive. */}
+          <button
+            onClick={() => openMode("recordings")}
+            className="w-full flex items-center gap-4 p-5 rounded-xl border-2 border-gray-700 hover:border-gray-500 hover:bg-gray-900/40 transition-colors text-left"
+          >
+            <span className="text-2xl">🎞️</span>
+            <span className="min-w-0">
+              <span className="block text-white font-medium">{t("Saved recordings")}</span>
+              <span className="block text-gray-500 text-sm">
+                {t("Play back sessions recorded on this server")}
+              </span>
+            </span>
+            {!user && <span className="ms-auto text-xs text-gray-600 flex-shrink-0">{t("🔒 Sign-in required")}</span>}
+          </button>
         </div>
       )}
 
@@ -462,6 +481,8 @@ export default function Home() {
               {mode === "screen" && (
                 <LiveCameraPlayer caseId={caseId ?? "no-case"} onStop={closeMode} onActivity={markActive} initialMode="screen" backend={backend} />
               )}
+
+              {mode === "recordings" && <RecordingsPanel title={t("All recordings on this server")} />}
 
               {mode === "upload" && uploadStage === "idle" && <UploadPanel onUpload={handleUpload} />}
 

@@ -236,4 +236,44 @@ export const FA: Record<string, string> = {
   "Inference latency (avg)": "تأخیر استنتاج (میانگین)",
   "Opening the ONNX Runtime session...": "در حال باز کردن نشست ONNX Runtime...",
   "Reading model weights from disk...": "در حال خواندن وزن‌های مدل از دیسک...",
+
+  // Session recording + playback. The triangles are direction-sensitive, so the
+  // collapsed-state Farsi string points the other way — same treatment as "← Back".
+  "● Record this session": "● ضبط این نشست",
+  "■ Stop recording": "■ توقف ضبط",
+  "Starting recording…": "در حال شروع ضبط…",
+  "Saving recording…": "در حال ذخیرهٔ ضبط…",
+  "REC {time}": "ضبط {time}",
+  "{size} saved": "{size} ذخیره شد",
+  "🔒 Sign in to record this session and play it back later.":
+    "🔒 برای ضبط این نشست و پخش بعدی آن وارد شوید.",
+  "This browser cannot record video. Use Chrome or Edge to save a session.":
+    "این مرورگر قابلیت ضبط ویدیو ندارد. برای ذخیرهٔ نشست از Chrome یا Edge استفاده کنید.",
+  "▸ Recordings from this session": "◂ ضبط‌های این نشست",
+  "▾ Recordings from this session": "▾ ضبط‌های این نشست",
+  "Recorded in this session": "ضبط‌شده در این نشست",
+  "Saved recordings": "ضبط‌های ذخیره‌شده",
+  "All recordings on this server": "همهٔ ضبط‌های این سرور",
+  "Play back sessions recorded on this server": "پخش نشست‌هایی که روی این سرور ضبط شده‌اند",
+  "🔒 Sign in to watch recorded sessions.": "🔒 برای تماشای نشست‌های ضبط‌شده وارد شوید.",
+  "Refresh": "به‌روزرسانی",
+  "Download": "دانلود",
+  "Delete": "حذف",
+  "Close player": "بستن پخش‌کننده",
+  "Nothing recorded in this session yet. Press “Record this session” to start one.":
+    "هنوز چیزی در این نشست ضبط نشده است. برای شروع، «ضبط این نشست» را بزنید.",
+  "No sessions have been recorded on this server yet.":
+    "هنوز هیچ نشستی روی این سرور ضبط نشده است.",
+  "No video data was saved for this one.": "برای این مورد هیچ داده‌ای ذخیره نشده است.",
+  "Could not load recordings from the server.": "بارگذاری ضبط‌ها از سرور ممکن نشد.",
+  "Could not delete that recording.": "حذف این ضبط ممکن نشد.",
+  "Delete this recording permanently? This cannot be undone.":
+    "این ضبط برای همیشه حذف شود؟ این کار قابل بازگشت نیست.",
+  "recording…": "در حال ضبط…",
+  "saved": "ذخیره‌شده",
+  "size limit": "به سقف حجم رسید",
+  "interrupted": "قطع‌شده",
+  "{duration} · {size}": "{duration} · {size}",
+  "case {case}": "پرونده {case}",
+  "case {case} · {when}": "پرونده {case} · {when}",
 };

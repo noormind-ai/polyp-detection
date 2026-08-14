@@ -13,7 +13,7 @@ load_dotenv(Path(__file__).parent / ".env")
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from backend import auth
-from backend.routes import auth as auth_routes, infer, feedback
+from backend.routes import auth as auth_routes, infer, feedback, recordings
 
 # File logger — writes to logs/backend.log, rotates at 5 MB, keeps 3 files
 Path("logs").mkdir(exist_ok=True)
@@ -53,6 +53,7 @@ app.add_middleware(
 app.include_router(auth_routes.router, prefix="/api")
 app.include_router(infer.router, prefix="/api")
 app.include_router(feedback.router, prefix="/api")
+app.include_router(recordings.router, prefix="/api")
 
 
 @app.get("/health")

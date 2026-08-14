@@ -2,8 +2,11 @@
 
 import { useEffect, useRef, useState } from "react";
 import FeedbackPanel from "./FeedbackPanel";
+import RecordingControls from "./RecordingControls";
+import RecordingsPanel from "./RecordingsPanel";
 import { useLanguage } from "@/lib/i18n";
 import { useRollingClip } from "@/lib/useRollingClip";
+import { useSessionRecorder } from "@/lib/useSessionRecorder";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "";
 // Resolve the socket origin explicitly rather than leaning on a relative
@@ -68,6 +71,19 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // Only starts recording once there's actually a stream on the element —
   // captureStream() on an empty <video> yields no tracks and MediaRecorder refuses it.
   const { getClip } = useRollingClip(streaming ? videoRef.current : null);
+
+  // The capture stream as STATE as well as a ref: streamRef is read inside the
+  // long-running capture loop, but the session recorder is a hook and has to
+  // re-run when the stream is replaced (a device switch, or camera → screen).
+  const [activeStream, setActiveStream] = useState<MediaStream | null>(null);
+  const recorder = useSessionRecorder(caseId, captureMode, activeStream);
+  const [showRecordings, setShowRecordings] = useState(false);
+
+  // Surface the list the moment a recording finishes — the operator has just
+  // saved something and the next thing they want is to confirm it is there.
+  useEffect(() => {
+    if (recorder.finishedCount > 0) setShowRecordings(true);
+  }, [recorder.finishedCount]);
 
   // Crop applied to screen-share frames before sending (normalized 0..1, relative to native frame size).
   // Lets you box just the video-feed area out of a shared app window that also shows toolbars/UI chrome.
@@ -355,6 +371,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         video: { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } },
       });
       streamRef.current = stream;
+      setActiveStream(stream);
       const video = videoRef.current;
       if (video) {
         video.srcObject = stream;
@@ -384,6 +401,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         audio: false,
       });
       streamRef.current = stream;
+      setActiveStream(stream);
       const video = videoRef.current;
       if (video) {
         video.srcObject = stream;
@@ -465,8 +483,12 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
 
   function stopCamera() {
     scanRef.current = false;
+    // Close the recording before killing the tracks: stop() flushes the final
+    // slice, and a recorder whose source has already died has nothing to flush.
+    recorder.stop();
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
+    setActiveStream(null);
     setStreaming(false);
     updateBoxes([]);
   }
@@ -640,6 +662,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
               {t("👁 Dr. found a polyp AI missed")}
             </button>
 
+            {/* Recording is opt-in: nothing is written to the server until this
+                is pressed, so a session that nobody wants archived leaves nothing. */}
+            <RecordingControls recorder={recorder} ready={streaming} />
+
             {/* Detected next — it's the panel being read during the procedure */}
             <div className="space-y-1">
               <div className="flex items-center justify-between gap-2">
@@ -706,6 +732,26 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
             <div className="min-w-0 xl:col-span-2 xl:sticky xl:top-4 xl:max-h-[calc(100vh-2rem)] xl:overflow-y-auto">
               <FeedbackPanel caseId={caseId} refreshSignal={feedbackRefreshKey} />
             </div>
+          )}
+        </div>
+
+        {/* Playback for what was recorded in THIS session, full width so the
+            player isn't squeezed into the narrow capture column. Collapsed by
+            default and unmounted while closed — during a procedure nobody is
+            watching a replay, and an open panel would be polling for no one. */}
+        <div className="mt-4 border-t border-gray-800 pt-3 space-y-3">
+          <button
+            onClick={() => setShowRecordings((v) => !v)}
+            className="text-sm text-gray-500 hover:text-gray-300 transition-colors"
+          >
+            {showRecordings ? t("▾ Recordings from this session") : t("▸ Recordings from this session")}
+          </button>
+          {showRecordings && (
+            <RecordingsPanel
+              caseId={caseId}
+              refreshSignal={recorder.finishedCount}
+              title={t("Recorded in this session")}
+            />
           )}
         </div>
       </div>
