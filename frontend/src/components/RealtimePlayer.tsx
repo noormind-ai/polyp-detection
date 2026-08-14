@@ -20,11 +20,17 @@ const INFER_TIMEOUT_MS = 6000;
 // data/precompute_demos.py encodes the saved demo results at this same width, so
 // replayed boxes land in the same coordinate space as live ones. Change both together.
 const INFER_WIDTH = 320;
-const SPEEDS = [0.1, 0.25, 0.5, 1, 1.5, 2];
+const SPEEDS = [0.1, 0.25, 0.5, 0.7, 1, 1.5, 2];
 // Don't auto-capture the same ongoing detection every single frame — once a
 // polyp is flagged, wait this long before the next auto-capture so the
 // review queue fills with distinct moments, not near-duplicates.
-const AUTO_CAPTURE_COOLDOWN_MS = 4000;
+// A polyp that is STILL on screen is re-filed at most this often. A polyp that
+// has just appeared is filed immediately regardless — see maybeAutoCapture.
+const AUTO_CAPTURE_REFRESH_MS = 8000;
+// A detection gap shorter than this counts as the same episode. The detector
+// drops the odd frame on a lesion that never left the screen, and treating that
+// as "gone" would re-trigger a capture on the very next frame.
+const DETECTION_GAP_MS = 1000;
 
 interface Box { bbox: [number, number, number, number]; conf: number; }
 interface Timing { recv_ms: number; modal_ms: number; total_ms: number; }
@@ -55,6 +61,8 @@ export default function RealtimePlayer({
   const wsRef       = useRef<WebSocket | null>(null);
   const scanRef     = useRef(false); // capture loop running?
   const lastAutoCaptureRef = useRef(0);
+  const lastDetectionRef   = useRef(0);     // when a box was last seen
+  const inEpisodeRef       = useRef(false); // inside one continuous appearance?
   // Replay reuses one scratch canvas instead of allocating per animation frame —
   // the live loop can get away with allocating because it runs at inference
   // speed (a few per second), replay runs at frame rate.
@@ -75,7 +83,10 @@ export default function RealtimePlayer({
   const [wsStatus, setWsStatus]   = useState<"connecting" | "open" | "error" | "closed">("connecting");
   const [closeCode, setCloseCode] = useState<number | null>(null);
   const [polyp, setPolyp]         = useState(false);
-  const [speed, setSpeed]         = useState(0.1); // slow default — demo footage moves too fast to react to otherwise
+  // 0.5x for live demos: fast enough to read as a procedure, slow enough that
+  // the CPU (~58ms/frame, ~17fps) keeps up with 25fps footage without skipping
+  // much. Must stay a member of SPEEDS or no button renders as selected.
+  const [speed, setSpeed]         = useState(0.5);
   const [stats, setStats]         = useState({ sent: 0, received: 0, avgMs: 0 });
   const [lastError, setLastError] = useState("");
   const [duration, setDuration]   = useState(0);
@@ -200,9 +211,25 @@ export default function RealtimePlayer({
   // inference, plus what the model saw, plus a rolling clip if available.
   // Throttled so a polyp staying in view for a while doesn't flood the queue.
   function maybeAutoCapture(cap: HTMLCanvasElement, boxes: Box[]) {
-    if (boxes.length === 0) return;
     const now = Date.now();
-    if (now - lastAutoCaptureRef.current < AUTO_CAPTURE_COOLDOWN_MS) return;
+
+    if (boxes.length === 0) {
+      if (now - lastDetectionRef.current > DETECTION_GAP_MS) inEpisodeRef.current = false;
+      return;
+    }
+    lastDetectionRef.current = now;
+
+    // The event worth reviewing is a polyp APPEARING, so capture on the rising
+    // edge. A fixed cooldown could not tell a new lesion from the one already on
+    // screen, so a second polyp arriving inside the window was dropped entirely
+    // while a single polyp was re-filed every few seconds. Edge-triggering
+    // inverts that: every distinct appearance lands, and one that lingers is
+    // only refreshed occasionally instead of once per frame.
+    if (inEpisodeRef.current) {
+      if (now - lastAutoCaptureRef.current < AUTO_CAPTURE_REFRESH_MS) return;
+    } else {
+      inEpisodeRef.current = true;
+    }
     lastAutoCaptureRef.current = now;
 
     cap.toBlob(async (blob) => {
@@ -347,6 +374,8 @@ export default function RealtimePlayer({
    *  clips leaves a stale "Polyp detected" lit over footage that has none. */
   function resetClipState() {
     setIsDemo(false);
+    inEpisodeRef.current = false;
+    lastDetectionRef.current = 0;
     scanRef.current = false;
     setPolyp(false);
     setStats({ sent: 0, received: 0, avgMs: 0 });

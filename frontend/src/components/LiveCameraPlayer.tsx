@@ -16,7 +16,13 @@ const INFER_TIMEOUT_MS = 6000;
 const INFER_WIDTH = 320;
 // Same throttle as the real-time player: once a polyp is flagged, wait this long
 // before auto-capturing again so the queue fills with distinct moments.
-const AUTO_CAPTURE_COOLDOWN_MS = 4000;
+// A polyp that is STILL on screen is re-filed at most this often. A polyp that
+// has just appeared is filed immediately regardless — see maybeAutoCapture.
+const AUTO_CAPTURE_REFRESH_MS = 8000;
+// A detection gap shorter than this counts as the same episode. The detector
+// drops the odd frame on a lesion that never left the screen, and treating that
+// as "gone" would re-trigger a capture on the very next frame.
+const DETECTION_GAP_MS = 1000;
 
 interface Box { bbox: [number, number, number, number]; conf: number; }
 interface Timing { recv_ms: number; modal_ms: number; total_ms: number; }
@@ -32,6 +38,8 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   const scanRef     = useRef(false); // capture loop running?
   const streamRef   = useRef<MediaStream | null>(null);
   const lastAutoCaptureRef = useRef(0);
+  const lastDetectionRef   = useRef(0);     // when a box was last seen
+  const inEpisodeRef       = useRef(false); // inside one continuous appearance?
   const lastBoxesRef = useRef<Box[]>([]); // AI's most recent detections — attached as context to manual captures
 
   // Pending response promise resolver — one in-flight request at a time
@@ -207,9 +215,25 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // inference, plus what the model saw, plus a rolling clip if available.
   // Throttled so a polyp staying in view for a while doesn't flood the queue.
   function maybeAutoCapture(cap: HTMLCanvasElement, boxes: Box[]) {
-    if (boxes.length === 0) return;
     const now = Date.now();
-    if (now - lastAutoCaptureRef.current < AUTO_CAPTURE_COOLDOWN_MS) return;
+
+    if (boxes.length === 0) {
+      if (now - lastDetectionRef.current > DETECTION_GAP_MS) inEpisodeRef.current = false;
+      return;
+    }
+    lastDetectionRef.current = now;
+
+    // The event worth reviewing is a polyp APPEARING, so capture on the rising
+    // edge. A fixed cooldown could not tell a new lesion from the one already on
+    // screen, so a second polyp arriving inside the window was dropped entirely
+    // while a single polyp was re-filed every few seconds. Edge-triggering
+    // inverts that: every distinct appearance lands, and one that lingers is
+    // only refreshed occasionally instead of once per frame.
+    if (inEpisodeRef.current) {
+      if (now - lastAutoCaptureRef.current < AUTO_CAPTURE_REFRESH_MS) return;
+    } else {
+      inEpisodeRef.current = true;
+    }
     lastAutoCaptureRef.current = now;
 
     cap.toBlob(async (blob) => {
