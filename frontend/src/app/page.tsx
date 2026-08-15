@@ -70,20 +70,9 @@ const isCpuEngine = (b: string) => b.startsWith("cpu");
  *  deployed, so a box with no onnx models simply shows the one option. */
 function engineOptions(d: BackendInfo | null, t: (s: string) => string): EngineOption[] {
   if (!d) return [];
-  const opts: EngineOption[] = [
-    {
-      id: "modal",
-      icon: "☁️",
-      title: t("Modal T4 (cloud GPU)"),
-      detail: t("Serverless · released after 2 min idle"),
-      // Measured from this server, warm, three consecutive runs: 378/378/379ms.
-      // The T4 itself only spends ~17ms on a frame — the rest is the round trip
-      // to the US and back, per frame. Quoting the GPU time here would be a lie
-      // about what the user will actually experience.
-      note: t("~380ms per frame · round-trip to the US dominates"),
-      usable: d.available?.modal !== false,
-    },
-  ];
+  // No cloud GPU option: this deployment is CPU-only (POLYP_CPU_ONLY), so
+  // offering Modal meant rendering a button the server would then refuse.
+  const opts: EngineOption[] = [];
   for (const m of d.cpu_models ?? []) {
     opts.push({
       id: m.backend,
@@ -122,9 +111,20 @@ const NEEDS_GPU: Mode[] = ["camera", "screen"];
 
 export default function Home() {
   const { t, lang, toggleLang } = useLanguage();
-  const { user, loading: authLoading, logout } = useAuth();
+  const { user, loading: authLoading, logout, reviewer } = useAuth();
 
   const [mode, setMode] = useState<Mode | null>(null);
+  // Opened from the header, so signing in never depends on first walking
+  // into a mode that happens to be gated.
+  const [showLogin, setShowLogin] = useState(false);
+
+  // RecordingControls sits several levels down inside the players; an event is
+  // less invasive than threading a callback through every one of them.
+  useEffect(() => {
+    const open = () => setShowLogin(true);
+    window.addEventListener("polyp:signin", open);
+    return () => window.removeEventListener("polyp:signin", open);
+  }, []);
   const [gpu, setGpu] = useState<GpuState>("off");
   const [uploadStage, setUploadStage] = useState<UploadStage>("idle");
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
@@ -338,6 +338,22 @@ export default function Home() {
               {t("Signed in as {user}", { user })}
             </span>
           )}
+          {reviewer && (
+            <a
+              href="/review"
+              className="text-sm px-3 py-2 rounded-lg border border-emerald-500/60 bg-emerald-600/20 text-emerald-200 hover:bg-emerald-600/30 transition-colors"
+            >
+              {t("Clinical review")}
+            </a>
+          )}
+          {!user && !authLoading && (
+            <button
+              onClick={() => setShowLogin(true)}
+              className="text-sm px-3 py-2 rounded-lg border border-blue-500/60 bg-blue-600/20 text-blue-200 hover:bg-blue-600/30 transition-colors"
+            >
+              {t("Sign in")}
+            </button>
+          )}
           {user && (
             <button
               onClick={logout}
@@ -439,6 +455,18 @@ export default function Home() {
               </span>
             </span>
             {!user && <span className="ms-auto text-xs text-gray-600 flex-shrink-0">{t("🔒 Sign-in required")}</span>}
+          </button>
+        </div>
+      )}
+
+      {showLogin && !user && (
+        <div className="mb-6">
+          <LoginPanel onOpenDemos={() => { setShowLogin(false); openMode("realtime"); }} />
+          <button
+            onClick={() => setShowLogin(false)}
+            className="mt-2 text-sm px-3 py-2 rounded-lg border border-gray-700 text-gray-400 hover:text-gray-200 hover:border-gray-500 transition-colors"
+          >
+            {t("Cancel")}
           </button>
         </div>
       )}

@@ -22,6 +22,8 @@ interface AuthContextValue {
   loading: boolean;
   registrationOpen: boolean;
   inviteRequired: boolean;
+  /** signed-in name is also an account in the clinical review panel */
+  reviewer: boolean;
   login: (username: string, password: string) => Promise<void>;
   register: (username: string, password: string, invite: string) => Promise<void>;
   logout: () => Promise<void>;
@@ -43,6 +45,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
   const [registrationOpen, setRegistrationOpen] = useState(false);
   const [inviteRequired, setInviteRequired] = useState(false);
+  const [reviewer, setReviewer] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -52,10 +55,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setUser(data.user ?? null);
       setRegistrationOpen(!!data.registration_open);
       setInviteRequired(!!data.invite_required);
+      setReviewer(!!data.reviewer);
     } catch {
       // Backend down or unreachable — treat as signed out rather than blocking
       // the whole page, since the open modes still work without it.
       setUser(null);
+      setReviewer(false);
     } finally {
       setLoading(false);
     }
@@ -88,7 +93,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   return (
     <AuthContext.Provider
-      value={{ user, loading, registrationOpen, inviteRequired, login, register, logout }}
+      value={{ user, loading, registrationOpen, inviteRequired, reviewer, login, register, logout }}
     >
       {children}
     </AuthContext.Provider>

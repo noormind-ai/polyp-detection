@@ -276,4 +276,6 @@ export const FA: Record<string, string> = {
   "{duration} · {size}": "{duration} · {size}",
   "case {case}": "پرونده {case}",
   "case {case} · {when}": "پرونده {case} · {when}",
+  "Clinical review": "بازبینی بالینی",
+
 };

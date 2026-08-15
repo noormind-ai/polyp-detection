@@ -82,4 +82,7 @@ def whoami(user: str | None = Depends(current_user)):
         "user": user,
         "registration_open": auth.REGISTRATION_OPEN,
         "invite_required": bool(auth.INVITE_CODE),
+        # Whether to offer the clinical review panel. Display only -- the panel
+        # authorises against its own users table regardless of what we say.
+        "reviewer": auth.is_panel_user(user) if user else False,
     }

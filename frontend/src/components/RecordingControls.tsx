@@ -43,9 +43,20 @@ export default function RecordingControls({ recorder, ready }: { recorder: Sessi
   if (loading) return null;
 
   if (!user) {
+    // Telling someone they need an account and then offering no way to get one
+    // is a dead end. The button opens the same login panel the header does.
     return (
-      <div className="rounded-xl border border-gray-800 bg-gray-900/40 px-3 py-2 text-xs text-gray-500">
-        {t("🔒 Sign in to record this session and play it back later.")}
+      <div className="flex flex-wrap items-center gap-2 rounded-xl border border-gray-800 bg-gray-900/40 px-3 py-2 text-xs text-gray-500">
+        <span>{t("🔒 Sign in to record this session and play it back later.")}</span>
+        {(
+          <button
+            type="button"
+            onClick={() => window.dispatchEvent(new CustomEvent("polyp:signin"))}
+            className="rounded-lg border border-blue-500/60 bg-blue-600/20 px-2.5 py-1 font-medium text-blue-200 hover:bg-blue-600/30"
+          >
+            {t("Sign in")}
+          </button>
+        )}
       </div>
     );
   }

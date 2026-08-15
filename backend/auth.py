@@ -174,7 +174,9 @@ def check_login(username: str, password: str) -> bool:
         # Hash anyway so a missing user and a wrong password take the same
         # time — otherwise the response time reveals which usernames exist.
         hash_password(password)
-        return False
+        # Not one of ours: it may still be a reviewer from the validation
+        # panel, who is the same person and should not need a second account.
+        return check_panel_login(username, password)
     if stored.startswith("pbkdf2$"):
         return verify_password(password, stored)
     return hmac.compare_digest(password, stored)
@@ -212,3 +214,87 @@ if __name__ == "__main__":
         print("usage: python -m backend.auth <password>")
         raise SystemExit(1)
     print(hash_password(sys.argv[1]))
+
+
+# ---------------------------------------------------------------------------
+# Review-panel accounts
+# ---------------------------------------------------------------------------
+# A reviewer created in the clinical validation panel is the same person as a
+# user of this app, and should not need a second set of credentials. So a login
+# that fails against this app's own users is retried against the panel's.
+#
+# The trust is deliberately ONE WAY. A panel account works here; an account
+# created HERE never gains anything in the panel, because self-signup is open
+# in this app and the panel guards patient images. Nothing in this file can
+# grant panel access -- the panel authorises against its own users table and
+# has no idea this code exists.
+#
+# Read-only, and only ever consulted after the local store has said no.
+PANEL_DB = os.environ.get(
+    "POLYP_PANEL_DB",
+    "/home/fati/noormind/clinical-validation/data/panel.db")
+
+
+def is_panel_user(username: str) -> bool:
+    """True if this name is a live account in the review panel.
+
+    Used only to decide whether to show the panel's link. It grants nothing:
+    the panel checks its own users table on every request and does not trust
+    anything this app says.
+    """
+    if not username or not os.path.exists(PANEL_DB):
+        return False
+    try:
+        import sqlite3
+        con = sqlite3.connect("file:%s?mode=ro" % PANEL_DB, uri=True, timeout=5)
+        try:
+            row = con.execute(
+                "SELECT 1 FROM users WHERE username = ? COLLATE NOCASE"
+                " AND is_active = 1", (username.strip(),)).fetchone()
+        finally:
+            con.close()
+        return bool(row)
+    except Exception:
+        return False
+
+
+def check_panel_login(username: str, password: str) -> bool:
+    """True if this is a live review-panel account and the password matches.
+
+    Argon2id, verified with the panel's own library. A panel user still holding
+    the one-time password an admin issued is refused: they must set their own
+    in the panel first, which is the same rule the panel itself applies before
+    showing a single image.
+    """
+    if not username or not password or not os.path.exists(PANEL_DB):
+        return False
+    try:
+        import sqlite3
+        from argon2 import PasswordHasher
+        from argon2.exceptions import (VerifyMismatchError, VerificationError,
+                                       InvalidHashError)
+    except Exception:
+        return False
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % PANEL_DB, uri=True, timeout=5)
+        try:
+            row = con.execute(
+                "SELECT pw_hash, is_active, must_change_pw FROM users"
+                " WHERE username = ? COLLATE NOCASE", (username.strip(),)
+            ).fetchone()
+        finally:
+            con.close()
+    except Exception:
+        return False
+    if not row:
+        return False
+    pw_hash, is_active, must_change = row
+    if not is_active or must_change:
+        return False
+    try:
+        PasswordHasher().verify(pw_hash, password)
+        return True
+    except (VerifyMismatchError, VerificationError, InvalidHashError):
+        return False
+    except Exception:
+        return False
