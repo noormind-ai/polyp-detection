@@ -35,3 +35,4 @@ venv/
 frontend/.next.bak-*/
 frontend/frontend.log
 .git.broken-bak/
+backend/models/
