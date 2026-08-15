@@ -1,0 +1,22 @@
+# Patient material and live state. None of this may leave the Iran box.
+# data/ holds the de-identified frames, panel.db (readers + annotations)
+# and the nightly backups.
+data/
+# crosswalk.csv maps a case label back to the real study folder. It is kept
+# only on the analyst's machine and is listed here so it can never be added
+# by accident if a copy ever lands next to the source.
+crosswalk.csv
+
+# Local-only working artifacts, all regenerable.
+# build/ comes back from scripts/build_pool.py; localdata/ is a scratch DB.
+build/
+localdata/
+venv/
+.venv/
+.env
+
+__pycache__/
+*.py[cod]
+*.db
+*.db-wal
+*.db-shm

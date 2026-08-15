@@ -1,0 +1,9 @@
+[Unit]
+Description=Nightly snapshot of the clinical feedback panel database
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

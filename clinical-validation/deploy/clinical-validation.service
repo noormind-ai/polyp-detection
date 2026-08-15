@@ -1,0 +1,41 @@
+[Unit]
+Description=NoorMind clinical feedback panel
+After=network.target
+
+[Service]
+Type=simple
+User=fati
+Group=fati
+# Code and state live apart on purpose. The code is a checkout of the
+# polyp-detection repo and is replaceable; the data directory holds the
+# frames, the reader accounts and every annotation, and is not.
+WorkingDirectory=/home/fati/noormind/panel-src/clinical-validation
+Environment=CV_DATA=/home/fati/noormind/clinical-validation/data
+Environment=CV_IMAGES=/home/fati/noormind/clinical-validation/data/images
+ExecStart=/home/fati/noormind/clinical-validation/venv/bin/uvicorn main:app \
+    --app-dir app --host 127.0.0.1 --port 19010 --proxy-headers \
+    --forwarded-allow-ips 127.0.0.1
+Restart=on-failure
+RestartSec=3
+
+# The service reads patient images and writes one database. Nothing else on the
+# box is its business, so nothing else is reachable from it.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/fati/noormind/clinical-validation/data
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

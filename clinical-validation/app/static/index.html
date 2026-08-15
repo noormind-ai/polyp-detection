@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>NoorMind — بازبینی بالینی</title>
+<link rel="stylesheet" href="/review/style.css">
+</head>
+<body>
+
+<header id="bar">
+  <button id="brandBtn" class="brand">NoorMind</button>
+  <span class="sep">/</span>
+  <span data-i18n="Clinical review">بازبینی بالینی</span>
+  <span class="grow"></span>
+  <span id="who" class="muted"></span>
+  <a id="navHome" href="/" class="ghost btnlink" data-i18n="NoorMind home">صفحه اصلی نورمایند</a>
+  <button id="navAdmin" class="ghost hidden" data-i18n="Admin">مدیریت</button>
+  <button id="navReview" class="ghost hidden" data-i18n="Review">بازبینی</button>
+  <button id="langBtn" class="ghost">EN</button>
+  <button id="logoutBtn" class="ghost hidden" data-i18n="Sign out">خروج</button>
+</header>
+
+<main>
+
+<!-- ------------------------------------------------------------- sign in -->
+<section id="viewLogin" class="card narrow">
+  <h1 data-i18n="Sign in">ورود</h1>
+  <p class="muted" data-i18n="Accounts are issued by an administrator.">
+    حساب‌ها توسط مدیر سامانه ایجاد می‌شوند.</p>
+  <label data-i18n="Username">نام کاربری</label>
+  <input id="liUser" autocomplete="username" autocapitalize="off" spellcheck="false">
+  <label data-i18n="Password">گذرواژه</label>
+  <input id="liPass" type="password" autocomplete="current-password">
+  <div id="liTotpWrap" class="hidden">
+    <label data-i18n="Authentication code">کد تأیید</label>
+    <input id="liTotp" inputmode="numeric" autocomplete="one-time-code">
+  </div>
+  <button id="liGo" class="primary" data-i18n="Sign in">ورود</button>
+  <p id="liErr" class="err"></p>
+</section>
+
+<!-- --------------------------------------------------- forced pw change -->
+<section id="viewChangePw" class="card narrow hidden">
+  <h1 data-i18n="Choose a new password">انتخاب گذرواژه جدید</h1>
+  <p class="muted" data-i18n="This account uses a one-time password. Set your own before continuing.">
+    این حساب با گذرواژه یک‌بارمصرف ساخته شده است. پیش از ادامه، گذرواژه خود را تعیین کنید.</p>
+  <label data-i18n="Current password">گذرواژه فعلی</label>
+  <input id="cpCur" type="password" autocomplete="current-password">
+  <label data-i18n="New password">گذرواژه جدید</label>
+  <input id="cpNew" type="password" autocomplete="new-password">
+  <label data-i18n="Repeat new password">تکرار گذرواژه جدید</label>
+  <input id="cpNew2" type="password" autocomplete="new-password">
+  <p class="muted small" data-i18n="At least 12 characters, using at least three of: lower case, upper case, digits, symbols.">
+    حداقل ۱۲ نویسه، شامل حداقل سه مورد از: حروف کوچک، حروف بزرگ، ارقام، نمادها.</p>
+  <button id="cpGo" class="primary" data-i18n="Save">ذخیره</button>
+  <p id="cpErr" class="err"></p>
+</section>
+
+<!-- ------------------------------------------------------------------ home -->
+<!-- Admins do both jobs, so neither is buried behind the other. -->
+<section id="viewHome" class="card narrow hidden">
+  <h1 id="homeHi"></h1>
+  <p class="muted" data-i18n="What would you like to do?">می‌خواهید چه کاری انجام دهید؟</p>
+  <div class="choices">
+    <button id="goReview" class="choice">
+      <span class="ci">🔍</span>
+      <span class="ct" data-i18n="Review images">بازبینی تصاویر</span>
+      <span class="cs muted small" data-i18n="Look at colonoscopy images and say whether you see a polyp.">تصاویر کولونوسکوپی را ببینید و بگویید پولیپ می‌بینید یا نه.</span>
+    </button>
+    <button id="goAdmin" class="choice">
+      <span class="ci">⚙️</span>
+      <span class="ct" data-i18n="Admin panel">پنل مدیریت</span>
+      <span class="cs muted small" data-i18n="Accounts, progress, activity log, and data export.">حساب‌ها، پیشرفت، گزارش فعالیت و دریافت داده‌ها.</span>
+    </button>
+  </div>
+</section>
+
+<!-- ---------------------------------------------------------- start view -->
+<section id="viewStart" class="card narrow hidden">
+  <h1 data-i18n="Start a reading session">شروع جلسه بازبینی</h1>
+  <p class="muted" data-i18n="You will be shown colonoscopy stills one at a time and asked whether a polyp is present. Cases are mixed and unlabelled.">
+    تصاویر کولونوسکوپی یکی‌یکی نمایش داده می‌شود و از شما پرسیده می‌شود آیا پولیپ وجود دارد.
+    موارد به‌صورت ترکیبی و بدون برچسب نمایش داده می‌شوند.</p>
+
+  <div id="resumeBox" class="hidden notice">
+    <span id="resumeTxt"></span>
+    <button id="resumeGo" class="primary small" data-i18n="Resume">ادامه</button>
+  </div>
+
+  <label data-i18n="How many images do you want to review?">چند تصویر می‌خواهید بازبینی کنید؟</label>
+  <div class="chips" id="nChips"></div>
+  <button id="startGo" class="primary" data-i18n="Start">شروع</button>
+  <p id="startErr" class="err"></p>
+</section>
+
+<!-- --------------------------------------------------------- frame review -->
+<section id="viewFrame" class="hidden">
+  <div class="progress"><div id="progFill"></div></div>
+  <div class="progtext"><span id="progTxt"></span><span id="caseTxt" class="muted"></span></div>
+
+  <div class="stage">
+    <div id="frameWrap" class="framewrap">
+      <img id="frameImg" alt="">
+      <canvas id="frameCanvas"></canvas>
+    </div>
+  </div>
+
+  <div id="qBlind" class="ask">
+    <h2 data-i18n="Is there a polyp in this image?">آیا در این تصویر پولیپ وجود دارد؟</h2>
+    <div class="btnrow answers">
+      <button id="bYes" class="yes" data-i18n="Yes, polyp">بله، پولیپ</button>
+      <button id="bNo"  class="no"  data-i18n="No polyp">پولیپ ندارد</button>
+      <button id="bUnsure" class="maybe" data-i18n="Not sure">مطمئن نیستم</button>
+    </div>
+    <div class="btnrow tight">
+      <button id="bBackQ" class="ghost hidden"><span data-i18n="Back">تصویر قبلی</span></button>
+    </div>
+  </div>
+
+  <div id="qBox" class="ask hidden">
+    <h2 data-i18n="Where is it? (optional)">کجاست؟ (اختیاری)</h2>
+    <p class="muted small" data-i18n="Marking the spot is helpful but not required — Continue saves your answer as it is.">
+      مشخص‌کردن محل مفید است اما الزامی نیست — «ادامه» پاسخ شما را همان‌طور ثبت می‌کند.</p>
+    <p id="boxHint" class="muted small" data-i18n="Drag on the image to draw. Tap the red ✕ on a box to remove it.">
+      برای رسم روی تصویر بکشید. برای حذف یک کادر، روی ✕ قرمز آن بزنید.</p>
+    <div class="btnrow tight">
+      <button id="bClear" class="ghost hidden" data-i18n="Clear boxes">پاک کردن کادرها</button>
+    </div>
+    <div class="btnrow">
+      <button id="bBoxDone" class="primary" data-i18n="Continue">ادامه</button>
+    </div>
+  </div>
+
+  <!-- Shown on the SAME image the reader just answered, never on top of the
+       next one. Everything here was withheld until the answer was stored. -->
+  <div id="qAfter" class="ask hidden">
+    <p id="afterWhy"></p>
+    <p id="afterAi" class="muted small hidden"></p>
+    <p id="afterYours" class="muted small"></p>
+    <div class="btnrow tight edit-row">
+      <button id="eYes" class="yes small" data-i18n="Yes, polyp">بله، پولیپ</button>
+      <button id="eNo" class="no small" data-i18n="No polyp">پولیپ ندارد</button>
+      <button id="eUnsure" class="maybe small" data-i18n="Not sure">مطمئن نیستم</button>
+    </div>
+    <div class="btnrow tight patient-row">
+      <button id="bPatient" class="ghost" data-i18n="See this whole patient">مشاهده کل این بیمار</button>
+    </div>
+    <div class="btnrow nav-row">
+      <button id="bBack" class="ghost"><span data-i18n="Back">تصویر قبلی</span></button>
+      <button id="bNext" class="primary"><span data-i18n="Next image">تصویر بعدی</span><span id="nextCount" class="count"></span></button>
+    </div>
+  </div>
+
+  <!-- The report and the whole patient, straight away, when the reader marks
+       something in a patient whose report records no polyp. -->
+  <div id="qConfirm" class="ask hidden">
+    <p id="confirmWhy" class="why"></p>
+    <h2 data-i18n="This patient's report records no polyp.">گزارش این بیمار هیچ پولیپی ثبت نکرده است.</h2>
+    <details class="rep">
+      <summary data-i18n="Show the full report">نمایش گزارش کامل</summary>
+      <pre id="confirmReport" class="report"></pre>
+    </details>
+    <p class="muted small" data-i18n="All images from this patient:">همه تصاویر این بیمار:</p>
+    <p id="confirmLegend" class="muted small legend"></p>
+    <div id="confirmSheet" class="sheet"></div>
+    <h3 data-i18n="Is there really a polyp there?">آیا واقعاً آنجا پولیپ وجود دارد؟</h3>
+    <div class="btnrow answers">
+      <button id="bConfirmYes" class="yes" data-i18n="Yes, I stand by it">بله، بر نظرم هستم</button>
+      <button id="bConfirmNo" class="no" data-i18n="No, I withdraw it">نه، پس می‌گیرم</button>
+      <button id="bConfirmUnsure" class="maybe" data-i18n="Not sure">مطمئن نیستم</button>
+    </div>
+  </div>
+</section>
+
+<!-- ------------------------------------------------------------ patient view -->
+<!-- Opened on demand from an answered image. The report is visible here, so
+     anything labelled from this screen is recorded as open-book, never as a
+     blind answer. -->
+<section id="viewPatient" class="hidden">
+  <div class="progtext">
+    <span id="pTitle"></span><span id="pCase" class="muted"></span>
+  </div>
+
+  <div class="ask">
+    <h2 id="pHead"></h2>
+    <p id="pFinding" class="finding hidden"></p>
+    <details class="rep">
+      <summary data-i18n="Show the full report">نمایش گزارش کامل</summary>
+      <pre id="pReport" class="report"></pre>
+    </details>
+    <p id="pLegend" class="muted small legend"></p>
+    <p class="muted small" data-i18n="Click any image to label it. Your answers are saved as reviewed with the report in view.">
+      برای برچسب‌زدن روی هر تصویر کلیک کنید. پاسخ‌های شما به‌عنوان «بررسی‌شده با گزارش» ثبت می‌شود.</p>
+  </div>
+
+  <div id="pSheet" class="sheet"></div>
+
+  <div class="ask">
+    <div class="btnrow">
+      <button id="pBack" class="primary" data-i18n="Back to review">بازگشت به بازبینی</button>
+    </div>
+  </div>
+</section>
+
+<!-- ------------------------------------------------------------ label one image -->
+<div id="pModal" class="modal hidden">
+  <div class="modalbox">
+    <div class="framewrap" id="pmWrap">
+      <img id="pmImg" alt="">
+      <canvas id="pmCanvas"></canvas>
+    </div>
+    <p id="pmHint" class="muted small" data-i18n="Drag on the image to draw. Tap the red ✕ on a box to remove it.">برای رسم روی تصویر بکشید. برای حذف یک کادر، روی ✕ قرمز آن بزنید.</p>
+    <div class="btnrow tight">
+      <button id="pmYes" class="yes small" data-i18n="Yes, polyp">بله، پولیپ</button>
+      <button id="pmNo" class="no small" data-i18n="No polyp">پولیپ ندارد</button>
+      <button id="pmUnsure" class="maybe small" data-i18n="Not sure">مطمئن نیستم</button>
+    </div>
+    <div class="btnrow tight">
+      <button id="pmClear" class="ghost hidden" data-i18n="Clear boxes">پاک کردن کادرها</button>
+    </div>
+    <div class="btnrow">
+      <button id="pmClose" class="ghost" data-i18n="Close">بستن</button>
+    </div>
+  </div>
+</div>
+
+<!-- ---------------------------------------------------------- patient review -->
+<!-- One screen per patient, shown only after every one of that patient's
+     images already has its own independent answer. -->
+<section id="viewCase" class="hidden">
+  <div class="progress"><div id="cProgFill"></div></div>
+  <div class="progtext"><span id="cProgTxt"></span><span id="cCaseTxt" class="muted"></span></div>
+
+  <div class="ask">
+    <h2 id="cHead"></h2>
+    <p id="cSub" class="muted"></p>
+    <p id="cFinding" class="finding hidden"></p>
+    <details class="rep">
+      <summary data-i18n="Show the full report">نمایش گزارش کامل</summary>
+      <pre id="cReport" class="report"></pre>
+    </details>
+  </div>
+
+  <p id="cLegend" class="muted small legend"></p>
+  <div id="cSheet" class="sheet"></div>
+
+  <!-- the reader marked something -->
+  <div id="cAskConfirm" class="ask hidden">
+    <h3 id="cQuestion"></h3>
+    <div class="btnrow answers">
+      <button id="bConfirm" class="yes" data-i18n="Yes, I stand by it">بله، بر نظرم هستم</button>
+      <button id="bRetract" class="no" data-i18n="No, I withdraw it">نه، پس می‌گیرم</button>
+      <button id="bConfUnsure" class="maybe" data-i18n="Not sure">مطمئن نیستم</button>
+    </div>
+  </div>
+
+  <!-- the reader found nothing but the report describes a polyp -->
+  <div id="cAskDebrief" class="ask hidden">
+    <h3 data-i18n="What do you think is the explanation?">به نظر شما توضیح آن چیست؟</h3>
+    <div class="reasons">
+      <button class="reason" data-reason="not_captured"
+              data-i18n="The polyp was never captured in a saved image">پولیپ در هیچ تصویر ذخیره‌شده‌ای ثبت نشده است</button>
+      <button class="reason" data-reason="now_visible"
+              data-i18n="Seeing them together, I can now see it">با دیدن همه با هم، اکنون آن را می‌بینم</button>
+      <button class="reason" data-reason="poor_quality"
+              data-i18n="The images are too poor to judge">کیفیت تصاویر برای قضاوت کافی نیست</button>
+      <button class="reason" data-reason="report_mismatch"
+              data-i18n="The report is wrong, or does not belong to these images">گزارش اشتباه است، یا مربوط به این تصاویر نیست</button>
+      <button class="reason" data-reason="other" data-i18n="Other">دلیل دیگر</button>
+    </div>
+    <p class="muted small" data-i18n="Click any image above to change what you said about it — including one you now think you got wrong.">
+      برای تغییر پاسخ خود روی هر تصویر بالا کلیک کنید — از جمله موردی که فکر می‌کنید اشتباه پاسخ داده‌اید.</p>
+    <label data-i18n="Explain in your own words (optional)">با بیان خودتان توضیح دهید (اختیاری)</label>
+    <textarea id="cNote" rows="2"></textarea>
+    <div class="btnrow">
+      <button id="cSave" class="primary" data-i18n="Save and continue">ذخیره و ادامه</button>
+    </div>
+    <p id="cErr" class="err"></p>
+  </div>
+</section>
+
+<!-- ------------------------------------------------------------------ done -->
+<section id="viewDone" class="card narrow hidden">
+  <h1 data-i18n="Session complete">جلسه به پایان رسید</h1>
+  <p id="doneTxt" class="muted"></p>
+  <div id="doneStats" class="grid4"></div>
+  <p id="doneContrib" class="muted small"></p>
+  <div class="progress"><div id="poolFill"></div></div>
+  <p id="poolTxt" class="muted small"></p>
+  <button id="doneGo" class="primary" data-i18n="Start another session">شروع جلسه جدید</button>
+</section>
+
+<!-- ----------------------------------------------------------------- admin -->
+<section id="viewAdmin" class="hidden">
+  <h1 data-i18n="Administration">مدیریت</h1>
+
+  <div class="card">
+    <h2 data-i18n="Create a reviewer account">ایجاد حساب بازبین</h2>
+    <div class="row">
+      <div><label data-i18n="Username">نام کاربری</label><input id="nuUser" spellcheck="false"></div>
+      <div><label data-i18n="Display name">نام نمایشی</label><input id="nuName"></div>
+      <div><label data-i18n="Role">نقش</label>
+        <select id="nuRole">
+          <option value="reader" data-i18n="Reviewer">بازبین</option>
+          <option value="admin" data-i18n="Administrator">مدیر</option>
+        </select></div>
+      <div class="bottom"><button id="nuGo" class="primary" data-i18n="Create">ایجاد</button></div>
+    </div>
+    <div id="nuOut" class="hidden creds"></div>
+    <p id="nuErr" class="err"></p>
+  </div>
+
+  <div class="card">
+    <h2 data-i18n="Accounts">حساب‌ها</h2>
+    <div id="userTable"></div>
+  </div>
+
+  <div id="readerCard" class="card hidden">
+    <h2 id="readerName"></h2>
+    <div id="readerSummary"></div>
+    <div class="btnrow tight">
+      <button id="readerRetire" class="ghost"></button>
+      <button id="readerClose" class="ghost" data-i18n="Close">بستن</button>
+    </div>
+    <div id="readerRows" class="logbox"></div>
+  </div>
+
+  <div class="card">
+    <h2 data-i18n="Progress">پیشرفت</h2>
+    <div id="statBox"></div>
+    <button id="exportGo" class="ghost" data-i18n="Download annotations">دریافت داده‌های ثبت‌شده</button>
+  </div>
+
+  <div class="card">
+    <h2 data-i18n="Activity log">گزارش فعالیت</h2>
+    <div id="auditBox"></div>
+  </div>
+</section>
+
+</main>
+<script src="/review/app.js"></script>
+</body>
+</html>

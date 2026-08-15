@@ -1,0 +1,8 @@
+[Unit]
+Description=Snapshot the clinical feedback panel database
+
+[Service]
+Type=oneshot
+User=fati
+Group=fati
+ExecStart=/home/fati/noormind/clinical-validation/deploy/backup.sh
