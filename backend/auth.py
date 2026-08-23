@@ -22,11 +22,24 @@ purpose — they are the real clinical use — and the bundled demos are open
 because they no longer touch the GPU at all (their detections are precomputed;
 see data/precompute_demos.py).
 
-Which is why registration DEFAULTS TO CLOSED here, unlike OrganAI. There,
-anyone may sign up but an account grants only the public demo cases — real
-patient data needs a separate reviewer list. Here an account IS the key to GPU
-spend, so open self-registration would make the gate decorative. Set
-POLYP_ALLOW_REGISTER=true (optionally with POLYP_INVITE_CODE) to open it.
+Registration DEFAULTS TO CLOSED, because where an upload costs GPU time an
+account IS the key to that spend and open self-registration would make the gate
+decorative. Set POLYP_ALLOW_REGISTER=true (optionally with POLYP_INVITE_CODE)
+to open it — the CPU-only deployments do, since there a stranger's upload costs
+one box's own cores rather than a GPU bill.
+
+ONE LOGIN, TWO KINDS OF ACCOUNT
+-------------------------------
+There is a single sign-in form for the whole site — the app at / and the
+clinical review panel at /review — and it accepts both kinds of account:
+
+  signed up here    can upload video. Cannot review: the panel authorises
+                    against its own users table and has never heard of them.
+  issued by a panel can do both. Reviewer accounts exist ONLY because an admin
+  admin             created one; no route anywhere makes one.
+
+So the login is shared and the ACCESS is what differs. See "Review-panel
+accounts" at the foot of this file for how the second kind is checked.
 """
 import base64
 import hashlib
@@ -166,7 +179,23 @@ def register_user(username: str, password: str, invite: str = "") -> None:
     tmp.replace(USER_FILE)                      # atomic: no half-written file
 
 
-def check_login(username: str, password: str) -> bool:
+# What login_status() can answer. Anything but OK means no session is issued;
+# MUST_CHANGE_PW is the one case where the password was RIGHT.
+OK = "ok"
+MUST_CHANGE_PW = "must_change_password"
+NO = "no"
+
+
+def login_status(username: str, password: str) -> str:
+    """OK / MUST_CHANGE_PW / NO — the single answer the sign-in form uses.
+
+    Local accounts first, then the review panel, so a name held in both is
+    whichever this app knows about. MUST_CHANGE_PW is reported rather than
+    folded into NO because the credentials were correct and the person has
+    something to DO about it — answering "wrong password" instead sends them off
+    to reset a password that was never the problem. It reveals no more than the
+    panel's own login already does, which returns must_change_pw on success.
+    """
     # Read fresh so an account registered a moment ago works immediately, and
     # so a second worker process sees it too.
     stored = load_users().get(username)
@@ -176,10 +205,15 @@ def check_login(username: str, password: str) -> bool:
         hash_password(password)
         # Not one of ours: it may still be a reviewer from the validation
         # panel, who is the same person and should not need a second account.
-        return check_panel_login(username, password)
-    if stored.startswith("pbkdf2$"):
-        return verify_password(password, stored)
-    return hmac.compare_digest(password, stored)
+        return panel_login_status(username, password)
+    ok = (verify_password(password, stored) if stored.startswith("pbkdf2$")
+          else hmac.compare_digest(password, stored))
+    return OK if ok else NO
+
+
+def check_login(username: str, password: str) -> bool:
+    """True only when a session may be issued right now."""
+    return login_status(username, password) == OK
 
 
 def issue_session(username: str) -> str:
@@ -258,23 +292,29 @@ def is_panel_user(username: str) -> bool:
         return False
 
 
-def check_panel_login(username: str, password: str) -> bool:
-    """True if this is a live review-panel account and the password matches.
+def panel_login_status(username: str, password: str) -> str:
+    """OK / MUST_CHANGE_PW / NO for a review-panel account.
 
-    Argon2id, verified with the panel's own library. A panel user still holding
-    the one-time password an admin issued is refused: they must set their own
-    in the panel first, which is the same rule the panel itself applies before
-    showing a single image.
+    Argon2id, verified with the panel's own library.
+
+    A reviewer still holding the one-time password an admin issued gets
+    MUST_CHANGE_PW, not a session. That password was dictated or messaged to
+    them out of band; it must not quietly become a permanent credential for a
+    second application. Same rule the panel applies before showing a single
+    image — and with a shared login form it costs one extra step instead of
+    being a locked door, which is what it used to be when this returned a bare
+    False and the caller told someone with a perfectly correct password that it
+    was incorrect.
     """
     if not username or not password or not os.path.exists(PANEL_DB):
-        return False
+        return NO
     try:
         import sqlite3
         from argon2 import PasswordHasher
         from argon2.exceptions import (VerifyMismatchError, VerificationError,
                                        InvalidHashError)
     except Exception:
-        return False
+        return NO
     try:
         con = sqlite3.connect("file:%s?mode=ro" % PANEL_DB, uri=True, timeout=5)
         try:
@@ -285,16 +325,44 @@ def check_panel_login(username: str, password: str) -> bool:
         finally:
             con.close()
     except Exception:
-        return False
+        return NO
     if not row:
-        return False
+        return NO
     pw_hash, is_active, must_change = row
-    if not is_active or must_change:
-        return False
+    if not is_active:
+        return NO
     try:
         PasswordHasher().verify(pw_hash, password)
-        return True
     except (VerifyMismatchError, VerificationError, InvalidHashError):
-        return False
+        return NO
     except Exception:
-        return False
+        return NO
+    return MUST_CHANGE_PW if must_change else OK
+
+
+def check_panel_login(username: str, password: str) -> bool:
+    return panel_login_status(username, password) == OK
+
+
+def panel_role(username: str) -> str | None:
+    """'admin' / 'reader' for a live panel account, else None.
+
+    Display only, exactly like is_panel_user: it decides whether to offer the
+    link to /review, and grants nothing. An account made by the signup form has
+    no row here at all, so it gets None, is never shown the link, and would be
+    turned away by the panel even if it guessed the URL.
+    """
+    if not username or not os.path.exists(PANEL_DB):
+        return None
+    try:
+        import sqlite3
+        con = sqlite3.connect("file:%s?mode=ro" % PANEL_DB, uri=True, timeout=5)
+        try:
+            row = con.execute(
+                "SELECT role FROM users WHERE username = ? COLLATE NOCASE"
+                " AND is_active = 1", (username.strip(),)).fetchone()
+        finally:
+            con.close()
+        return row[0] if row else None
+    except Exception:
+        return None

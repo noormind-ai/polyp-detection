@@ -79,6 +79,22 @@ export const FA: Record<string, string> = {
   "Laptop webcam, phone camera (if this page is opened on the phone itself), or a USB/HDMI capture card — any of them show up below once you grant camera access.": "وب‌کم لپ‌تاپ، دوربین گوشی (اگر این صفحه روی خود گوشی باز شده باشد) یا کارت کپچر USB/HDMI — پس از اعطای دسترسی به دوربین، همه آن‌ها در پایین نمایش داده می‌شوند.",
   "Requesting access...": "در حال درخواست دسترسی...",
   "Choose a camera": "انتخاب دوربین",
+  "📺 Tutorials": "📺 آموزش‌ها",
+  "Tutorials": "آموزش‌ها",
+  "How to use the feedback panels": "راهنمای استفاده از پنل‌های بازخورد",
+  "Two short guides to the feedback workflow. Nothing downloads until you press play.": "دو راهنمای کوتاه برای فرایند بازخورد. تا زمانی که پخش را نزنید چیزی دانلود نمی‌شود.",
+  "A short guide to the feedback workflow. Nothing downloads until you press play.": "یک راهنمای کوتاه برای فرایند بازخورد. تا زمانی که پخش را نزنید چیزی دانلود نمی‌شود.",
+  "No guides are available for this account.": "برای این حساب راهنمایی موجود نیست.",
+  "Online — feedback during a live session": "آنلاین (live) — ثبت بازخورد به صورت زنده و همزمان با کولونوسکوپی",
+  "Capturing a frame while the procedure is running: what the AI files on its own, and how to flag something it missed.": "ثبت یک فریم به صورت زنده و همزمان با کولونوسکوپی: چه چیزی را هوش مصنوعی خودش ذخیره می‌کند، و چگونه موردی را که از قلم افتاده علامت بزنید.",
+  "Offline — reviewing what was captured": "آفلاین — برچسب‌زنی تصاویر جمع‌آوری‌شده",
+  "Working through the review queue afterwards: confirming or rejecting each capture.": "برچسب زدن تصاویری که از قبل جمع‌آوری شده‌اند: تأیید یا رد هر مورد در صف بازبینی.",
+  "Open in a new tab": "باز کردن در تب جدید",
+  "Cameras": "دوربین‌ها",
+  "Demo clips": "کلیپ‌های نمونه",
+  "Select a source…": "یک منبع انتخاب کنید…",
+  "Demo clip: {name}": "کلیپ نمونه: {name}",
+  "← Stop demo clip": "→ توقف کلیپ نمونه",
   "No active stream — pick a device below.": "جریان فعالی وجود ندارد — یک دستگاه از فهرست پایین انتخاب کنید.",
   "Camera is in use by another app on this computer.": "دوربین توسط برنامه دیگری روی این رایانه در حال استفاده است.",
   "Share a window instead": "در عوض، یک پنجره به اشتراک بگذارید",
@@ -278,4 +294,53 @@ export const FA: Record<string, string> = {
   "case {case} · {when}": "پرونده {case} · {when}",
   "Clinical review": "بازبینی بالینی",
 
+
+  // The one sign-in shared by the app and the review panel.
+  "NoorMind":
+    "نورمایند",
+  "Continue":
+    "ادامه",
+  "An account here lets you upload and analyse video. Access to the clinical review panel is issued by an administrator.":
+    "با این حساب می‌توانید ویدیو بارگذاری و تحلیل کنید. دسترسی به پنل بازبینی بالینی را مدیر سامانه صادر می‌کند.",
+  "Choose your own password":
+    "رمز عبور خودتان را انتخاب کنید",
+  "New password":
+    "رمز عبور جدید",
+  "Repeat new password":
+    "تکرار رمز عبور جدید",
+  "Passwords do not match.":
+    "رمز عبورها یکسان نیستند.",
+  "At least 12 characters, using three of: lower case, upper case, digits, symbols.":
+    "حداقل ۱۲ نویسه، شامل حداقل سه مورد از: حروف کوچک، حروف بزرگ، ارقام، نمادها.",
+  "Save and continue":
+    "ذخیره و ادامه",
+  "This account cannot open the clinical review panel.":
+    "این حساب اجازهٔ ورود به پنل بازبینی بالینی را ندارد.",
+  "Could not open the clinical review panel. Sign in again.":
+    "باز کردن پنل بازبینی بالینی ممکن نشد. دوباره وارد شوید.",
+  "You are signed in as {user}. Review access is issued by an administrator.":
+    "شما با نام {user} وارد شده‌اید. دسترسی بازبینی را مدیر سامانه صادر می‌کند.",
+  "Sign in as someone else":
+    "ورود با حساب دیگر",
+  "Your session expired. Sign in again.":
+    "نشست شما منقضی شد. دوباره وارد شوید.",
+  "Sign in to continue.": "برای ادامه وارد شوید.",
+
+  // The reviewer's callout on the landing screen. Arrows are flipped in Farsi,
+  // same as "← Back" above.
+  "Clinical review panel":
+    "پنل بازبینی بالینی",
+  "Administrator":
+    "مدیر",
+  "Read patient studies and record your findings":
+    "مطالعات بیماران را ببینید و یافته‌های خود را ثبت کنید",
+  "{done} of {total} studies reviewed in your open session":
+    "{done} از {total} مطالعه در نشست باز شما بازبینی شده است",
+  "Continue reviewing →":
+    "ادامهٔ بازبینی ←",
+  "Open the review panel →":
+    "باز کردن پنل بازبینی ←",
+  "This account uses a one-time password. Choose your own to continue.":
+    "این حساب با رمز عبور یک‌بارمصرف ساخته شده است. پیش از ادامه، رمز عبور خود را تعیین کنید.",
+  "Repeat password": "تکرار رمز عبور",
 };

@@ -6,8 +6,9 @@ import WarmupPanel from "@/components/WarmupPanel";
 import VideoPlayer from "@/components/VideoPlayer";
 import RealtimePlayer from "@/components/RealtimePlayer";
 import LiveCameraPlayer from "@/components/LiveCameraPlayer";
-import LoginPanel from "@/components/LoginPanel";
+import SignInPrompt, { goToLogin } from "@/components/SignInPrompt";
 import RecordingsPanel from "@/components/RecordingsPanel";
+import ReviewCallout from "@/components/ReviewCallout";
 import { useAuth } from "@/lib/auth";
 import { useLanguage } from "@/lib/i18n";
 
@@ -114,14 +115,11 @@ export default function Home() {
   const { user, loading: authLoading, logout, reviewer } = useAuth();
 
   const [mode, setMode] = useState<Mode | null>(null);
-  // Opened from the header, so signing in never depends on first walking
-  // into a mode that happens to be gated.
-  const [showLogin, setShowLogin] = useState(false);
 
   // RecordingControls sits several levels down inside the players; an event is
   // less invasive than threading a callback through every one of them.
   useEffect(() => {
-    const open = () => setShowLogin(true);
+    const open = () => goToLogin();
     window.addEventListener("polyp:signin", open);
     return () => window.removeEventListener("polyp:signin", open);
   }, []);
@@ -348,7 +346,7 @@ export default function Home() {
           )}
           {!user && !authLoading && (
             <button
-              onClick={() => setShowLogin(true)}
+              onClick={() => goToLogin()}
               className="text-sm px-3 py-2 rounded-lg border border-blue-500/60 bg-blue-600/20 text-blue-200 hover:bg-blue-600/30 transition-colors"
             >
               {t("Sign in")}
@@ -362,6 +360,15 @@ export default function Home() {
               {t("Sign out")}
             </button>
           )}
+          {/* Deliberately outside the account wall and in the header rather than
+              down with the mode cards: the guides are part of what convinces
+              someone to sign up, and they are wanted mid-task too. */}
+          <a
+            href="/tutorials"
+            className="text-sm px-3 py-2 rounded-lg border border-gray-700 text-gray-400 hover:text-gray-200 hover:border-gray-500 transition-colors"
+          >
+            {t("📺 Tutorials")}
+          </a>
           <a href="/" className="text-sm px-3 py-2 rounded-lg border border-gray-700 text-gray-400 hover:text-gray-200 hover:border-gray-500 transition-colors">
             {t("Home")}
           </a>
@@ -378,6 +385,10 @@ export default function Home() {
           nothing here starts one; only the two live capture modes do. */}
       {mode === null && (
         <div className="space-y-4">
+          {/* A reviewer came here for the panel, not for inference. Give it the
+              top of the page, above the choices that are not their work. */}
+          <ReviewCallout />
+
           {/* Engine picker. Only rendered when the server offers more than one,
               so a deployment with no CPU models looks exactly as it did. */}
           {engineOptions(backends, t).length > 1 && (
@@ -459,23 +470,11 @@ export default function Home() {
         </div>
       )}
 
-      {showLogin && !user && (
-        <div className="mb-6">
-          <LoginPanel onOpenDemos={() => { setShowLogin(false); openMode("realtime"); }} />
-          <button
-            onClick={() => setShowLogin(false)}
-            className="mt-2 text-sm px-3 py-2 rounded-lg border border-gray-700 text-gray-400 hover:text-gray-200 hover:border-gray-500 transition-colors"
-          >
-            {t("Cancel")}
-          </button>
-        </div>
-      )}
-
       {mode !== null && (
         <div className="space-y-3">
           {backButton}
 
-          {blockedOnLogin && <LoginPanel onOpenDemos={() => openMode("realtime")} />}
+          {blockedOnLogin && <SignInPrompt onOpenDemos={() => openMode("realtime")} />}
 
           {!blockedOnLogin && warmingUp && <WarmupPanel backend={backend} />}
 

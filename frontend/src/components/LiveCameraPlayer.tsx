@@ -4,11 +4,13 @@ import { useEffect, useRef, useState } from "react";
 import FeedbackPanel from "./FeedbackPanel";
 import RecordingControls from "./RecordingControls";
 import RecordingsPanel from "./RecordingsPanel";
+import { DEMO_VIDEOS } from "./demos";
 import { useLanguage } from "@/lib/i18n";
 import { useRollingClip } from "@/lib/useRollingClip";
 import { useSessionRecorder } from "@/lib/useSessionRecorder";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "";
+const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 // Resolve the socket origin explicitly rather than leaning on a relative
 // WebSocket URL: the spec allows it, but an absolute ws:// is unambiguous and
 // still follows the page from an IP to a domain with no rebuild.
@@ -26,6 +28,14 @@ const AUTO_CAPTURE_REFRESH_MS = 8000;
 // drops the odd frame on a lesion that never left the screen, and treating that
 // as "gone" would re-trigger a capture on the very next frame.
 const DETECTION_GAP_MS = 1000;
+
+// A demo clip is a third source alongside the two real ones. It is not a
+// separate playback mode: the frames go through the identical capture loop,
+// socket and auto-capture path, so from here down it behaves like a camera.
+type CaptureMode = "camera" | "screen" | "demo";
+// Demo entries share the device <select> with real cameras, so their option
+// values have to be distinguishable from a deviceId.
+const DEMO_PREFIX = "demo:";
 
 interface Box { bbox: [number, number, number, number]; conf: number; }
 interface Timing { recv_ms: number; modal_ms: number; total_ms: number; }
@@ -58,10 +68,11 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   const [stats, setStats]                 = useState({ sent: 0, received: 0, avgMs: 0 });
   const [lastError, setLastError]         = useState("");
   const [cameraBusy, setCameraBusy]       = useState(false); // device held by another app — offer screen-share fallback
-  const [captureMode, setCaptureMode]     = useState<"camera" | "screen">("camera");
+  const [captureMode, setCaptureMode]     = useState<CaptureMode>("camera");
   // Mirrored into a ref because the capture loop is a long-running closure that
   // would otherwise read whatever the mode was when it started.
-  const captureModeRef = useRef<"camera" | "screen">("camera");
+  const captureModeRef = useRef<CaptureMode>("camera");
+  const [demoFile, setDemoFile]           = useState<string | null>(null);
   const [feedbackRefreshKey, setFeedbackRefreshKey] = useState(0);
   const [aspect, setAspect]               = useState("560/480"); // replaced with the stream's real ratio once it starts
   const [showDetected, setShowDetected]   = useState(true);
@@ -76,7 +87,9 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // long-running capture loop, but the session recorder is a hook and has to
   // re-run when the stream is replaced (a device switch, or camera → screen).
   const [activeStream, setActiveStream] = useState<MediaStream | null>(null);
-  const recorder = useSessionRecorder(caseId, captureMode, activeStream);
+  // A demo clip records as "camera": it enters the pipeline the same way, and
+  // the server only accepts camera|screen as a recording source.
+  const recorder = useSessionRecorder(caseId, captureMode === "screen" ? "screen" : "camera", activeStream);
   const [showRecordings, setShowRecordings] = useState(false);
 
   // Surface the list the moment a recording finishes — the operator has just
@@ -95,7 +108,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   const snapshotCanvasRef = useRef<HTMLCanvasElement>(null);
   const CROP_KEY = "polyp_screen_crop_rect";
 
-  function switchCaptureMode(mode: "camera" | "screen") {
+  function switchCaptureMode(mode: CaptureMode) {
     captureModeRef.current = mode;
     setCaptureMode(mode);
   }
@@ -388,6 +401,49 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     }
   }
 
+  // Play one of the bundled demo clips as if it were a camera: the <video> is
+  // fed from a file instead of a MediaStream and looped, and everything after
+  // that — the capture loop, the socket, auto-capture, the two panels — is the
+  // camera path untouched. Works with no capture hardware attached at all.
+  async function startDemo(file: string) {
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    scanRef.current = false;
+    setLastError("");
+    setCameraBusy(false);
+    const video = videoRef.current;
+    if (!video) return;
+    try {
+      video.srcObject = null;
+      video.src = `${BASE_PATH}/demos/${file}`;
+      video.loop = true;
+      setDemoFile(file);
+      setSelectedId(`${DEMO_PREFIX}${file}`);
+      switchCaptureMode("demo");
+      // Unhide before waiting for pixels — a display:none <video> is not a
+      // reliable captureStream() source, the same reason the screen-share path
+      // flips this before it waits.
+      setStreaming(true);
+      await video.play();
+      await waitForFrame(video);
+
+      // The element's own captureStream() stands in for a device stream, so
+      // session recording and the rolling clip work here unchanged.
+      let stream: MediaStream | null = null;
+      try {
+        // @ts-expect-error captureStream isn't in the older lib.dom typings
+        stream = typeof video.captureStream === "function" ? video.captureStream() : null;
+      } catch { /* recording just won't be available for this clip */ }
+      streamRef.current = stream;
+      setActiveStream(stream);
+
+      startLoop();
+    } catch (err: unknown) {
+      setStreaming(false);
+      setDemoFile(null);
+      setLastError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   // Fallback when the physical device is locked by another app (e.g. ColnoSpy already has it
   // open) — capture the pixels of whatever window/screen is showing the feed instead of the
   // device itself. No coordination with the other app needed, just a one-time picker consent.
@@ -477,8 +533,12 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
 
   function handleDeviceChange(e: React.ChangeEvent<HTMLSelectElement>) {
     const id = e.target.value;
+    if (!id) return;
     setSelectedId(id);
-    startStream(id);
+    // Demo clips sit in the same list as the real devices — picking one is the
+    // same gesture as picking a camera, so it runs through the same handler.
+    if (id.startsWith(DEMO_PREFIX)) startDemo(id.slice(DEMO_PREFIX.length));
+    else startStream(id);
   }
 
   function stopCamera() {
@@ -489,6 +549,11 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     setActiveStream(null);
+    // A demo is a file on the element, not a device: stopping the captured
+    // tracks does not stop it playing, so unload it explicitly.
+    const video = videoRef.current;
+    if (video && video.src) { video.pause(); video.removeAttribute("src"); video.load(); }
+    setDemoFile(null);
     setStreaming(false);
     updateBoxes([]);
   }
@@ -524,11 +589,21 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       onChange={handleDeviceChange}
       className="bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white"
     >
-      {devices.map((d) => (
-        <option key={d.deviceId} value={d.deviceId}>
-          {d.label || t("Camera {id}", { id: d.deviceId.slice(0, 6) })}
-        </option>
-      ))}
+      {!selectedDeviceId && <option value="">{t("Select a source…")}</option>}
+      {devices.length > 0 && (
+        <optgroup label={t("Cameras")}>
+          {devices.map((d) => (
+            <option key={d.deviceId} value={d.deviceId}>
+              {d.label || t("Camera {id}", { id: d.deviceId.slice(0, 6) })}
+            </option>
+          ))}
+        </optgroup>
+      )}
+      <optgroup label={t("Demo clips")}>
+        {DEMO_VIDEOS.map((v) => (
+          <option key={v.file} value={`${DEMO_PREFIX}${v.file}`}>{t(v.label)}</option>
+        ))}
+      </optgroup>
     </select>
   );
 
@@ -541,6 +616,11 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
             <span className={`w-2 h-2 rounded-full inline-block ${wsOk ? "bg-green-400 animate-pulse" : "bg-yellow-400"}`} />
             {wsStatusText}
           </span>
+          {captureMode === "demo" && demoFile && (
+            <span className="text-xs px-2 py-0.5 rounded-md border border-purple-800 bg-purple-950/40 text-purple-300">
+              {t("Demo clip: {name}", { name: t(DEMO_VIDEOS.find((v) => v.file === demoFile)?.label ?? demoFile) })}
+            </span>
+          )}
           {polyp && <span className="text-[#39ff14] font-medium animate-pulse">{t("Polyp detected")}</span>}
         </div>
         <button onClick={() => { stopCamera(); onStop(); }} className="text-sm text-red-400 hover:text-red-300 transition-colors">{t("Stop")}</button>
@@ -609,7 +689,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
               ) : (
                 <p className="text-gray-500 text-sm">{t("No active stream — pick a device below.")}</p>
               )}
-              {devices.length > 0 && <div>{deviceSelect}</div>}
+              <div>{deviceSelect}</div>
 
               {cameraBusy && (
                 <div className="max-w-sm mx-auto bg-red-950 border border-red-800 rounded-lg px-4 py-3 space-y-2">
@@ -698,6 +778,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
                     ref={videoRef}
                     muted
                     playsInline
+                    loop={captureMode === "demo"}
                     className={liveStyle ? "absolute object-contain" : "absolute inset-0 w-full h-full object-contain"}
                     style={liveStyle}
                   />
@@ -705,7 +786,9 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
               </div>
             </div>
 
-            {captureMode === "camera" && devices.length > 1 && deviceSelect}
+            {/* Shown whenever the source is switchable — with the demo clips in
+                the list that is any time we are not screen-sharing. */}
+            {captureMode !== "screen" && deviceSelect}
 
             {captureMode === "screen" && (
               <div className="flex flex-wrap items-center gap-3 text-sm">
@@ -721,7 +804,9 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
             )}
 
             <button onClick={stopCamera} className="text-sm text-gray-500 hover:text-gray-300 transition-colors">
-              {captureMode === "screen" ? t("← Disconnect screen share") : t("← Disconnect camera")}
+              {captureMode === "screen" ? t("← Disconnect screen share")
+                : captureMode === "demo" ? t("← Stop demo clip")
+                : t("← Disconnect camera")}
             </button>
           </div>
 
