@@ -417,4 +417,43 @@ export const FA: Record<string, string> = {
     "آشکارساز ترنسفورمری، صرفاً برای مقایسه ارزیابی شد. روی این مجموعه رقابتی نیست.",
   "Measured on this deployment's own archive against the endoscopist's report, not on a public benchmark. With only {positives} report-positive studies, one study is worth about {pts} points of recall — treat small differences as noise and compare on ROC AUC, which uses every study and needs no threshold.":
     "اندازه‌گیری‌شده روی آرشیو همین استقرار و در مقایسه با گزارش پزشک، نه روی یک محک عمومی. با تنها {positives} مطالعه دارای پولیپ در گزارش، هر مطالعه حدود {pts} واحد حساسیت ارزش دارد — تفاوت‌های کوچک را نویز بدانید و مقایسه را بر پایه ROC AUC انجام دهید که همه مطالعات را به کار می‌گیرد و به آستانه نیاز ندارد.",
+  "Model comparison": "مقایسه مدل‌ها",
+  "Measured on our own studies, against the endoscopist's report":
+    "اندازه‌گیری‌شده روی مطالعات خودمان، در مقایسه با گزارش پزشک",
+  "All models": "همه مدل‌ها",
+  "Include noisy-frame false alarms": "احتساب هشدارهای نادرست روی فریم‌های نویزی",
+  "Model": "مدل",
+  "ROC AUC": "سطح زیر منحنی ROC",
+  "Fires on noise": "هشدار روی نویز",
+  "studies found": "مطالعات یافت‌شده",
+  "of alerts, correct": "از هشدارها، درست",
+  "clean studies left alone": "مطالعات سالم بدون هشدار",
+  "lower is better": "کمتر بهتر است",
+  "not run": "اجرا نشده",
+  "Click a row for the full breakdown. Click a column heading to sort.":
+    "برای دیدن جزئیات کامل روی یک سطر و برای مرتب‌سازی روی عنوان ستون کلیک کنید.",
+  "Found": "یافت‌شده",
+  "Missed": "از دست رفته",
+  "report-positive studies": "مطالعات دارای پولیپ در گزارش",
+  "false negatives": "منفی‌های نادرست",
+  "of {n} clean studies": "از {n} مطالعه سالم",
+  "sensitivity + specificity − 1": "حساسیت + ویژگی − ۱",
+  "Sensitivity by polyp size": "حساسیت بر اساس اندازه پولیپ",
+  "Sensitivity by morphology": "حساسیت بر اساس ریخت‌شناسی",
+  "Noisy frames fired on": "فریم‌های نویزی دارای هشدار",
+  "Compare all models →": "مقایسه همه مدل‌ها ←",
+  "<=5mm": "≤ ۵ میلی‌متر",
+  "6-9mm": "۶ تا ۹ میلی‌متر",
+  ">=10mm": "≥ ۱۰ میلی‌متر",
+  "size not stated": "اندازه ذکر نشده",
+  "sessile": "پایه‌پهن (سسیل)",
+  "not stated": "ذکر نشده",
+  "Every row is the same evaluation: {studies} colonoscopy studies from this archive, scored against the endoscopist's report. A study counts as a detection when the model fires on at least 3 frames at confidence 0.70 or above. {positives} of the studies have a polyp in the report; {negatives} do not.":
+    "هر سطر همان ارزیابی یکسان است: {studies} مطالعه کولونوسکوپی از این آرشیو، سنجیده‌شده در برابر گزارش پزشک. یک مطالعه زمانی «شناسایی‌شده» شمرده می‌شود که مدل دست‌کم روی ۳ فریم با اطمینان ۰٫۷۰ یا بیشتر هشدار دهد. {positives} مطالعه در گزارش پولیپ دارند و {negatives} مطالعه ندارند.",
+  "Published benchmark scores are not shown. A model trained on Kvasir reports its accuracy on Kvasir, which says little about this hospital's footage — the deployed model scores mAP50 0.93 there and finds {recall}% of studies here.":
+    "امتیازهای محک‌های منتشرشده نمایش داده نمی‌شوند. مدلی که روی Kvasir آموزش دیده دقتش را روی همان Kvasir گزارش می‌کند و این چیز زیادی درباره تصاویر این بیمارستان نمی‌گوید — مدل مستقرشده آنجا mAP50 برابر ۰٫۹۳ می‌گیرد و اینجا {recall}٪ مطالعات را می‌یابد.",
+  "\"Fires on noise\" is a separate frame-level test: {frames} frames the review panel marked noisy and never called a polyp, so their true label is no-polyp and every detection is wrong by construction. It is kept apart from the study numbers because a study needs 3 frames to be called positive — one stray box costs no study, but it does cost attention. These panel frames arrive already tightly cropped, so the border crop is a no-op on this set and cannot be judged by it.":
+    "«هشدار روی نویز» یک آزمون جداگانه در سطح فریم است: {frames} فریم که پنل بازبینی آن‌ها را نویزی علامت زده و هرگز پولیپ ندانسته است، پس برچسب واقعی‌شان «بدون پولیپ» است و هر شناسایی روی آن‌ها ذاتاً نادرست است. این آزمون جدا از اعداد سطح‌مطالعه نگه داشته شده، چون یک مطالعه برای مثبت شمرده‌شدن به ۳ فریم نیاز دارد — یک کادر پرت هزینه‌ای در سطح مطالعه ندارد، اما توجه پزشک را هدر می‌دهد. این فریم‌های پنل از پیش کاملاً برش خورده‌اند، بنابراین برش حاشیه روی این مجموعه بی‌اثر است و با آن نمی‌توان قضاوتش کرد.",
+  "Measured on {frames} frames across {studies} studies. With only {positives} report-positive studies, one study is worth about {pts} points of recall — treat small differences as noise, and compare models on ROC AUC, which uses every study and needs no threshold.":
+    "اندازه‌گیری‌شده روی {frames} فریم در {studies} مطالعه. با تنها {positives} مطالعه دارای پولیپ در گزارش، هر مطالعه حدود {pts} واحد حساسیت ارزش دارد — تفاوت‌های کوچک را نویز بدانید و مقایسه مدل‌ها را بر پایه ROC AUC انجام دهید که همه مطالعات را به کار می‌گیرد و به آستانه نیاز ندارد.",
 };

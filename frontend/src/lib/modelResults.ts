@@ -1,37 +1,49 @@
 /**
  * Study-level results for every detector we have evaluated on our own corpus.
  *
- * These are NOT the numbers a model reports on its own training benchmark.
- * Every row here is the same evaluation: 108 colonoscopy studies from this
- * deployment's archive, scored against what the endoscopist's report said, at
- * conf >= 0.70 with a study called positive at >= 3 frames. That is why a model
- * can look strong on Kvasir and unremarkable here.
+ * These are NOT the numbers a model reports on its own training benchmark. Every
+ * row is the same evaluation: 108 colonoscopy studies from this deployment's
+ * archive, scored against what the endoscopist's report said, at conf >= 0.70
+ * with a study called positive at >= 3 frames. That is why a model can look
+ * strong on Kvasir and unremarkable here.
  *
- * Generated from the eval outputs described in documents/fov-crop-ablation.md.
+ * `noisy` is a separate, frame-level test on the 339 frames the review panel
+ * marked noisy and never called a polyp. Their true label is "no polyp", so
+ * every detection there is wrong by construction. It is kept apart from the
+ * study numbers on purpose: a study needs 3 frames to be called positive, so a
+ * lone spurious box costs no study -- but it does cost the operator's attention.
+ *
+ * Generated from the eval outputs, see documents/fov-crop-ablation.md.
  * Regenerate rather than hand-edit: the point of publishing them is that they
  * are the measured numbers, not the chosen ones.
  */
 
 export interface CurvePoint {
-  conf: number;
-  recall: number;        // % of report-positive studies caught
-  fpPerClean: number;    // false-positive frames per clean procedure
-  alerted: number;       // clean studies that raised at least one alert
-  clean: number;
+  conf: number; recall: number; fpPerClean: number; alerted: number; clean: number;
+}
+
+/** Sensitivity within one slice of the positives -- by lesion size or shape. */
+export interface Slice { label: string; found: number; total: number; pct: number }
+
+/** False alarms on frames a reviewer called noisy. Every fire here is an error. */
+export interface NoisyResult {
+  frames: number;
+  /** Panel frames arrive already tightly cropped, so the border crop is a no-op
+   *  on this set and cannot be judged by it. Measured, not assumed. */
+  preCropped: boolean;
+  meanConf: number;
+  curve: { conf: number; framesFired: number; pct: number }[];
 }
 
 export interface ModelResult {
-  key: string;
-  label: string;
-  deployed: boolean;
-  note: string;
+  key: string; label: string; deployed: boolean; note: string;
   tp: number; fn: number; fp: number; tn: number;
   precision: number; recall: number; f1: number;
   specificity: number; npv: number; youden: number;
-  aucMaxConf: number;   // threshold-free: the honest way to compare two models
-  aucFrames07: number;
-  studies: number; positives: number; frames: number;
-  curve: CurvePoint[];
+  aucMaxConf: number; aucFrames05: number; aucFrames07: number;
+  studies: number; positives: number; negatives: number; frames: number;
+  bySize: Slice[]; byMorphology: Slice[]; curve: CurvePoint[];
+  noisy?: NoisyResult;
 }
 
 export const MODEL_RESULTS: ModelResult[] = [
@@ -47,10 +59,52 @@ export const MODEL_RESULTS: ModelResult[] = [
     "npv": 91.1,
     "youden": 0.709,
     "aucMaxConf": 0.87,
+    "aucFrames05": 0.848,
     "aucFrames07": 0.893,
     "studies": 108,
     "positives": 31,
+    "negatives": 77,
     "frames": 7166,
+    "bySize": [
+      {
+        "label": "<=5mm",
+        "found": 9,
+        "total": 15,
+        "pct": 60
+      },
+      {
+        "label": "6-9mm",
+        "found": 5,
+        "total": 5,
+        "pct": 100
+      },
+      {
+        "label": ">=10mm",
+        "found": 6,
+        "total": 6,
+        "pct": 100
+      },
+      {
+        "label": "size not stated",
+        "found": 4,
+        "total": 5,
+        "pct": 80
+      }
+    ],
+    "byMorphology": [
+      {
+        "label": "sessile",
+        "found": 17,
+        "total": 24,
+        "pct": 71
+      },
+      {
+        "label": "not stated",
+        "found": 7,
+        "total": 7,
+        "pct": 100
+      }
+    ],
     "curve": [
       {
         "conf": 0.3,
@@ -112,7 +166,54 @@ export const MODEL_RESULTS: ModelResult[] = [
     "key": "yolov5m-crop-320",
     "label": "YOLOv5m \u00b7 320px \u00b7 border cropped",
     "deployed": true,
-    "note": "Deployed. Kvasir-SEG fine-tune, run at the resolution the browser sends, with the black border cropped off first."
+    "note": "Deployed. Kvasir-SEG fine-tune, run at the resolution the browser sends, with the black border cropped off first.",
+    "noisy": {
+      "frames": 339,
+      "preCropped": true,
+      "meanConf": 0.1105,
+      "curve": [
+        {
+          "conf": 0.3,
+          "framesFired": 52,
+          "pct": 15.3
+        },
+        {
+          "conf": 0.4,
+          "framesFired": 39,
+          "pct": 11.5
+        },
+        {
+          "conf": 0.5,
+          "framesFired": 30,
+          "pct": 8.8
+        },
+        {
+          "conf": 0.6,
+          "framesFired": 21,
+          "pct": 6.2
+        },
+        {
+          "conf": 0.7,
+          "framesFired": 13,
+          "pct": 3.8
+        },
+        {
+          "conf": 0.8,
+          "framesFired": 4,
+          "pct": 1.2
+        },
+        {
+          "conf": 0.9,
+          "framesFired": 1,
+          "pct": 0.3
+        },
+        {
+          "conf": 0.95,
+          "framesFired": 0,
+          "pct": 0.0
+        }
+      ]
+    }
   },
   {
     "tp": 18,
@@ -126,10 +227,52 @@ export const MODEL_RESULTS: ModelResult[] = [
     "npv": 85.1,
     "youden": 0.542,
     "aucMaxConf": 0.855,
+    "aucFrames05": 0.813,
     "aucFrames07": 0.85,
     "studies": 108,
     "positives": 31,
+    "negatives": 77,
     "frames": 7166,
+    "bySize": [
+      {
+        "label": "<=5mm",
+        "found": 6,
+        "total": 15,
+        "pct": 40
+      },
+      {
+        "label": "6-9mm",
+        "found": 4,
+        "total": 5,
+        "pct": 80
+      },
+      {
+        "label": ">=10mm",
+        "found": 5,
+        "total": 6,
+        "pct": 83
+      },
+      {
+        "label": "size not stated",
+        "found": 3,
+        "total": 5,
+        "pct": 60
+      }
+    ],
+    "byMorphology": [
+      {
+        "label": "sessile",
+        "found": 13,
+        "total": 24,
+        "pct": 54
+      },
+      {
+        "label": "not stated",
+        "found": 5,
+        "total": 7,
+        "pct": 71
+      }
+    ],
     "curve": [
       {
         "conf": 0.3,
@@ -191,7 +334,54 @@ export const MODEL_RESULTS: ModelResult[] = [
     "key": "yolov5m-320",
     "label": "YOLOv5m \u00b7 320px \u00b7 no crop",
     "deployed": false,
-    "note": "The same model and resolution without the crop \u2014 13.5% of every frame is black border, and the pixel budget is spent on it."
+    "note": "The same model and resolution without the crop \u2014 13.5% of every frame is black border, and the pixel budget is spent on it.",
+    "noisy": {
+      "frames": 339,
+      "preCropped": true,
+      "meanConf": 0.1105,
+      "curve": [
+        {
+          "conf": 0.3,
+          "framesFired": 52,
+          "pct": 15.3
+        },
+        {
+          "conf": 0.4,
+          "framesFired": 39,
+          "pct": 11.5
+        },
+        {
+          "conf": 0.5,
+          "framesFired": 30,
+          "pct": 8.8
+        },
+        {
+          "conf": 0.6,
+          "framesFired": 21,
+          "pct": 6.2
+        },
+        {
+          "conf": 0.7,
+          "framesFired": 13,
+          "pct": 3.8
+        },
+        {
+          "conf": 0.8,
+          "framesFired": 4,
+          "pct": 1.2
+        },
+        {
+          "conf": 0.9,
+          "framesFired": 1,
+          "pct": 0.3
+        },
+        {
+          "conf": 0.95,
+          "framesFired": 0,
+          "pct": 0.0
+        }
+      ]
+    }
   },
   {
     "tp": 24,
@@ -205,10 +395,52 @@ export const MODEL_RESULTS: ModelResult[] = [
     "npv": 91.1,
     "youden": 0.709,
     "aucMaxConf": 0.862,
+    "aucFrames05": 0.853,
     "aucFrames07": 0.878,
     "studies": 108,
     "positives": 31,
+    "negatives": 77,
     "frames": 7166,
+    "bySize": [
+      {
+        "label": "<=5mm",
+        "found": 11,
+        "total": 15,
+        "pct": 73
+      },
+      {
+        "label": "6-9mm",
+        "found": 3,
+        "total": 5,
+        "pct": 60
+      },
+      {
+        "label": ">=10mm",
+        "found": 6,
+        "total": 6,
+        "pct": 100
+      },
+      {
+        "label": "size not stated",
+        "found": 4,
+        "total": 5,
+        "pct": 80
+      }
+    ],
+    "byMorphology": [
+      {
+        "label": "sessile",
+        "found": 18,
+        "total": 24,
+        "pct": 75
+      },
+      {
+        "label": "not stated",
+        "found": 6,
+        "total": 7,
+        "pct": 86
+      }
+    ],
     "curve": [
       {
         "conf": 0.3,
@@ -270,7 +502,54 @@ export const MODEL_RESULTS: ModelResult[] = [
     "key": "yolov5m-640",
     "label": "YOLOv5m \u00b7 640px",
     "deployed": false,
-    "note": "The original baseline, run at 640px. Four times the compute of 320 for the same accuracy the crop recovers."
+    "note": "The original baseline, run at 640px. Four times the compute of 320 for the same accuracy the crop recovers.",
+    "noisy": {
+      "frames": 339,
+      "preCropped": true,
+      "meanConf": 0.1063,
+      "curve": [
+        {
+          "conf": 0.3,
+          "framesFired": 44,
+          "pct": 13.0
+        },
+        {
+          "conf": 0.4,
+          "framesFired": 30,
+          "pct": 8.8
+        },
+        {
+          "conf": 0.5,
+          "framesFired": 25,
+          "pct": 7.4
+        },
+        {
+          "conf": 0.6,
+          "framesFired": 20,
+          "pct": 5.9
+        },
+        {
+          "conf": 0.7,
+          "framesFired": 10,
+          "pct": 2.9
+        },
+        {
+          "conf": 0.8,
+          "framesFired": 6,
+          "pct": 1.8
+        },
+        {
+          "conf": 0.9,
+          "framesFired": 1,
+          "pct": 0.3
+        },
+        {
+          "conf": 0.95,
+          "framesFired": 0,
+          "pct": 0.0
+        }
+      ]
+    }
   },
   {
     "tp": 24,
@@ -284,10 +563,52 @@ export const MODEL_RESULTS: ModelResult[] = [
     "npv": 90.9,
     "youden": 0.683,
     "aucMaxConf": 0.912,
+    "aucFrames05": 0.894,
     "aucFrames07": 0.88,
     "studies": 108,
     "positives": 31,
+    "negatives": 77,
     "frames": 7166,
+    "bySize": [
+      {
+        "label": "<=5mm",
+        "found": 10,
+        "total": 15,
+        "pct": 67
+      },
+      {
+        "label": "6-9mm",
+        "found": 4,
+        "total": 5,
+        "pct": 80
+      },
+      {
+        "label": ">=10mm",
+        "found": 6,
+        "total": 6,
+        "pct": 100
+      },
+      {
+        "label": "size not stated",
+        "found": 4,
+        "total": 5,
+        "pct": 80
+      }
+    ],
+    "byMorphology": [
+      {
+        "label": "sessile",
+        "found": 18,
+        "total": 24,
+        "pct": 75
+      },
+      {
+        "label": "not stated",
+        "found": 6,
+        "total": 7,
+        "pct": 86
+      }
+    ],
     "curve": [
       {
         "conf": 0.3,
@@ -349,7 +670,54 @@ export const MODEL_RESULTS: ModelResult[] = [
     "key": "yolo11m-multi",
     "label": "YOLO11m \u00b7 6-dataset fine-tune",
     "deployed": false,
-    "note": "Trained on a pooled 6-dataset corpus. Best ranking of any model tried, but it ties on recall and costs more to run."
+    "note": "Trained on a pooled 6-dataset corpus. Best ranking of any model tried, but it ties on recall and costs more to run.",
+    "noisy": {
+      "frames": 339,
+      "preCropped": true,
+      "meanConf": 0.0903,
+      "curve": [
+        {
+          "conf": 0.3,
+          "framesFired": 36,
+          "pct": 10.6
+        },
+        {
+          "conf": 0.4,
+          "framesFired": 28,
+          "pct": 8.3
+        },
+        {
+          "conf": 0.5,
+          "framesFired": 19,
+          "pct": 5.6
+        },
+        {
+          "conf": 0.6,
+          "framesFired": 11,
+          "pct": 3.2
+        },
+        {
+          "conf": 0.7,
+          "framesFired": 3,
+          "pct": 0.9
+        },
+        {
+          "conf": 0.8,
+          "framesFired": 2,
+          "pct": 0.6
+        },
+        {
+          "conf": 0.9,
+          "framesFired": 0,
+          "pct": 0.0
+        },
+        {
+          "conf": 0.95,
+          "framesFired": 0,
+          "pct": 0.0
+        }
+      ]
+    }
   },
   {
     "tp": 22,
@@ -363,10 +731,52 @@ export const MODEL_RESULTS: ModelResult[] = [
     "npv": 88.0,
     "youden": 0.567,
     "aucMaxConf": 0.846,
+    "aucFrames05": 0.789,
     "aucFrames07": 0.858,
     "studies": 108,
     "positives": 31,
+    "negatives": 77,
     "frames": 7166,
+    "bySize": [
+      {
+        "label": "<=5mm",
+        "found": 8,
+        "total": 15,
+        "pct": 53
+      },
+      {
+        "label": "6-9mm",
+        "found": 4,
+        "total": 5,
+        "pct": 80
+      },
+      {
+        "label": ">=10mm",
+        "found": 6,
+        "total": 6,
+        "pct": 100
+      },
+      {
+        "label": "size not stated",
+        "found": 4,
+        "total": 5,
+        "pct": 80
+      }
+    ],
+    "byMorphology": [
+      {
+        "label": "sessile",
+        "found": 16,
+        "total": 24,
+        "pct": 67
+      },
+      {
+        "label": "not stated",
+        "found": 6,
+        "total": 7,
+        "pct": 86
+      }
+    ],
     "curve": [
       {
         "conf": 0.3,
@@ -442,10 +852,52 @@ export const MODEL_RESULTS: ModelResult[] = [
     "npv": 75.5,
     "youden": 0.194,
     "aucMaxConf": 0.882,
+    "aucFrames05": 0.871,
     "aucFrames07": 0.758,
     "studies": 108,
     "positives": 31,
+    "negatives": 77,
     "frames": 7166,
+    "bySize": [
+      {
+        "label": "<=5mm",
+        "found": 1,
+        "total": 15,
+        "pct": 7
+      },
+      {
+        "label": "6-9mm",
+        "found": 2,
+        "total": 5,
+        "pct": 40
+      },
+      {
+        "label": ">=10mm",
+        "found": 3,
+        "total": 6,
+        "pct": 50
+      },
+      {
+        "label": "size not stated",
+        "found": 0,
+        "total": 5,
+        "pct": 0
+      }
+    ],
+    "byMorphology": [
+      {
+        "label": "sessile",
+        "found": 6,
+        "total": 24,
+        "pct": 25
+      },
+      {
+        "label": "not stated",
+        "found": 0,
+        "total": 7,
+        "pct": 0
+      }
+    ],
     "curve": [
       {
         "conf": 0.3,
@@ -521,10 +973,52 @@ export const MODEL_RESULTS: ModelResult[] = [
     "npv": 72.3,
     "youden": 0.045,
     "aucMaxConf": 0.739,
+    "aucFrames05": 0.756,
     "aucFrames07": 0.642,
     "studies": 108,
     "positives": 31,
+    "negatives": 77,
     "frames": 7166,
+    "bySize": [
+      {
+        "label": "<=5mm",
+        "found": 1,
+        "total": 15,
+        "pct": 7
+      },
+      {
+        "label": "6-9mm",
+        "found": 0,
+        "total": 5,
+        "pct": 0
+      },
+      {
+        "label": ">=10mm",
+        "found": 1,
+        "total": 6,
+        "pct": 17
+      },
+      {
+        "label": "size not stated",
+        "found": 1,
+        "total": 5,
+        "pct": 20
+      }
+    ],
+    "byMorphology": [
+      {
+        "label": "sessile",
+        "found": 2,
+        "total": 24,
+        "pct": 8
+      },
+      {
+        "label": "not stated",
+        "found": 1,
+        "total": 7,
+        "pct": 14
+      }
+    ],
     "curve": [
       {
         "conf": 0.3,
@@ -590,5 +1084,5 @@ export const MODEL_RESULTS: ModelResult[] = [
   }
 ];
 
-/** Shown first, and the one the product actually runs. */
 export const DEFAULT_MODEL_KEY = "yolov5m-crop-320";
+export const DEPLOYED = MODEL_RESULTS.find((m) => m.deployed) ?? MODEL_RESULTS[0];

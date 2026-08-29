@@ -79,10 +79,18 @@ export default function ModelPerformance() {
               hint={t("threshold-free")} />
       </div>
 
-      <button onClick={() => setOpen(!open)}
-              className="text-xs text-gray-500 hover:text-gray-300 transition-colors">
-        {open ? t("Hide detail") : t("Show detail")}
-      </button>
+      <div className="flex items-center gap-3">
+        <button onClick={() => setOpen(!open)}
+                className="text-xs text-gray-500 hover:text-gray-300 transition-colors">
+          {open ? t("Hide detail") : t("Show detail")}
+        </button>
+        {/* The full table lives on its own route -- this panel is the summary
+            for someone about to start, not the place to choose a model. */}
+        <a href="/model-comparison"
+           className="text-xs text-gray-500 hover:text-gray-300 transition-colors">
+          {t("Compare all models →")}
+        </a>
+      </div>
 
       {open && (
         <div className="space-y-3 pt-1">
