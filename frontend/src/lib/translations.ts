@@ -110,7 +110,8 @@ export const FA: Record<string, string> = {
   "{pct}% of the frame is border": "{pct}٪ فریم حاشیه است",
   "Show what is cropped": "نمایش بخش حذف‌شده",
   "Hide what is cropped": "پنهان کردن بخش حذف‌شده",
-  "No border found — nothing to crop": "حاشیه‌ای یافت نشد — چیزی برای برش نیست",
+  "No border to crop — measured {pct}%, needs {min}%":
+    "حاشیه‌ای برای برش نیست — اندازه‌گیری {pct}٪، حداقل لازم {min}٪",
   "measuring…": "در حال اندازه‌گیری…",
   "Red is dropped before inference — {pct}% of the frame":
     "بخش قرمز پیش از استنتاج حذف می‌شود — {pct}٪ فریم",

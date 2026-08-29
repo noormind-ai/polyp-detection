@@ -1140,7 +1140,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
                   </>
                 ) : (
                   <span className="text-xs text-gray-600">
-                    {fovRect ? t("No border found — nothing to crop") : t("measuring…")}
+                    {fovRect
+                      ? t("No border to crop — measured {pct}%, needs {min}%", {
+                          pct: (fovTrim * 100).toFixed(1), min: Math.round(NEGLIGIBLE_TRIM * 100) })
+                      : t("measuring…")}
                   </span>
                 )}
               </div>
