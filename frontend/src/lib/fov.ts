@@ -44,10 +44,33 @@ const SAMPLE_WIDTH = 160;
  *  measured border on our corpus sits at a mean of 10-15 with a 99th percentile
  *  of 13-20. */
 const LUMA_THRESHOLD = 18;
-/** Fraction of a row (or column) that must be lit for it to count as inside the
- *  picture. Tolerates a few stray bright pixels in the border — our corpus has
- *  0.03-0.18% of border pixels above luminance 100. */
-const LINE_COVERAGE = 0.10;
+/**
+ * Fraction of a row (or column) that must be lit for it to count as inside the
+ * picture.
+ *
+ * This is not the tolerance knob it looks like. In a real frame a picture
+ * column is lit over ~99% of its height and a border column over ~0%, so
+ * anything between the two gives the same answer — measured across 594 clinic
+ * stills, 0.10 and 0.45 produce byte-identical rects for every resolution.
+ *
+ * What it actually decides is what happens to a *partly* lit column, and that
+ * case is real. Every 720x576 recording on this deployment carries a solid
+ * green band across the bottom 16.5% of the frame (a zeroed YUV buffer renders
+ * green, not black — the picture is 720x480 inside a 720x576 frame). Green has
+ * luma near 77, so it is "lit", and at 0.10 that band alone qualified every
+ * column on its own: the left black bar was invisible and nothing was ever
+ * cropped. At 0.30 the band no longer carries a column by itself and the bar
+ * is found — 0.7% trim becomes 6.2%, with the stills unchanged.
+ *
+ * The bound going up: a full-width strip taller than this fraction would mask
+ * a side bar again. The bound going down: on a truly circular field of view the
+ * outermost columns are lit over only a short span, so a high value would clip
+ * into the image. Ours is a rounded rectangle (only 4-7% of the area inside the
+ * detected box is black), which is why 0.30 costs nothing here — but a scope
+ * with a real circular FOV would want this lower, and the overlay is how you
+ * would notice.
+ */
+const LINE_COVERAGE = 0.30;
 /** Refuse to believe a detection that would throw away most of the frame. If we
  *  land here the frame was probably just dark, and cropping to it would be
  *  worse than not cropping at all. */
