@@ -7,6 +7,7 @@ import RecordingsPanel from "./RecordingsPanel";
 import { DEMO_VIDEOS } from "./demos";
 import { useLanguage } from "@/lib/i18n";
 import { useSessionRecorder } from "@/lib/useSessionRecorder";
+import { detectFovRect, unionRect, intersectRect, trimmedFraction, NEGLIGIBLE_TRIM, type Rect } from "@/lib/fov";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "";
 const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
@@ -18,6 +19,11 @@ const API_WS = (process.env.NEXT_PUBLIC_API_URL
 const INFER_TIMEOUT_MS = 6000;
 // Resize frames to this width before sending — faster inference, smaller payload
 const INFER_WIDTH = 320;
+// How many of the first frames of a session are measured to find the picture
+// area. The border does not move, so this is a fixed startup cost, not a
+// per-frame one. Several rather than one because the union of several frames
+// cannot be fooled by a single dark frame — see lib/fov.ts.
+const FOV_SAMPLE_FRAMES = 8;
 // Same throttle as the real-time player: once a polyp is flagged, wait this long
 // before auto-capturing again so the queue fills with distinct moments.
 // A polyp that is STILL on screen is re-filed at most this often. A polyp that
@@ -129,6 +135,46 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   const dragStartRef = useRef<{ x: number; y: number } | null>(null);
   const snapshotCanvasRef = useRef<HTMLCanvasElement>(null);
   const CROP_KEY = "polyp_screen_crop_rect";
+
+  // The picture area inside the signal, measured from the first frames of the
+  // session (lib/fov.ts explains why this is worth doing). Native pixels.
+  const [fovRect, setFovRectState] = useState<Rect | null>(null);
+  const fovRectRef  = useRef<Rect | null>(null);
+  const fovSamplesRef = useRef(0);
+  // Native frame size the rect was measured against — needed to express it as a
+  // fraction for the overlay, and not the same as the analyzed `aspect`.
+  const [fovFrame, setFovFrame] = useState<{ w: number; h: number } | null>(null);
+  // On by default, but the operator can turn it off — a processor we have not
+  // seen could confuse the detector, and being able to switch it off in the
+  // room beats having to redeploy.
+  const [fovEnabled, setFovEnabledState] = useState(true);
+  const fovEnabledRef = useRef(true);
+  // Shows exactly which pixels the crop discards, over the live panel.
+  const [showFovOverlay, setShowFovOverlay] = useState(false);
+  const FOV_KEY = "polyp_fov_enabled";
+
+  function setFovEnabled(on: boolean) {
+    fovEnabledRef.current = on;
+    setFovEnabledState(on);
+    try { localStorage.setItem(FOV_KEY, on ? "1" : "0"); } catch { /* ignore */ }
+  }
+
+  // Forget the measurement so the next session measures again. The border
+  // belongs to the source, so anything that changes the source invalidates it.
+  function resetFovDetection() {
+    fovRectRef.current = null;
+    fovSamplesRef.current = 0;
+    setFovRectState(null);
+    setFovFrame(null);
+    setShowFovOverlay(false);
+  }
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(FOV_KEY);
+      if (raw !== null) { const on = raw === "1"; fovEnabledRef.current = on; setFovEnabledState(on); }
+    } catch { /* ignore */ }
+  }, []);
 
   function switchCaptureMode(mode: CaptureMode) {
     captureModeRef.current = mode;
@@ -254,12 +300,40 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   function sourceRect(video: HTMLVideoElement) {
     const vw = video.videoWidth, vh = video.videoHeight;
     const crop = captureModeRef.current === "screen" ? cropRectRef.current : null;
-    return {
+    const base = {
       x: crop ? Math.round(crop.x * vw) : 0,
       y: crop ? Math.round(crop.y * vh) : 0,
       w: crop ? Math.round(crop.w * vw) : vw,
       h: crop ? Math.round(crop.h * vh) : vh,
     };
+    // The hand-drawn region and the detected picture area are both constraints
+    // on what is worth sending, so both apply. Intersecting also means a region
+    // drawn tightly inside the picture is never widened back out by this.
+    const fov = fovEnabledRef.current ? fovRectRef.current : null;
+    // A frame that arrived already cropped trims a percent or two; applying that
+    // buys nothing and only adds a coordinate transform to every capture.
+    if (!fov || trimmedFraction(fov, vw, vh) < NEGLIGIBLE_TRIM) return base;
+    const r = intersectRect(base, fov);
+    return r.w > 0 && r.h > 0 ? r : base;
+  }
+
+  // Measure the picture area from the first frames of the session, then leave
+  // it alone. Cheap (a 160px-wide probe) and it stops after FOV_SAMPLE_FRAMES,
+  // so this costs nothing for the rest of the procedure.
+  function sampleFov(video: HTMLVideoElement) {
+    if (fovSamplesRef.current >= FOV_SAMPLE_FRAMES) return;
+    fovSamplesRef.current += 1;
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const found = detectFovRect(video, vw, vh);
+    if (!found) return;
+    const merged = unionRect(fovRectRef.current, found);
+    fovRectRef.current = merged;
+    setFovFrame((prev) => (prev && prev.w === vw && prev.h === vh ? prev : { w: vw, h: vh }));
+    // Only push to React state when it actually moved — this runs inside the
+    // capture loop and a setState per frame would re-render the whole player.
+    setFovRectState((prev) =>
+      prev && merged && prev.x === merged.x && prev.y === merged.y
+        && prev.w === merged.w && prev.h === merged.h ? prev : merged);
   }
 
   // Auto-capture — the clean (no-overlay) frame that was already grabbed for
@@ -372,6 +446,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         await new Promise<void>((res) => requestAnimationFrame(() => res()));
         continue;
       }
+
+      // Before choosing the region, not after — the first frames of a session
+      // are exactly the ones that decide it.
+      sampleFov(video);
 
       const { x: srcX, y: srcY, w: srcW, h: srcH } = sourceRect(video);
       // Size the panels to the region actually being analyzed, so the two live
@@ -613,6 +691,9 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     setDemoFile(null);
     setStreaming(false);
     updateBoxes([]);
+    // The picture area belongs to the source. Whatever comes next gets measured
+    // on its own frames rather than inheriting this one's border.
+    resetFovDetection();
   }
 
   const wsOk = wsStatus === "open";
@@ -626,7 +707,32 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // it sits next to a panel that looks zoomed in relative to it. The scaled <video>
   // keeps its native ratio exactly (the panel box is already the crop's ratio), so
   // this crops without distorting.
-  const liveCrop = captureMode === "screen" ? cropRect : null;
+  // The detected picture area, normalized against the native frame so it can be
+  // composed with the hand-drawn screen-share region and used for CSS.
+  const fovNorm = fovRect && fovFrame
+    ? { x: fovRect.x / fovFrame.w, y: fovRect.y / fovFrame.h,
+        w: fovRect.w / fovFrame.w, h: fovRect.h / fovFrame.h }
+    : null;
+  const fovTrim = fovRect && fovFrame ? trimmedFraction(fovRect, fovFrame.w, fovFrame.h) : 0;
+  // Worth acting on only if there is a real border. A frame that arrived already
+  // cropped trims a percent or two, and applying that buys nothing.
+  const fovWorthIt = !!fovNorm && fovTrim >= NEGLIGIBLE_TRIM;
+  const fovApplied = fovEnabled && fovWorthIt;
+
+  const screenCrop = captureMode === "screen" ? cropRect : null;
+  // Same composition the capture loop does, in normalized space, so the Live
+  // panel frames exactly the region the model is being given.
+  const analyzedCrop =
+    fovApplied && screenCrop ? intersectRect(screenCrop, fovNorm!)
+    : fovApplied ? fovNorm
+    : screenCrop;
+  // While the overlay is up the whole frame is shown instead, because the point
+  // of the overlay is to see the part that normally gets dropped.
+  const liveCrop = showFovOverlay ? null : analyzedCrop;
+  // The panel has to carry the native ratio in overlay mode, otherwise
+  // object-contain letterboxes the video inside it and the overlay percentages
+  // no longer line up with the picture they are describing.
+  const liveAspect = showFovOverlay && fovFrame ? `${fovFrame.w}/${fovFrame.h}` : aspect;
   const liveStyle = liveCrop
     ? {
         width: `${100 / liveCrop.w}%`,
@@ -878,7 +984,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
                 </button>
               </div>
               <div className={showLive ? "" : "h-0 overflow-hidden opacity-0"}>
-                <div className={panelBox} style={{ aspectRatio: aspect }}>
+                <div className={panelBox} style={{ aspectRatio: liveAspect }}>
                   <video
                     ref={videoRef}
                     muted
@@ -887,9 +993,62 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
                     className={liveStyle ? "absolute object-contain" : "absolute inset-0 w-full h-full object-contain"}
                     style={liveStyle}
                   />
+                  {/* What the crop discards. The panel is showing the whole
+                      frame right now (liveCrop is forced to null above), so the
+                      kept region is outlined and everything outside it is
+                      washed red by an outsized ring shadow the panel clips. */}
+                  {showFovOverlay && fovNorm && (
+                    <div className="absolute inset-0 pointer-events-none">
+                      <div
+                        className="absolute border-2 border-[#39ff14]"
+                        style={{
+                          left:   `${fovNorm.x * 100}%`,
+                          top:    `${fovNorm.y * 100}%`,
+                          width:  `${fovNorm.w * 100}%`,
+                          height: `${fovNorm.h * 100}%`,
+                          boxShadow: "0 0 0 9999px rgba(239,68,68,0.5)",
+                        }}
+                      />
+                      <p className="absolute bottom-1 inset-x-1 text-center text-[11px] leading-tight text-white bg-black/75 rounded px-1 py-0.5">
+                        {t("Red is dropped before inference — {pct}% of the frame", { pct: Math.round(fovTrim * 100) })}
+                      </p>
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
+
+            {/* Field of view. The signal is wider than the picture: there is a
+                black border around it, and averaging quality statistics over
+                that border flattens the difference between a sharp frame and a
+                soft one. lib/fov.ts has the measurements. */}
+            {streaming && (
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
+                <label className="flex items-center gap-2 text-gray-400 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={fovEnabled}
+                    onChange={(e) => setFovEnabled(e.target.checked)}
+                    className="accent-green-500"
+                  />
+                  {t("Crop to the picture area")}
+                </label>
+                {fovWorthIt ? (
+                  <>
+                    <span className="text-xs text-gray-500">
+                      {t("{pct}% of the frame is border", { pct: Math.round(fovTrim * 100) })}
+                    </span>
+                    <button onClick={() => setShowFovOverlay(!showFovOverlay)} className={toggleBtn}>
+                      {showFovOverlay ? t("Hide what is cropped") : t("Show what is cropped")}
+                    </button>
+                  </>
+                ) : (
+                  <span className="text-xs text-gray-600">
+                    {fovRect ? t("No border found — nothing to crop") : t("measuring…")}
+                  </span>
+                )}
+              </div>
+            )}
 
             {/* Shown whenever the source is switchable — with the demo clips in
                 the list that is any time we are not screen-sharing. */}

@@ -6,6 +6,7 @@ import FeedbackPanel from "./FeedbackPanel";
 import LoginPanel from "./LoginPanel";
 import { useAuth } from "@/lib/auth";
 import { useLanguage } from "@/lib/i18n";
+import { detectFovRect, unionRect, trimmedFraction, NEGLIGIBLE_TRIM, type Rect } from "@/lib/fov";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "";
 // Resolve the socket origin explicitly rather than leaning on a relative
@@ -19,6 +20,9 @@ const INFER_TIMEOUT_MS = 6000;
 // data/precompute_demos.py encodes the saved demo results at this same width, so
 // replayed boxes land in the same coordinate space as live ones. Change both together.
 const INFER_WIDTH = 320;
+// Frames measured at the start of a clip to find its picture area. See
+// lib/fov.ts — the union of several beats one, and the border does not move.
+const FOV_SAMPLE_FRAMES = 8;
 const SPEEDS = [0.1, 0.25, 0.5, 0.7, 1, 1.5, 2];
 // Don't auto-capture the same ongoing detection every single frame — once a
 // polyp is flagged, wait this long before the next auto-capture so the
@@ -164,6 +168,64 @@ export default function RealtimePlayer({
     if (videoRef.current) videoRef.current.playbackRate = speed;
   }, [speed, videoUrl]);
 
+  // Picture area inside the frame — the same measurement the live camera path
+  // makes, for the same reasons (lib/fov.ts). Only the live-inference loop uses
+  // it; replaying a demo's precomputed boxes deliberately does not, because
+  // those were baked against the whole frame and cropping would put them in the
+  // wrong coordinate space.
+  const [fovRect, setFovRectState] = useState<Rect | null>(null);
+  const fovRectRef = useRef<Rect | null>(null);
+  const fovSamplesRef = useRef(0);
+  const [fovFrame, setFovFrame] = useState<{ w: number; h: number } | null>(null);
+  const [fovEnabled, setFovEnabledState] = useState(true);
+  const fovEnabledRef = useRef(true);
+  const [showFovOverlay, setShowFovOverlay] = useState(false);
+  const FOV_KEY = "polyp_fov_enabled";
+
+  function setFovEnabled(on: boolean) {
+    fovEnabledRef.current = on;
+    setFovEnabledState(on);
+    try { localStorage.setItem(FOV_KEY, on ? "1" : "0"); } catch { /* ignore */ }
+  }
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(FOV_KEY);
+      if (raw !== null) { const on = raw === "1"; fovEnabledRef.current = on; setFovEnabledState(on); }
+    } catch { /* ignore */ }
+  }, []);
+
+  // A new clip is a new source, so the border has to be measured again.
+  useEffect(() => {
+    fovRectRef.current = null;
+    fovSamplesRef.current = 0;
+    setFovRectState(null);
+    setFovFrame(null);
+    setShowFovOverlay(false);
+  }, [videoUrl]);
+
+  function sourceRect(video: HTMLVideoElement) {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const full = { x: 0, y: 0, w: vw, h: vh };
+    const fov = fovEnabledRef.current ? fovRectRef.current : null;
+    if (!fov || trimmedFraction(fov, vw, vh) < NEGLIGIBLE_TRIM) return full;
+    return fov.w > 0 && fov.h > 0 ? fov : full;
+  }
+
+  function sampleFov(video: HTMLVideoElement) {
+    if (fovSamplesRef.current >= FOV_SAMPLE_FRAMES) return;
+    fovSamplesRef.current += 1;
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const found = detectFovRect(video, vw, vh);
+    if (!found) return;
+    const merged = unionRect(fovRectRef.current, found);
+    fovRectRef.current = merged;
+    setFovFrame((prev) => (prev && prev.w === vw && prev.h === vh ? prev : { w: vw, h: vh }));
+    setFovRectState((prev) =>
+      prev && merged && prev.x === merged.x && prev.y === merged.y
+        && prev.w === merged.w && prev.h === merged.h ? prev : merged);
+  }
+
   // Draws the exact frame that was sent to the model, with boxes at native (capture)
   // resolution — pixel-accurate for that frame, unlike overlaying on the live video
   // (which has moved on by the time the result comes back).
@@ -289,13 +351,17 @@ export default function RealtimePlayer({
         continue;
       }
 
-      const scale = INFER_WIDTH / video.videoWidth;
+      sampleFov(video);
+      const { x: srcX, y: srcY, w: srcW, h: srcH } = sourceRect(video);
+      setAspect(`${srcW}/${srcH}`);
+
+      const scale = INFER_WIDTH / srcW;
       const capW  = INFER_WIDTH;
-      const capH  = Math.round(video.videoHeight * scale);
+      const capH  = Math.round(srcH * scale);
       const cap   = document.createElement("canvas");
       cap.width   = capW;
       cap.height  = capH;
-      cap.getContext("2d")!.drawImage(video, 0, 0, capW, capH);
+      cap.getContext("2d")!.drawImage(video, srcX, srcY, srcW, srcH, 0, 0, capW, capH);
 
       const blob: Blob = await new Promise((res) => cap.toBlob((b) => res(b!), "image/jpeg", 0.85));
       const buf = await blob.arrayBuffer();
@@ -481,6 +547,15 @@ export default function RealtimePlayer({
   // image (same frame, same ratio) come out exactly the same size.
   const panelBox = "relative w-full rounded-xl overflow-hidden border border-gray-800 bg-black";
   const toggleBtn = "text-xs px-2 py-0.5 rounded-md border border-gray-800 text-gray-500 hover:text-gray-300 hover:border-gray-600 transition-colors flex-shrink-0";
+  const fovNorm = fovRect && fovFrame
+    ? { x: fovRect.x / fovFrame.w, y: fovRect.y / fovFrame.h,
+        w: fovRect.w / fovFrame.w, h: fovRect.h / fovFrame.h }
+    : null;
+  const fovTrim = fovRect && fovFrame ? trimmedFraction(fovRect, fovFrame.w, fovFrame.h) : 0;
+  const fovWorthIt = !!fovNorm && fovTrim >= NEGLIGIBLE_TRIM;
+  // The panel carries the native ratio while the overlay is up, so the video
+  // fills it exactly and the overlay percentages line up with the picture.
+  const liveAspect = showFovOverlay && fovFrame ? `${fovFrame.w}/${fovFrame.h}` : aspect;
 
   const wsStatusText =
     wsStatus === "open" ? t("connected") :
@@ -665,7 +740,7 @@ export default function RealtimePlayer({
                 </button>
               </div>
               <div className={showLive ? "" : "h-0 overflow-hidden opacity-0"}>
-                <div className={panelBox} style={{ aspectRatio: aspect }}>
+                <div className={panelBox} style={{ aspectRatio: liveAspect }}>
                   <video
                     ref={videoRef}
                     src={videoUrl}
@@ -676,9 +751,57 @@ export default function RealtimePlayer({
                     onEnded={() => { scanRef.current = false; setVideoEnded(true); }}
                     className="absolute inset-0 w-full h-full object-contain"
                   />
+                  {showFovOverlay && fovNorm && (
+                    <div className="absolute inset-0 pointer-events-none">
+                      <div
+                        className="absolute border-2 border-[#39ff14]"
+                        style={{
+                          left:   `${fovNorm.x * 100}%`,
+                          top:    `${fovNorm.y * 100}%`,
+                          width:  `${fovNorm.w * 100}%`,
+                          height: `${fovNorm.h * 100}%`,
+                          boxShadow: "0 0 0 9999px rgba(239,68,68,0.5)",
+                        }}
+                      />
+                      <p className="absolute bottom-1 inset-x-1 text-center text-[11px] leading-tight text-white bg-black/75 rounded px-1 py-0.5">
+                        {t("Red is dropped before inference — {pct}% of the frame", { pct: Math.round(fovTrim * 100) })}
+                      </p>
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
+
+            {/* Field of view — only on the live-inference path. A demo replaying
+                precomputed boxes is not cropped, so offering the control there
+                would promise something that does not happen. */}
+            {liveInference && (
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
+                <label className="flex items-center gap-2 text-gray-400 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={fovEnabled}
+                    onChange={(e) => setFovEnabled(e.target.checked)}
+                    className="accent-green-500"
+                  />
+                  {t("Crop to the picture area")}
+                </label>
+                {fovWorthIt ? (
+                  <>
+                    <span className="text-xs text-gray-500">
+                      {t("{pct}% of the frame is border", { pct: Math.round(fovTrim * 100) })}
+                    </span>
+                    <button onClick={() => setShowFovOverlay(!showFovOverlay)} className={toggleBtn}>
+                      {showFovOverlay ? t("Hide what is cropped") : t("Show what is cropped")}
+                    </button>
+                  </>
+                ) : (
+                  <span className="text-xs text-gray-600">
+                    {fovRect ? t("No border found — nothing to crop") : t("measuring…")}
+                  </span>
+                )}
+              </div>
+            )}
 
             {/* Seek — for lining up the exact moment before a manual capture */}
             <input
