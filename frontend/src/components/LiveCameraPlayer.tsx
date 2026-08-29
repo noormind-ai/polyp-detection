@@ -1119,8 +1119,13 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
             taking the other two. Same structure (and same card chrome) as the
             real-time player, so the live panels and the captured feedback
             frames render at identical size. Stacks on narrow screens. */}
-        <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 items-start">
-          <div className="space-y-2 min-w-0 bg-gray-900/50 border border-gray-800 rounded-xl p-3">
+        <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 items-start">
+          {/* Session controls. Pressed between moments rather than read during
+              one, so they span the top of the grid instead of sitting on the
+              video column -- which is what lets the Detected panel and the
+              review lane start at the same height. */}
+          <div className="xl:col-span-2 min-w-0 bg-gray-900/50 border border-gray-800 rounded-xl p-3
+                          flex flex-col md:flex-row md:flex-wrap md:items-center gap-3 [&>*]:min-w-0">
             {/* Right at the top of the column — it's pressed mid-procedure, so it
                 should never be somewhere you have to look for or scroll to. */}
             <button
@@ -1134,7 +1139,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
                 inEpisodeRef.current = false;
                 lastAutoCaptureRef.current = 0;
               }}
-              className={`w-full py-2.5 px-4 rounded-xl text-white font-medium text-sm transition-colors ${
+              className={`w-full md:w-auto py-2.5 px-4 rounded-xl text-white font-medium text-sm transition-colors ${
                 procedureStarted
                   ? "bg-gray-700 hover:bg-gray-600"
                   : "bg-blue-600 hover:bg-blue-500"
@@ -1173,7 +1178,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
 
             <button
               onClick={captureDrFound}
-              className="w-full py-2.5 px-4 rounded-xl bg-emerald-700 hover:bg-emerald-600 text-white font-medium text-sm transition-colors"
+              className="w-full md:w-auto py-2.5 px-4 rounded-xl bg-emerald-700 hover:bg-emerald-600 text-white font-medium text-sm transition-colors"
             >
               {t("👁 Dr. found a polyp AI missed")}
             </button>
@@ -1181,13 +1186,8 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
             {/* Recording is opt-in: nothing is written to the server until this
                 is pressed, so a session that nobody wants archived leaves nothing. */}
             <RecordingControls recorder={recorder} ready={streaming} />
-
-            {/* The gate sits directly above Detected: when it fires, this is the
-                explanation for why that panel has stopped updating. */}
-            <InBodyGateNotice gate={inBody} />
-
-            <QualityGateNotice gate={quality} />
-
+          </div>
+          <div className="space-y-2 min-w-0 bg-gray-900/50 border border-gray-800 rounded-xl p-3">
             {/* Detected next — it's the panel being read during the procedure */}
             <div className="space-y-1">
               <div className="flex items-center justify-between gap-2">
@@ -1204,6 +1204,12 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
                 </div>
               </div>
             </div>
+
+            {/* The gate sits directly above Detected: when it fires, this is the
+                explanation for why that panel has stopped updating. */}
+            <InBodyGateNotice gate={inBody} />
+
+            <QualityGateNotice gate={quality} />
 
             {/* Live source underneath, as the reference feed. Never unmounted —
                 the <video> is where startStream() attaches the MediaStream. */}
@@ -1383,7 +1389,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
               scrolls internally so it never lengthens the page. Mounted only
               while streaming so it isn't polling behind the setup screen. */}
           {streaming && (
-            <div className="min-w-0 xl:col-span-2 xl:sticky xl:top-4 xl:max-h-[calc(100vh-2rem)] xl:overflow-y-auto">
+            <div className="min-w-0 xl:sticky xl:top-4 xl:max-h-[calc(100vh-2rem)] xl:overflow-y-auto">
               <FeedbackPanel caseId={caseId} refreshSignal={feedbackRefreshKey} />
             </div>
           )}

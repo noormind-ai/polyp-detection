@@ -61,28 +61,30 @@ function clampBox(b: UserBox, w: number, h: number): UserBox {
 
 const byNewest = (a: Entry, b: Entry) => Number(b.timestamp || 0) - Number(a.timestamp || 0);
 
-// Two fully independent lanes — separate queue, separate review window, no
-// interaction between them. AI-detected: stable, oldest-first, a new capture
-// never interrupts whatever's open. Dr-found: newest-first, a new capture
-// always takes over its own window immediately (doctor-caught misses are
-// urgent) — but this NEVER touches the AI-detected lane or vice versa.
+// One merged review lane, newest first.
+//
+// This replaced two independent lanes -- AI-detected and Dr-found -- which
+// showed the same kind of thing, split the available width in half, and meant
+// the newest capture could be in either column. Each card still carries the
+// actions belonging to its own kind, so nothing that could be done before is
+// gone; only the two windows became one.
+//
+// A newly-arrived capture takes over the open card. Both lanes already did that
+// separately, so merging does not introduce it -- and the strip above keeps the
+// older ones one click away.
 export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: string; refreshSignal?: number }) {
   const { t } = useLanguage();
   const [pending, setPending] = useState<Entry[]>([]);
   const [drFound, setDrFound] = useState<Entry[]>([]);
   const [reviewed, setReviewed] = useState<Entry[]>([]); // confirmed + false_positive (ex-pending)
-  const [pendingKey, setPendingKey] = useState<string | null>(null);
-  const [drKey, setDrKey] = useState<string | null>(null);
-  // dr_found items never leave the list just from being handled (no status
-  // change) — dismissing moves one from the active bar to the reviewed one.
+  const [currentKey, setCurrentKey] = useState<string | null>(null);
+  // Filenames are unique across both kinds, so one dismissed set covers both.
+  // A dr_found item never changes status server-side, so dismissing is the only
+  // thing that moves it from the active strip to the reviewed one; a skipped
+  // pending item would otherwise resurface on the very next poll.
   const dismissedRef = useRef<Set<string>>(new Set());
-  // Skip doesn't change anything server-side, so without this a skipped
-  // pending item would just resurface on the very next poll (still oldest).
-  const dismissedPendingRef = useRef<Set<string>>(new Set());
-  const seenDrRef = useRef<Set<string>>(new Set());
+  const seenRef = useRef<Set<string>>(new Set());
   const hasLoadedRef = useRef(false);
-  const seenPendingRef = useRef<Set<string>>(new Set());
-  const hasLoadedPendingRef = useRef(false);
 
   type Lists = { pending: Entry[]; drFound: Entry[]; reviewed: Entry[] };
 
@@ -101,53 +103,27 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
     }
   }
 
-  // Mirrors reconcileDrFound: a newly-arrived capture takes over the window, so
-  // the panel always shows the most recent detection rather than pinning to
-  // whatever was on screen first. Trade-off is deliberate — a detection landing
-  // mid-review will pull the window to the new frame; the queue strip below
-  // keeps the older ones reachable.
-  function reconcilePending(pendingList: Entry[], reviewedList: Entry[]) {
+  function reconcile(lists: Lists) {
+    const active = [...lists.pending, ...lists.drFound]
+      .filter((e) => !dismissedRef.current.has(e.filename));
+    const newest = () => [...active].sort(byNewest)[0]?.filename ?? null;
     const stillValid = (k: string) =>
-      pendingList.some((e) => e.filename === k) || reviewedList.some((e) => e.filename === k);
-    const active = pendingList.filter((e) => !dismissedPendingRef.current.has(e.filename));
+      active.some((e) => e.filename === k) || lists.reviewed.some((e) => e.filename === k);
 
-    if (!hasLoadedPendingRef.current) {
-      active.forEach((e) => seenPendingRef.current.add(e.filename));
-      hasLoadedPendingRef.current = true;
-      setPendingKey((prev) => (prev && stillValid(prev) ? prev : [...active].sort(byNewest)[0]?.filename ?? null));
-      return;
-    }
-
-    const fresh = active.filter((e) => !seenPendingRef.current.has(e.filename));
-    fresh.forEach((e) => seenPendingRef.current.add(e.filename));
-    if (fresh.length > 0) {
-      setPendingKey(fresh.sort(byNewest)[0].filename);
-      return;
-    }
-    setPendingKey((prev) => (prev && stillValid(prev) ? prev : [...active].sort(byNewest)[0]?.filename ?? null));
-  }
-
-  function reconcileDrFound(drList: Entry[]) {
-    const active = drList.filter((e) => !dismissedRef.current.has(e.filename));
     if (!hasLoadedRef.current) {
-      active.forEach((e) => seenDrRef.current.add(e.filename));
+      active.forEach((e) => seenRef.current.add(e.filename));
       hasLoadedRef.current = true;
-      setDrKey((prev) => {
-        if (prev && drList.some((e) => e.filename === prev)) return prev;
-        return [...active].sort(byNewest)[0]?.filename ?? null;
-      });
+      setCurrentKey((prev) => (prev && stillValid(prev) ? prev : newest()));
       return;
     }
-    const fresh = active.filter((e) => !seenDrRef.current.has(e.filename));
-    fresh.forEach((e) => seenDrRef.current.add(e.filename));
+
+    const fresh = active.filter((e) => !seenRef.current.has(e.filename));
+    fresh.forEach((e) => seenRef.current.add(e.filename));
     if (fresh.length > 0) {
-      setDrKey(fresh.sort(byNewest)[0].filename); // a new capture always takes over this window
+      setCurrentKey(fresh.sort(byNewest)[0].filename);
       return;
     }
-    setDrKey((prev) => {
-      if (prev && drList.some((e) => e.filename === prev)) return prev;
-      return [...active].sort(byNewest)[0]?.filename ?? null;
-    });
+    setCurrentKey((prev) => (prev && stillValid(prev) ? prev : newest()));
   }
 
   useEffect(() => {
@@ -155,8 +131,7 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
     async function tick() {
       const lists = await loadAll();
       if (!alive) return;
-      reconcilePending(lists.pending, lists.reviewed);
-      reconcileDrFound(lists.drFound);
+      reconcile(lists);
     }
     tick();
     const iv = setInterval(tick, 5000);
@@ -166,41 +141,31 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
 
   useEffect(() => {
     if (refreshSignal === undefined) return;
-    (async () => {
-      const lists = await loadAll();
-      reconcilePending(lists.pending, lists.reviewed);
-      reconcileDrFound(lists.drFound);
-    })();
+    (async () => reconcile(await loadAll()))();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshSignal]);
 
-  const pendingCurrent = useMemo(
-    () => [...pending, ...reviewed].find((e) => e.filename === pendingKey) ?? null,
-    [pendingKey, pending, reviewed],
-  );
-  const drCurrent = useMemo(() => drFound.find((e) => e.filename === drKey) ?? null, [drKey, drFound]);
+  // Computed inline rather than memoised: dismissal happens through a ref, which
+  // a dependency array cannot see, and these lists are tens of items at most.
+  const activeEntries = [...pending, ...drFound]
+    .filter((e) => !dismissedRef.current.has(e.filename))
+    .sort(byNewest);
+  const reviewedEntries = [...reviewed, ...drFound.filter((e) => dismissedRef.current.has(e.filename))]
+    .sort(byNewest);
+  const current = [...pending, ...drFound, ...reviewed]
+    .find((e) => e.filename === currentKey) ?? null;
 
-  async function advancePending(entry: Entry, dismiss = false) {
-    if (dismiss) dismissedPendingRef.current.add(entry.filename);
-    const lists = await loadAll();
-    setPendingKey((prev) => {
-      const stillOpenElsewhere = prev && prev !== entry.filename
-        && (lists.pending.some((e) => e.filename === prev) || lists.reviewed.some((e) => e.filename === prev))
-        && !dismissedPendingRef.current.has(prev);
-      if (stillOpenElsewhere) return prev;
-      return lists.pending.find((e) => !dismissedPendingRef.current.has(e.filename) && e.filename !== entry.filename)?.filename ?? null;
-    });
-  }
-
-  async function advanceDrFound(entry: Entry, dismiss: boolean) {
+  /** Moves off `entry`, unless something else is open and still valid. */
+  async function advance(entry: Entry, dismiss: boolean) {
     if (dismiss) dismissedRef.current.add(entry.filename);
     const lists = await loadAll();
-    setDrKey((prev) => {
+    setCurrentKey((prev) => {
+      const pool = [...lists.pending, ...lists.drFound]
+        .filter((e) => !dismissedRef.current.has(e.filename));
       const stillOpenElsewhere = prev && prev !== entry.filename
-        && lists.drFound.some((e) => e.filename === prev) && !dismissedRef.current.has(prev);
+        && (pool.some((e) => e.filename === prev) || lists.reviewed.some((e) => e.filename === prev));
       if (stillOpenElsewhere) return prev;
-      const active = lists.drFound.filter((e) => !dismissedRef.current.has(e.filename) && e.filename !== entry.filename);
-      return [...active].sort(byNewest)[0]?.filename ?? null;
+      return pool.filter((e) => e.filename !== entry.filename).sort(byNewest)[0]?.filename ?? null;
     });
   }
 
@@ -211,37 +176,41 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
     fd.append("box_corrected", String(corrected));
     if (box) fd.append("bbox", JSON.stringify(box.map((n) => Math.round(n))));
     await fetch(`${API}/api/feedback/${entry.case_id}/${entry.filename}/review`, { method: "POST", body: fd });
-    await advancePending(entry);
+    // The server changes its status, so it leaves the queue on its own.
+    await advance(entry, false);
   }
 
   async function saveDrFoundBox(entry: Entry, box: UserBox | null) {
     const fd = new FormData();
     if (box) fd.append("bbox", JSON.stringify(box.map((n) => Math.round(n))));
     await fetch(`${API}/api/feedback/${entry.case_id}/${entry.filename}`, { method: "PATCH", body: fd });
-    await advanceDrFound(entry, true);
+    await advance(entry, true);
   }
 
-  async function deleteCapture(entry: Entry, lane: "pending" | "dr_found") {
+  async function deleteCapture(entry: Entry) {
     await fetch(`${API}/api/feedback/${entry.case_id}/${entry.filename}`, { method: "DELETE" });
-    if (lane === "pending") await advancePending(entry, true);
-    else await advanceDrFound(entry, true);
+    await advance(entry, true);
   }
-
-  const reviewedDrFound = drFound.filter((e) => dismissedRef.current.has(e.filename));
 
   return (
-    // Two lanes side by side — one per column of the parent's three equal
-    // tracks. The gap has to match the parent grid's (gap-4) or the lanes come
-    // out a few pixels wider than the video column next to them.
-    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-start">
-      <Lane
-        title={t("🤖 AI detected")}
-        activeEntries={pending}
-        current={pendingCurrent}
-        onOpen={(e) => setPendingKey(e.filename)}
-        onDelete={(e) => deleteCapture(e, "pending")}
-        onSkip={(e) => advancePending(e, true)}
-        renderActions={(entry, box, corrected) => (
+    <Lane
+      title={t("Review · newest first")}
+      activeEntries={activeEntries}
+      current={current}
+      onOpen={(e) => setCurrentKey(e.filename)}
+      onDelete={deleteCapture}
+      onSkip={(e) => advance(e, true)}
+      renderActions={(entry, box, corrected) =>
+        entry.status === "dr_found" ? (
+          <div className="grid grid-cols-2 gap-2">
+            <button onClick={() => saveDrFoundBox(entry, box)} className="py-2.5 bg-sky-600 hover:bg-sky-500 rounded-xl text-white font-medium text-sm transition-colors">
+              {t("💾 Save")}
+            </button>
+            <button onClick={() => deleteCapture(entry)} className="py-2.5 bg-gray-800 hover:bg-gray-700 rounded-xl text-red-400 font-medium text-sm transition-colors">
+              {t("🗑 Discard")}
+            </button>
+          </div>
+        ) : (
           <div className="grid grid-cols-2 gap-2">
             <button onClick={() => submitReview(entry, true, box, corrected)} className="py-2.5 bg-emerald-600 hover:bg-emerald-500 rounded-xl text-white font-medium text-sm transition-colors">
               {t("✓ Confirm polyp")}
@@ -250,34 +219,12 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
               {t("✗ Not a polyp")}
             </button>
           </div>
-        )}
-        reviewedTitle={t("Already reviewed")}
-        reviewedEntries={reviewed}
-        onOpenReviewed={(e) => setPendingKey(e.filename)}
-      />
-
-      <Lane
-        title={t("👁 Dr. found, AI missed")}
-        activeEntries={drFound.filter((e) => !dismissedRef.current.has(e.filename))}
-        current={drCurrent}
-        onOpen={(e) => setDrKey(e.filename)}
-        onDelete={(e) => deleteCapture(e, "dr_found")}
-        onSkip={(e) => advanceDrFound(e, true)}
-        renderActions={(entry, box) => (
-          <div className="grid grid-cols-2 gap-2">
-            <button onClick={() => saveDrFoundBox(entry, box)} className="py-2.5 bg-sky-600 hover:bg-sky-500 rounded-xl text-white font-medium text-sm transition-colors">
-              {t("💾 Save")}
-            </button>
-            <button onClick={() => deleteCapture(entry, "dr_found")} className="py-2.5 bg-gray-800 hover:bg-gray-700 rounded-xl text-red-400 font-medium text-sm transition-colors">
-              {t("🗑 Discard")}
-            </button>
-          </div>
-        )}
-        reviewedTitle={t("Already reviewed")}
-        reviewedEntries={reviewedDrFound}
-        onOpenReviewed={(e) => setDrKey(e.filename)}
-      />
-    </div>
+        )
+      }
+      reviewedTitle={t("Already reviewed")}
+      reviewedEntries={reviewedEntries}
+      onOpenReviewed={(e) => setCurrentKey(e.filename)}
+    />
   );
 }
 
@@ -458,6 +405,13 @@ function Bar({ title, entries, emptyText, currentFilename, onOpen, onDelete }: {
                   }`}
                 >
                   <img src={`${API}/api/feedback/${e.case_id}/image/${e.filename}`} alt="" className="w-full h-full object-cover" />
+                  {/* The merged strip mixes both kinds; without this the only
+                      way to tell them apart is to open the card. */}
+                  <span className={`absolute bottom-0 inset-x-0 text-[9px] leading-tight text-white text-center ${
+                    e.status === "dr_found" ? "bg-sky-600/90" : "bg-emerald-700/90"
+                  }`}>
+                    {e.status === "dr_found" ? "Dr" : "AI"}
+                  </span>
                 </button>
                 <button
                   onClick={(ev) => { ev.stopPropagation(); onDelete(e); }}
