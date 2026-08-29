@@ -495,4 +495,52 @@ export const FA: Record<string, string> = {
     "«هشدار روی نویز» یک آزمون جداگانه در سطح فریم است: {frames} فریم که پنل بازبینی آن‌ها را نویزی علامت زده و هرگز پولیپ ندانسته است، پس برچسب واقعی‌شان «بدون پولیپ» است و هر شناسایی روی آن‌ها ذاتاً نادرست است. این آزمون جدا از اعداد سطح‌مطالعه نگه داشته شده، چون یک مطالعه برای مثبت شمرده‌شدن به ۳ فریم نیاز دارد — یک کادر پرت هزینه‌ای در سطح مطالعه ندارد، اما توجه پزشک را هدر می‌دهد. این فریم‌های پنل از پیش کاملاً برش خورده‌اند، بنابراین برش حاشیه روی این مجموعه بی‌اثر است و با آن نمی‌توان قضاوتش کرد.",
   "Measured on {frames} frames across {studies} studies. With only {positives} report-positive studies, one study is worth about {pts} points of recall — treat small differences as noise, and compare models on ROC AUC, which uses every study and needs no threshold.":
     "اندازه‌گیری‌شده روی {frames} فریم در {studies} مطالعه. با تنها {positives} مطالعه دارای پولیپ در گزارش، هر مطالعه حدود {pts} واحد حساسیت ارزش دارد — تفاوت‌های کوچک را نویز بدانید و مقایسه مدل‌ها را بر پایه ROC AUC انجام دهید که همه مطالعات را به کار می‌گیرد و به آستانه نیاز ندارد.",
+  "Settings": "تنظیمات",
+  "Input size": "اندازه ورودی",
+  "Border crop": "برش حاشیه",
+  "on": "روشن",
+  "off": "خاموش",
+  "Variant": "پیکربندی",
+  "best backend": "بهترین بک‌اند",
+  "not benchmarked": "سنجش نشده",
+  "not swept at this point": "در این نقطه سنجیده نشده",
+  "Breakdown": "تفکیک",
+  "clean left alone": "سالم‌های بدون هشدار",
+  "this is what runs today": "این همان چیزی است که امروز اجرا می‌شود",
+  "Only detections at or above this score count.":
+    "فقط شناسایی‌هایی که امتیازشان از این حد کمتر نباشد شمرده می‌شوند.",
+  "Frames to call a study positive": "تعداد فریم لازم برای مثبت شمردن یک مطالعه",
+  "A lone flagged frame is usually noise; several is a finding.":
+    "یک فریم تنها معمولاً نویز است؛ چند فریم یعنی یک یافته.",
+  "Reset to what is deployed (0.70, 3 frames)":
+    "بازنشانی به مقادیر مستقرشده (۰٫۷۰ و ۳ فریم)",
+  "All variants at confidence {conf} and {n} frames":
+    "همه پیکربندی‌ها با آستانه {conf} و {n} فریم",
+  "Only one crop setting was measured for this combination — the greyed option was never run, and is not estimated here.":
+    "برای این ترکیب فقط یک حالت برش اندازه‌گیری شده است — گزینه خاکستری هرگز اجرا نشده و اینجا تخمین زده نمی‌شود.",
+  "Click a row to select it. Click a column heading to sort. Deltas are against the deployed variant at the same operating point.":
+    "برای انتخاب روی یک سطر و برای مرتب‌سازی روی عنوان ستون کلیک کنید. اختلاف‌ها نسبت به پیکربندی مستقرشده در همان نقطه کاری محاسبه می‌شوند.",
+  "This combination was not swept at that operating point.":
+    "این ترکیب در آن نقطه کاری سنجیده نشده است.",
+  "Speed was not benchmarked for this input size.":
+    "سرعت برای این اندازه ورودی سنجیده نشده است.",
+  "{fps} fps · p90 {p90} ms": "{fps} فریم بر ثانیه · صدک ۹۰: {p90} میلی‌ثانیه",
+  "Measured on the development laptop, one frame at a time. The deployed server is a different machine and slower — quote its own logs, not these, for what a clinic will see.":
+    "اندازه‌گیری‌شده روی لپ‌تاپ توسعه، هر بار یک فریم. سرور مستقرشده ماشین دیگری است و کندتر — برای آنچه در کلینیک دیده می‌شود به لاگ‌های خودِ سرور استناد کنید، نه به این اعداد.",
+  "Fires on {pct}% of the {frames} reviewer-labelled noisy frames at this threshold — every one of those is a false alarm.":
+    "در این آستانه روی {pct}٪ از {frames} فریم نویزیِ برچسب‌خورده توسط بازبین هشدار می‌دهد — هر کدام یک هشدار نادرست است.",
+  "These two breakdowns are computed at the deployed operating point (0.70, 3 frames) and do not follow the sliders.":
+    "این دو تفکیک در نقطه کاری مستقرشده (۰٫۷۰ و ۳ فریم) محاسبه شده‌اند و از لغزنده‌ها پیروی نمی‌کنند.",
+  "Every row is the same evaluation: {studies} colonoscopy studies from this archive, scored against the endoscopist's report. {positives} have a polyp in the report; {negatives} do not.":
+    "هر سطر همان ارزیابی یکسان است: {studies} مطالعه کولونوسکوپی از این آرشیو، سنجیده‌شده در برابر گزارش پزشک. {positives} مطالعه در گزارش پولیپ دارند و {negatives} مطالعه ندارند.",
+  "Deployed. Kvasir-SEG fine-tune at the resolution the browser sends, with the black border cropped off first.":
+    "مستقرشده. آموزش‌دیده روی Kvasir-SEG در همان اندازه‌ای که مرورگر می‌فرستد، با حذف حاشیه سیاه پیش از استنتاج.",
+  "The original baseline at 640px. Four times the compute of 320 for the accuracy the crop recovers at 320.":
+    "خط پایه اولیه با ۶۴۰ پیکسل. چهار برابر محاسبات ۳۲۰ برای همان دقتی که برش در ۳۲۰ بازیابی می‌کند.",
+  "The 6-dataset fine-tune at deployment resolution, uncropped.":
+    "مدل آموزش‌دیده روی ۶ دیتاست، در اندازه استقرار، بدون برش.",
+  "The 6-dataset fine-tune at deployment resolution, cropped — the combination never previously measured.":
+    "مدل آموزش‌دیده روی ۶ دیتاست، در اندازه استقرار، با برش — ترکیبی که پیش‌تر هرگز اندازه‌گیری نشده بود.",
+  "Trained on a pooled 6-dataset corpus. Best ranking of anything tried, and by far the quietest on noise.":
+    "آموزش‌دیده روی مجموعه‌ای از ۶ دیتاست. بهترین رتبه‌بندی میان همه موارد آزموده‌شده و به‌مراتب کم‌هشدارترین روی نویز.",
 };
