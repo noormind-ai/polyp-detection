@@ -34,13 +34,41 @@ const AUTO_CAPTURE_REFRESH_MS = 8000;
 // as "gone" would re-trigger a capture on the very next frame.
 const DETECTION_GAP_MS = 1000;
 
-// A demo clip is a third source alongside the two real ones. It is not a
-// separate playback mode: the frames go through the identical capture loop,
-// socket and auto-capture path, so from here down it behaves like a camera.
-type CaptureMode = "camera" | "screen" | "demo";
+// A demo clip is a third source alongside the two real ones, and a recording
+// already on this server is a fourth. Neither is a separate playback mode: the
+// frames go through the identical capture loop, socket, FOV crop, auto-capture
+// and session-recording path, so from here down both behave like a camera.
+// That is the point of replaying a recording — it is not a preview, it is the
+// live pipeline fed from a file instead of from the capture card.
+type CaptureMode = "camera" | "screen" | "demo" | "recording";
 // Demo entries share the device <select> with real cameras, so their option
 // values have to be distinguishable from a deviceId.
 const DEMO_PREFIX = "demo:";
+// Recordings share the same <select>, so their option values have to be
+// distinguishable from both a deviceId and a demo filename.
+const REC_PREFIX = "rec:";
+
+/** Just the fields the source picker needs — RecordingsPanel owns the full shape. */
+interface ServerRecording {
+  id: string;
+  case_id: string;
+  source: "camera" | "screen";
+  width: number;
+  height: number;
+  started_at: number;
+  duration_ms: number;
+  status: string;
+}
+
+/** Enough to tell two recordings apart in a dropdown: when it was made, how
+ *  long it ran, and what it came from. */
+function describeRecording(r: ServerRecording): string {
+  const when = new Date(r.started_at * 1000);
+  const stamp = `${when.toLocaleDateString()} ${when.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+  const secs = Math.round((r.duration_ms || 0) / 1000);
+  const dur = secs >= 60 ? `${Math.floor(secs / 60)}m${String(secs % 60).padStart(2, "0")}s` : `${secs}s`;
+  return `${stamp} · ${dur} · ${r.source}`;
+}
 
 interface Box { bbox: [number, number, number, number]; conf: number; }
 interface Timing { recv_ms: number; modal_ms: number; total_ms: number; }
@@ -85,6 +113,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // would otherwise read whatever the mode was when it started.
   const captureModeRef = useRef<CaptureMode>("camera");
   const [demoFile, setDemoFile]           = useState<string | null>(null);
+  // Recordings already on this server, offered as a capture source so a past
+  // session can be pushed back through the live pipeline exactly as it ran.
+  const [recordings, setRecordings]       = useState<ServerRecording[]>([]);
+  const [recordingLabel, setRecordingLabel] = useState<string | null>(null);
   const [feedbackRefreshKey, setFeedbackRefreshKey] = useState(0);
   const [aspect, setAspect]               = useState("560/480"); // replaced with the stream's real ratio once it starts
   // Auto-capture is off until the procedure is explicitly started. Before the
@@ -175,6 +207,23 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       if (raw !== null) { const on = raw === "1"; fovEnabledRef.current = on; setFovEnabledState(on); }
     } catch { /* ignore */ }
   }, []);
+
+  // Recordings on this server, for the source picker. Only the finished ones:
+  // a recording still being written has no reliable duration and replaying it
+  // would race the writer. A failure here is not worth surfacing — the picker
+  // simply offers the cameras and demos it already has.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`${API}/api/recordings`, { credentials: "include" });
+        if (!res.ok) return;
+        const all: ServerRecording[] = await res.json();
+        if (!cancelled) setRecordings(all.filter((r) => r.status === "complete" && r.duration_ms > 0));
+      } catch { /* leave the list empty */ }
+    })();
+    return () => { cancelled = true; };
+  }, [recorder.finishedCount]);
 
   function switchCaptureMode(mode: CaptureMode) {
     captureModeRef.current = mode;
@@ -540,7 +589,16 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // fed from a file instead of a MediaStream and looped, and everything after
   // that — the capture loop, the socket, auto-capture, the two panels — is the
   // camera path untouched. Works with no capture hardware attached at all.
-  async function startDemo(file: string) {
+  /**
+   * Play a file through the camera pipeline. Everything downstream of the
+   * <video> element — capture loop, socket, FOV crop, auto-capture, session
+   * recording — is the same code the capture card drives, so this is a genuine
+   * rehearsal of a live procedure rather than a preview of one.
+   *
+   * Loops on purpose: a capture card never reaches an end, and a source that
+   * stops would end the session in a way the real one never does.
+   */
+  async function startFileSource(src: string, mode: "demo" | "recording", optionValue: string) {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     scanRef.current = false;
     setLastError("");
@@ -549,11 +607,13 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     if (!video) return;
     try {
       video.srcObject = null;
-      video.src = `${BASE_PATH}/demos/${file}`;
+      video.src = src;
       video.loop = true;
-      setDemoFile(file);
-      setSelectedId(`${DEMO_PREFIX}${file}`);
-      switchCaptureMode("demo");
+      // Both sources are same-origin (demos are static assets, recordings come
+      // from this server's own API), so the canvas stays readable and the FOV
+      // probe works. A cross-origin file would taint it and silently disable it.
+      setSelectedId(optionValue);
+      switchCaptureMode(mode);
       // Unhide before waiting for pixels — a display:none <video> is not a
       // reliable captureStream() source, the same reason the screen-share path
       // flips this before it waits.
@@ -575,8 +635,25 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     } catch (err: unknown) {
       setStreaming(false);
       setDemoFile(null);
+      setRecordingLabel(null);
       setLastError(err instanceof Error ? err.message : String(err));
     }
+  }
+
+  async function startDemo(file: string) {
+    setDemoFile(file);
+    setRecordingLabel(null);
+    await startFileSource(`${BASE_PATH}/demos/${file}`, "demo", `${DEMO_PREFIX}${file}`);
+  }
+
+  async function startRecording(rec: ServerRecording) {
+    setDemoFile(null);
+    setRecordingLabel(describeRecording(rec));
+    await startFileSource(
+      `${API}/api/recordings/${rec.case_id}/${rec.id}/video`,
+      "recording",
+      `${REC_PREFIX}${rec.case_id}/${rec.id}`,
+    );
   }
 
   // Fallback when the physical device is locked by another app (e.g. ColnoSpy already has it
@@ -673,6 +750,11 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     // Demo clips sit in the same list as the real devices — picking one is the
     // same gesture as picking a camera, so it runs through the same handler.
     if (id.startsWith(DEMO_PREFIX)) startDemo(id.slice(DEMO_PREFIX.length));
+    else if (id.startsWith(REC_PREFIX)) {
+      const [caseId, recId] = id.slice(REC_PREFIX.length).split("/");
+      const rec = recordings.find((r) => r.case_id === caseId && r.id === recId);
+      if (rec) startRecording(rec);
+    }
     else startStream(id);
   }
 
@@ -767,6 +849,15 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
           <option key={v.file} value={`${DEMO_PREFIX}${v.file}`}>{t(v.label)}</option>
         ))}
       </optgroup>
+      {recordings.length > 0 && (
+        <optgroup label={t("Saved on this server")}>
+          {recordings.map((r) => (
+            <option key={`${r.case_id}/${r.id}`} value={`${REC_PREFIX}${r.case_id}/${r.id}`}>
+              {describeRecording(r)}
+            </option>
+          ))}
+        </optgroup>
+      )}
     </select>
   );
 
@@ -779,6 +870,11 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
             <span className={`w-2 h-2 rounded-full inline-block ${wsOk ? "bg-green-400 animate-pulse" : "bg-yellow-400"}`} />
             {wsStatusText}
           </span>
+          {captureMode === "recording" && recordingLabel && (
+            <span className="text-xs px-2 py-0.5 rounded-md border border-sky-800 bg-sky-950/40 text-sky-300">
+              {t("Replaying recording: {name}", { name: recordingLabel })}
+            </span>
+          )}
           {captureMode === "demo" && demoFile && (
             <span className="text-xs px-2 py-0.5 rounded-md border border-purple-800 bg-purple-950/40 text-purple-300">
               {t("Demo clip: {name}", { name: t(DEMO_VIDEOS.find((v) => v.file === demoFile)?.label ?? demoFile) })}
@@ -989,7 +1085,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
                     ref={videoRef}
                     muted
                     playsInline
-                    loop={captureMode === "demo"}
+                    loop={captureMode === "demo" || captureMode === "recording"}
                     className={liveStyle ? "absolute object-contain" : "absolute inset-0 w-full h-full object-contain"}
                     style={liveStyle}
                   />
@@ -1070,6 +1166,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
             <button onClick={stopCamera} className="text-sm text-gray-500 hover:text-gray-300 transition-colors">
               {captureMode === "screen" ? t("← Disconnect screen share")
                 : captureMode === "demo" ? t("← Stop demo clip")
+                : captureMode === "recording" ? t("← Stop replay")
                 : t("← Disconnect camera")}
             </button>
           </div>
