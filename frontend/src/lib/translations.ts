@@ -193,6 +193,34 @@ export const FA: Record<string, string> = {
 
   // Replay + manual false-positive capture + side-panel false-positive bar
   "↺ Replay": "↺ پخش دوباره",
+  "↺ Restart": "↺ از ابتدا",
+
+  // Noisy-frame filter — the classical quality gate in front of the AI.
+  "Noisy-frame filter": "فیلتر فریم نویزی",
+
+  // Noisy-frame filter: strictness levels.
+  "⏸ Too noisy — not sent to the AI": "⏸ بیش از حد نویزی — به هوش مصنوعی ارسال نشد",
+  "Off — every frame is sent to the AI.": "خاموش — همهٔ فریم‌ها به هوش مصنوعی ارسال می‌شوند.",
+  "Strictness": "شدت فیلتر",
+  "Gentle": "ملایم",
+  "Medium": "متوسط",
+  "Strong": "قوی",
+  "Maximum": "بیشینه",
+  "Rejected because: {reason}.": "دلیل رد شدن: {reason}.",
+  "Catches {noisy}% of noisy frames · also skips {polyp}% of frames with a polyp": "{noisy}٪ از فریم‌های نویزی را می‌گیرد · همچنین {polyp}٪ از فریم‌های دارای پولیپ را رد می‌کند",
+  "Off — every frame is sent to the AI. Turn it on to skip frames judged too noisy.": "خاموش — همهٔ فریم‌ها به هوش مصنوعی ارسال می‌شوند. برای رد کردن فریم‌های نویزی آن را روشن کنید.",
+  "⏸ Frame too noisy — not sent to the AI": "⏸ فریم بیش از حد نویزی است — به هوش مصنوعی ارسال نشد",
+  "Rejected because: {reason}. Detection resumes as soon as the picture is usable again.": "دلیل رد شدن: {reason}. به‌محض اینکه تصویر قابل استفاده شود، تشخیص از سر گرفته می‌شود.",
+  "Picture usable · every frame going to the AI": "تصویر قابل استفاده است · همهٔ فریم‌ها به هوش مصنوعی می‌رود",
+  "Too blurry": "بیش از حد تار",
+  "Too dark": "بیش از حد تاریک",
+  "Too much glare": "انعکاس نور بیش از حد",
+  "Underexposed": "کم‌نور",
+  "Overexposed": "پرنور",
+  "OK": "مناسب",
+  "Unverified: on 1,088 reviewed in-house frames this skipped 5.8% of frames a doctor marked as containing a polyp. Watch the numbers above against the picture before relying on it.": "تأییدنشده: روی ۱۰۸۸ فریم بازبینی‌شدهٔ داخلی، این فیلتر ۵.۸٪ از فریم‌هایی را که پزشک دارای پولیپ علامت زده بود رد کرد. پیش از اتکا به آن، اعداد بالا را با تصویر مقایسه کنید.",
+  "Measuring clip length…": "در حال اندازه‌گیری طول کلیپ…",
+  "Scrub the clip — detection keeps running from wherever you land.": "در کلیپ جلو و عقب بروید — تشخیص از همان جایی که می‌رسید ادامه پیدا می‌کند.",
   "🚫 Mark current AI box as false positive": "🚫 علامت‌گذاری کادر فعلی هوش مصنوعی به‌عنوان هشدار کاذب",
   "🚫 False positives": "🚫 هشدارهای کاذب",
   "Mark AI detection as false positive": "علامت‌گذاری تشخیص هوش مصنوعی به‌عنوان هشدار کاذب",
@@ -371,6 +399,17 @@ export const FA: Record<string, string> = {
   "This account uses a one-time password. Choose your own to continue.":
     "این حساب با رمز عبور یک‌بارمصرف ساخته شده است. پیش از ادامه، رمز عبور خود را تعیین کنید.",
   "Repeat password": "تکرار رمز عبور",
+  // Out-of-body filter — the colour gate in front of the detector.
+  "Out-of-body filter": "فیلتر خارج از بدن",
+  "Turn off": "خاموش کردن",
+  "Turn on": "روشن کردن",
+  "Off — every frame is sent for inference, including frames where the camera is outside the patient.": "خاموش — همهٔ فریم‌ها برای استنتاج ارسال می‌شوند، از جمله فریم‌هایی که دوربین بیرون از بدن بیمار است.",
+  "⏸ Out of body detected — no inference": "⏸ خارج از بدن تشخیص داده شد — استنتاجی انجام نمی‌شود",
+  "The camera is outside the patient, so frames are not being sent to the detector. Detection resumes on its own once the scope is back inside.": "دوربین بیرون از بدن بیمار است، بنابراین فریم‌ها به هوش مصنوعی ارسال نمی‌شوند. به‌محض بازگشت آندوسکوپ به داخل، تشخیص به‌طور خودکار از سر گرفته می‌شود.",
+  "Inside the colon · detector running": "داخل روده بزرگ · هوش مصنوعی در حال اجرا",
+  "{n} frames skipped this session": "{n} فریم در این نشست رد شد",
+  "Back inside — inference resumed": "بازگشت به داخل — استنتاج از سر گرفته شد",
+  "Out of body — inference paused": "خارج از بدن — استنتاج متوقف شد",
   "Model performance": "کارایی مدل",
   "in use": "در حال استفاده",
   "{studies} studies from this archive · {positives} with a polyp in the report · {frames} frames":

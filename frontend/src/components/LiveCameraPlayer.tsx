@@ -6,6 +6,10 @@ import RecordingControls from "./RecordingControls";
 import RecordingsPanel from "./RecordingsPanel";
 import { DEMO_VIDEOS } from "./demos";
 import { useLanguage } from "@/lib/i18n";
+import { useInBodyGate } from "@/lib/useInBodyGate";
+import InBodyGateNotice from "./InBodyGateNotice";
+import { useQualityGate } from "@/lib/useQualityGate";
+import QualityGateNotice from "./QualityGateNotice";
 import { useSessionRecorder } from "@/lib/useSessionRecorder";
 import { detectFovRect, unionRect, intersectRect, trimmedFraction, NEGLIGIBLE_TRIM, type Rect } from "@/lib/fov";
 
@@ -19,6 +23,9 @@ const API_WS = (process.env.NEXT_PUBLIC_API_URL
 const INFER_TIMEOUT_MS = 6000;
 // Resize frames to this width before sending — faster inference, smaller payload
 const INFER_WIDTH = 320;
+// Same ladder RealtimePlayer offers, so the two players behave alike. Only
+// meaningful for a file-backed source; a camera runs at whatever rate it runs.
+const SPEEDS = [0.1, 0.25, 0.5, 0.7, 1, 1.5, 2];
 // How many of the first frames of a session are measured to find the picture
 // area. The border does not move, so this is a fixed startup cost, not a
 // per-frame one. Several rather than one because the union of several frames
@@ -75,10 +82,18 @@ interface Timing { recv_ms: number; modal_ms: number; total_ms: number; }
 
 export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = "/api/ws/infer", initialMode = "camera", backend }: { caseId: string; onStop: () => void; onActivity?: () => void; wsPath?: string; initialMode?: "camera" | "screen"; backend?: string }) {
   const { t } = useLanguage();
+  // Cheap colour gate in front of the detector: while the camera is outside the
+  // patient there is nothing to detect, so the frame is never sent. The operator
+  // can switch it off from the panel without restarting the session.
+  const inBody = useInBodyGate();
+  // Second, independent gate: too blurry / too dark / too much glare to be
+  // worth inferring. Its own switch, because unlike the out-of-body gate it
+  // has a measured cost in true polyps and is off until someone opts in.
+  const quality = useQualityGate();
   // The engine is pinned for the life of the socket — the server reads it once,
   // so the latency average never blends two very different backends.
   const WS_URL = `${API_WS}${wsPath}${backend ? `?backend=${encodeURIComponent(backend)}` : ""}`;
-  const videoRef    = useRef<HTMLVideoElement>(null);
+  const videoRef    = useRef<HTMLVideoElement | null>(null);
   const analyzedRef = useRef<HTMLCanvasElement>(null); // last frame actually sent to the model, with boxes burned on
   const wsRef       = useRef<WebSocket | null>(null);
   const scanRef     = useRef(false); // capture loop running?
@@ -109,6 +124,17 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   const [lastError, setLastError]         = useState("");
   const [cameraBusy, setCameraBusy]       = useState(false); // device held by another app — offer screen-share fallback
   const [captureMode, setCaptureMode]     = useState<CaptureMode>("camera");
+  // Only meaningful for the file-backed sources — see `seekable` below.
+  const [duration, setDuration]           = useState(0);
+  const [curTime, setCurTime]             = useState(0);
+  // While the thumb is held the input renders scrubValue, not curTime: a seek
+  // on a cue-less WebM takes a moment, and letting curTime drive the thumb
+  // makes it jump backwards under the user's finger.
+  const [paused, setPaused]               = useState(false);
+  const [speed, setSpeed]                 = useState(1);
+  const [scrubbing, setScrubbing]         = useState(false);
+  const [scrubValue, setScrubValue]       = useState(0);
+  const pendingSeekRef                    = useRef<number | null>(null);
   // Mirrored into a ref because the capture loop is a long-running closure that
   // would otherwise read whatever the mode was when it started.
   const captureModeRef = useRef<CaptureMode>("camera");
@@ -228,6 +254,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   function switchCaptureMode(mode: CaptureMode) {
     captureModeRef.current = mode;
     setCaptureMode(mode);
+    // The old clip's timeline must not survive into the new source, or the
+    // scrubber briefly renders the previous duration against a new video.
+    setDuration(0);
+    setCurTime(0);
   }
 
   function setCropRect(rect: typeof cropRect) {
@@ -348,7 +378,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // share silently keeps cropping the camera feed, with no UI to clear it.
   function sourceRect(video: HTMLVideoElement) {
     const vw = video.videoWidth, vh = video.videoHeight;
-    const crop = captureModeRef.current === "screen" ? cropRectRef.current : null;
+    // Any source that plays a picture can carry an edge worth trimming: browser
+    // chrome around a shared window, a capture-card border or sync line down a
+    // recording. Only a live device is excluded, where the operator frames it.
+    const crop = captureModeRef.current !== "camera" ? cropRectRef.current : null;
     const base = {
       x: crop ? Math.round(crop.x * vw) : 0,
       y: crop ? Math.round(crop.y * vh) : 0,
@@ -482,8 +515,70 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     }, "image/jpeg", 0.82);
   }
 
-  // Live loop — send current frame → wait for result → send next. No seeking:
-  // the video plays continuously, we just grab whatever frame is current each time.
+  // A demo clip or a saved recording is a file, so it has a timeline that staff
+  // can scrub. A camera or screen share does not — nothing to seek in a stream.
+  const seekable = captureMode === "demo" || captureMode === "recording";
+
+  function handleTimeUpdate() {
+    if (videoRef.current) setCurTime(videoRef.current.currentTime);
+  }
+
+  /** A demo clip is an mp4 and reports its length here. A live MediaStream and a
+   *  cue-less WebM both report Infinity — neither may clobber a length the
+   *  recordings API already gave us. */
+  function handleLoadedMetadata() {
+    const v = videoRef.current;
+    if (!v) return;
+    if (Number.isFinite(v.duration) && v.duration > 0) setDuration(v.duration);
+    setCurTime(v.currentTime);
+  }
+
+  function seekTo(newTime: number) {
+    const video = videoRef.current;
+    if (!video) return;
+    const hi = duration > 0 ? duration : Number.MAX_SAFE_INTEGER;
+    const target = Math.max(0, Math.min(hi, newTime));
+    // A streaming WebM carries no cue index, so the browser scans on every seek.
+    // Issuing one per drag event queues them and the tab stops responding — keep
+    // a single seek in flight and remember only the newest target.
+    if (video.seeking) {
+      pendingSeekRef.current = target;
+      return;
+    }
+    pendingSeekRef.current = null;
+    video.currentTime = target;
+    setCurTime(target);
+  }
+
+  /** Stop and hold on the current frame. The inference loop keeps grabbing that
+   *  frozen frame, so the detector — and both gates — keep scoring it, which is
+   *  what makes a single moment inspectable. */
+  function togglePlay() {
+    const video = videoRef.current;
+    if (!video) return;
+    if (video.paused) video.play().catch(() => {});
+    else video.pause();
+  }
+
+  function changeSpeed(s: number) {
+    setSpeed(s);
+    if (videoRef.current) videoRef.current.playbackRate = s;
+  }
+
+  /** Applies whatever target arrived while the previous seek was still running. */
+  function handleSeeked() {
+    const video = videoRef.current;
+    if (!video) return;
+    setCurTime(video.currentTime);
+    const queued = pendingSeekRef.current;
+    if (queued === null) return;
+    pendingSeekRef.current = null;
+    video.currentTime = queued;
+  }
+
+  // Live loop — send current frame → wait for result → send next. The loop never
+  // seeks on its own; it just grabs whatever frame is current, so scrubbing from
+  // the UI simply changes what the next grab picks up.
   async function startLoop() {
     if (scanRef.current) return;
     scanRef.current = true;
@@ -512,6 +607,27 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       cap.width   = capW;
       cap.height  = capH;
       cap.getContext("2d")!.drawImage(video, srcX, srcY, srcW, srcH, 0, 0, capW, capH);
+
+      // Out of body: no JPEG encode, no round trip, no inference. The panel keeps
+      // showing the real frame with no boxes, so it stays obvious that the feed is
+      // live and the detector is simply not being asked. Paced at roughly the
+      // inference cadence rather than spinning a tight while loop.
+      if (!inBody.shouldInfer(cap)) {
+        updateBoxes([]);
+        drawAnalyzedFrame(cap, []);
+        await new Promise<void>((res) => setTimeout(res, 100));
+        continue;
+      }
+
+      // Second gate: inside the patient, but the picture is too poor to be worth a
+      // forward pass. Same contract as the first -- nothing is encoded or sent.
+      // Off by default; see useQualityGate for the measured reason why.
+      if (!quality.shouldInfer(cap)) {
+        updateBoxes([]);
+        drawAnalyzedFrame(cap, []);
+        await new Promise<void>((res) => setTimeout(res, 100));
+        continue;
+      }
 
       const blob: Blob = await new Promise((res) => cap.toBlob((b) => res(b!), "image/jpeg", 0.85));
       const buf = await blob.arrayBuffer();
@@ -598,7 +714,8 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
    * Loops on purpose: a capture card never reaches an end, and a source that
    * stops would end the session in a way the real one never does.
    */
-  async function startFileSource(src: string, mode: "demo" | "recording", optionValue: string) {
+  async function startFileSource(src: string, mode: "demo" | "recording", optionValue: string,
+                                 knownDurationSec = 0) {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     scanRef.current = false;
     setLastError("");
@@ -609,11 +726,21 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       video.srcObject = null;
       video.src = src;
       video.loop = true;
+      // Assigning src resets the rate to 1, so the chosen speed has to be
+      // re-applied rather than set once at mount.
+      video.playbackRate = speed;
       // Both sources are same-origin (demos are static assets, recordings come
       // from this server's own API), so the canvas stays readable and the FOV
       // probe works. A cross-origin file would taint it and silently disable it.
       setSelectedId(optionValue);
       switchCaptureMode(mode);
+      // A saved recording is a MediaRecorder WebM written in streaming mode: no
+      // duration in the header, so the browser reports Infinity and the scrub bar
+      // has no range. The API already knows the length — using it beats making
+      // the browser scan the whole file to rediscover it, which is what made
+      // starting a clip feel slow. Must come after switchCaptureMode, which
+      // clears the previous source's timeline.
+      if (knownDurationSec > 0) setDuration(knownDurationSec);
       // Unhide before waiting for pixels — a display:none <video> is not a
       // reliable captureStream() source, the same reason the screen-share path
       // flips this before it waits.
@@ -653,6 +780,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       `${API}/api/recordings/${rec.case_id}/${rec.id}/video`,
       "recording",
       `${REC_PREFIX}${rec.case_id}/${rec.id}`,
+      (rec.duration_ms || 0) / 1000,
     );
   }
 
@@ -801,7 +929,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   const fovWorthIt = !!fovNorm && fovTrim >= NEGLIGIBLE_TRIM;
   const fovApplied = fovEnabled && fovWorthIt;
 
-  const screenCrop = captureMode === "screen" ? cropRect : null;
+  const screenCrop = captureMode !== "camera" ? cropRect : null;
   // Same composition the capture loop does, in normalized space, so the Live
   // panel frames exactly the region the model is being given.
   const analyzedCrop =
@@ -824,6 +952,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       }
     : undefined;
   const toggleBtn = "text-xs px-2 py-0.5 rounded-md border border-gray-800 text-gray-500 hover:text-gray-300 hover:border-gray-600 transition-colors flex-shrink-0";
+  const transportBtn = "px-2.5 py-1 rounded-md bg-gray-800 hover:bg-gray-700 text-gray-300 font-mono transition-colors";
   const wsStatusText =
     wsStatus === "open" ? t("connected") :
     wsStatus === "closed" ? t("closed ({code})", { code: closeCode ?? "" }) :
@@ -1053,6 +1182,12 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
                 is pressed, so a session that nobody wants archived leaves nothing. */}
             <RecordingControls recorder={recorder} ready={streaming} />
 
+            {/* The gate sits directly above Detected: when it fires, this is the
+                explanation for why that panel has stopped updating. */}
+            <InBodyGateNotice gate={inBody} />
+
+            <QualityGateNotice gate={quality} />
+
             {/* Detected next — it's the panel being read during the procedure */}
             <div className="space-y-1">
               <div className="flex items-center justify-between gap-2">
@@ -1086,6 +1221,12 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
                     muted
                     playsInline
                     loop={captureMode === "demo" || captureMode === "recording"}
+                    onTimeUpdate={handleTimeUpdate}
+                    onSeeked={handleSeeked}
+                    onPlay={() => setPaused(false)}
+                    onPause={() => setPaused(true)}
+                    onLoadedMetadata={handleLoadedMetadata}
+                    onDurationChange={handleLoadedMetadata}
                     className={liveStyle ? "absolute object-contain" : "absolute inset-0 w-full h-full object-contain"}
                     style={liveStyle}
                   />
@@ -1113,6 +1254,70 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
                 </div>
               </div>
             </div>
+
+            {/* Scrub — lets staff line up an exact moment in a clip instead of
+                waiting for the loop to come back around to it. Hidden for camera
+                and screen share, which have no timeline. */}
+            {seekable && (
+              <div className="space-y-1">
+                {duration > 0 ? (
+                  <input
+                    type="range" min={0} max={duration} step={0.1}
+                    value={scrubbing ? scrubValue : curTime}
+                    onPointerDown={() => { setScrubbing(true); setScrubValue(curTime); }}
+                    onPointerUp={() => setScrubbing(false)}
+                    onPointerCancel={() => setScrubbing(false)}
+                    onChange={(e) => {
+                      const v = parseFloat(e.target.value);
+                      setScrubValue(v);
+                      seekTo(v);
+                    }}
+                    className="w-full accent-blue-500 cursor-pointer"
+                  />
+                ) : (
+                  <p className="text-xs text-gray-600">{t("Measuring clip length…")}</p>
+                )}
+                {/* dir=ltr because a transport is read the same way everywhere: the
+                    signs carry the direction, so nothing here depends on the page
+                    being LTR or on arrow glyphs being flipped for RTL. */}
+                <div dir="ltr" className="flex flex-wrap items-center gap-x-2 gap-y-1.5 text-xs">
+                  <button onClick={togglePlay} className={transportBtn}>{paused ? "▶" : "⏸"}</button>
+                  <button onClick={() => seekTo(curTime - 3)} className={transportBtn}>{"−3s"}</button>
+                  <button onClick={() => seekTo(curTime - 1)} className={transportBtn}>{"−1s"}</button>
+                  <button onClick={() => seekTo(curTime + 1)} className={transportBtn}>{"+1s"}</button>
+                  <button onClick={() => seekTo(curTime + 3)} className={transportBtn}>{"+3s"}</button>
+                  <button onClick={() => seekTo(0)} className={transportBtn}>{t("↺ Restart")}</button>
+                  <span className="text-gray-500 font-mono">
+                    {curTime.toFixed(1)}s{duration > 0 ? ` / ${duration.toFixed(1)}s` : ""}
+                  </span>
+                </div>
+
+                {/* Speed sits on its own row: the label is translated, so unlike the
+                    transport above it should follow the page direction. */}
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 text-xs">
+                  <span
+                    className="text-gray-500"
+                    title={t("slower playback = less motion between frames = the two panels drift apart less")}
+                  >
+                    {t("Playback speed")}
+                  </span>
+                  {SPEEDS.map((s) => (
+                    <button
+                      key={s}
+                      onClick={() => changeSpeed(s)}
+                      className={`px-2.5 py-1 rounded-md font-mono transition-colors ${
+                        speed === s ? "bg-green-600 text-white" : "bg-gray-800 text-gray-400 hover:bg-gray-700"
+                      }`}
+                    >
+                      {s}x
+                    </button>
+                  ))}
+                </div>
+                <p className="text-xs text-gray-500">
+                  {t("Scrub the clip — detection keeps running from wherever you land.")}
+                </p>
+              </div>
+            )}
 
             {/* Field of view. The signal is wider than the picture: there is a
                 black border around it, and averaging quality statistics over
@@ -1153,7 +1358,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
                 the list that is any time we are not screen-sharing. */}
             {captureMode !== "screen" && deviceSelect}
 
-            {captureMode === "screen" && (
+            {captureMode !== "camera" && streaming && (
               <div className="flex flex-wrap items-center gap-3 text-sm">
                 <button onClick={openRegionSelector} className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg text-white transition-colors">
                   {cropRect ? t("Change capture region") : t("Select capture region")}

@@ -6,6 +6,10 @@ import FeedbackPanel from "./FeedbackPanel";
 import LoginPanel from "./LoginPanel";
 import { useAuth } from "@/lib/auth";
 import { useLanguage } from "@/lib/i18n";
+import { useInBodyGate } from "@/lib/useInBodyGate";
+import InBodyGateNotice from "./InBodyGateNotice";
+import { useQualityGate } from "@/lib/useQualityGate";
+import QualityGateNotice from "./QualityGateNotice";
 import { detectFovRect, unionRect, trimmedFraction, NEGLIGIBLE_TRIM, type Rect } from "@/lib/fov";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "";
@@ -51,6 +55,14 @@ export default function RealtimePlayer({
 }: { caseId: string; onStop: () => void; onActivity?: () => void; wsPath?: string; backend?: string; cpuOnly?: boolean }) {
   const { user } = useAuth();
   const { t } = useLanguage();
+  // Cheap colour gate in front of the detector: while the camera is outside the
+  // patient there is nothing to detect, so the frame is never sent. The operator
+  // can switch it off from the panel without restarting the session.
+  const inBody = useInBodyGate();
+  // Second, independent gate: too blurry / too dark / too much glare to be
+  // worth inferring. Its own switch, because unlike the out-of-body gate it
+  // has a measured cost in true polyps and is off until someone opts in.
+  const quality = useQualityGate();
   // The engine is pinned for the life of the socket — the server reads it once,
   // so the latency average never blends two very different backends.
   const [isDemo, setIsDemo] = useState(false);
@@ -362,6 +374,27 @@ export default function RealtimePlayer({
       cap.width   = capW;
       cap.height  = capH;
       cap.getContext("2d")!.drawImage(video, srcX, srcY, srcW, srcH, 0, 0, capW, capH);
+
+      // Out of body: no JPEG encode, no round trip, no inference. The panel keeps
+      // showing the real frame with no boxes, so it stays obvious that the feed is
+      // live and the detector is simply not being asked. Paced at roughly the
+      // inference cadence rather than spinning a tight while loop.
+      if (!inBody.shouldInfer(cap)) {
+        updateBoxes([]);
+        drawAnalyzedFrame(cap, []);
+        await new Promise<void>((res) => setTimeout(res, 100));
+        continue;
+      }
+
+      // Second gate: inside the patient, but the picture is too poor to be worth a
+      // forward pass. Same contract as the first -- nothing is encoded or sent.
+      // Off by default; see useQualityGate for the measured reason why.
+      if (!quality.shouldInfer(cap)) {
+        updateBoxes([]);
+        drawAnalyzedFrame(cap, []);
+        await new Promise<void>((res) => setTimeout(res, 100));
+        continue;
+      }
 
       const blob: Blob = await new Promise((res) => cap.toBlob((b) => res(b!), "image/jpeg", 0.85));
       const buf = await blob.arrayBuffer();
@@ -709,6 +742,12 @@ export default function RealtimePlayer({
             >
               {t("👁 Dr. found a polyp AI missed")}
             </button>
+
+            {/* The gate sits directly above Detected: when it fires, this is the
+                explanation for why that panel has stopped updating. */}
+            <InBodyGateNotice gate={inBody} />
+
+            <QualityGateNotice gate={quality} />
 
             {/* Detected next — it's the panel being read during the procedure */}
             <div className="space-y-1">
