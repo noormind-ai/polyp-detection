@@ -9,6 +9,7 @@ import LiveCameraPlayer from "@/components/LiveCameraPlayer";
 import SignInPrompt, { goToLogin } from "@/components/SignInPrompt";
 import RecordingsPanel from "@/components/RecordingsPanel";
 import ReviewCallout from "@/components/ReviewCallout";
+import ModelPerformance from "@/components/ModelPerformance";
 import { useAuth } from "@/lib/auth";
 import { useLanguage } from "@/lib/i18n";
 
@@ -338,7 +339,7 @@ export default function Home() {
         <div>
           <h1 className="text-xl sm:text-2xl font-semibold mb-1">{t("Polyp Detection AI")}</h1>
           <p className="text-gray-500 text-sm">
-            {t("Real-time colonoscopy polyp detection · YOLOv5 · Kvasir-SEG · mAP50 0.93")}
+            {t("Real-time colonoscopy polyp detection · YOLOv5m · 77% of studies found on our own archive")}
           </p>
         </div>
         <div className="flex gap-2 flex-shrink-0 flex-wrap justify-start sm:justify-end items-center">
@@ -399,6 +400,11 @@ export default function Home() {
           {/* A reviewer came here for the panel, not for inference. Give it the
               top of the page, above the choices that are not their work. */}
           <ReviewCallout />
+
+          {/* What the detector actually scores here, model by model. Sits on
+              the landing screen because it is context for choosing a mode, not
+              a detour from one. */}
+          <ModelPerformance />
 
           {/* Engine picker. Only rendered when the server offers more than one,
               so a deployment with no CPU models looks exactly as it did. */}

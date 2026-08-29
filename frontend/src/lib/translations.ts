@@ -371,4 +371,50 @@ export const FA: Record<string, string> = {
   "This account uses a one-time password. Choose your own to continue.":
     "این حساب با رمز عبور یک‌بارمصرف ساخته شده است. پیش از ادامه، رمز عبور خود را تعیین کنید.",
   "Repeat password": "تکرار رمز عبور",
+  "Model performance": "کارایی مدل",
+  "in use": "در حال استفاده",
+  "{studies} studies from this archive · {positives} with a polyp in the report · {frames} frames":
+    "{studies} مطالعه از این آرشیو · {positives} مورد با پولیپ در گزارش · {frames} فریم",
+  "Recall": "حساسیت",
+  "Precision": "دقت",
+  "Study ROC AUC": "سطح زیر منحنی ROC (مطالعه)",
+  "threshold-free": "بدون آستانه",
+  "{tp} of {n} found": "{tp} از {n} یافت شد",
+  "{fp} false alarms": "{fp} هشدار نادرست",
+  "Show detail": "نمایش جزئیات",
+  "Hide detail": "پنهان کردن جزئیات",
+  "Specificity": "ویژگی",
+  "NPV": "ارزش اخباری منفی",
+  "Youden J": "شاخص یودن J",
+  "Confusion": "ماتریس درهم‌ریختگی",
+  "TP / FN / FP / TN": "مثبت درست / منفی نادرست / مثبت نادرست / منفی درست",
+  "Recall against false-alarm burden": "حساسیت در برابر بار هشدارهای نادرست",
+  "Confidence": "آستانه اطمینان",
+  "False frames per clean study": "فریم نادرست در هر مطالعه سالم",
+  "Clean studies alerted": "مطالعات سالم دارای هشدار",
+  "Real-time colonoscopy polyp detection · YOLOv5m · 77% of studies found on our own archive":
+    "تشخیص بلادرنگ پولیپ در کولونوسکوپی · YOLOv5m · شناسایی ۷۷٪ مطالعات در آرشیو ما",
+  "YOLOv5m · 320px · border cropped": "YOLOv5m · ۳۲۰ پیکسل · با برش حاشیه",
+  "YOLOv5m · 320px · no crop": "YOLOv5m · ۳۲۰ پیکسل · بدون برش",
+  "YOLOv5m · 640px": "YOLOv5m · ۶۴۰ پیکسل",
+  "YOLO11m · 6-dataset fine-tune": "YOLO11m · آموزش روی ۶ مجموعه‌داده",
+  "YOLO11n · nano": "YOLO11n · نانو",
+  "YOLO11n · nano · 320px": "YOLO11n · نانو · ۳۲۰ پیکسل",
+  "RT-DETR-R18": "RT-DETR-R18",
+  "Deployed. Kvasir-SEG fine-tune, run at the resolution the browser sends, with the black border cropped off first.":
+    "در حال استفاده. آموزش‌دیده روی Kvasir-SEG، اجرا در همان اندازه‌ای که مرورگر می‌فرستد، با حذف حاشیه سیاه پیش از استنتاج.",
+  "The same model and resolution without the crop — 13.5% of every frame is black border, and the pixel budget is spent on it.":
+    "همان مدل و همان اندازه بدون برش — ۱۳٫۵٪ هر فریم حاشیه سیاه است و بودجه پیکسلی صرف آن می‌شود.",
+  "The original baseline, run at 640px. Four times the compute of 320 for the same accuracy the crop recovers.":
+    "خط پایه اولیه با اندازه ۶۴۰ پیکسل. چهار برابر محاسبات ۳۲۰ برای همان دقتی که برش بازیابی می‌کند.",
+  "Trained on a pooled 6-dataset corpus. Best ranking of any model tried, but it ties on recall and costs more to run.":
+    "آموزش‌دیده روی مجموعه‌ای از ۶ دیتاست. بهترین رتبه‌بندی میان مدل‌های آزموده‌شده، اما در حساسیت برابر است و اجرای آن گران‌تر.",
+  "Nano-class model. Fast enough for anything, but it misses roughly a third of the studies.":
+    "مدل رده نانو. برای هر کاری به‌اندازه کافی سریع، اما حدود یک‌سوم مطالعات را از دست می‌دهد.",
+  "Nano at deployment resolution. Never wrong when it fires, and almost never fires.":
+    "نانو در اندازه استقرار. وقتی هشدار می‌دهد هرگز اشتباه نمی‌کند، و تقریباً هرگز هشدار نمی‌دهد.",
+  "Transformer detector, evaluated for comparison. Not competitive on this corpus.":
+    "آشکارساز ترنسفورمری، صرفاً برای مقایسه ارزیابی شد. روی این مجموعه رقابتی نیست.",
+  "Measured on this deployment's own archive against the endoscopist's report, not on a public benchmark. With only {positives} report-positive studies, one study is worth about {pts} points of recall — treat small differences as noise and compare on ROC AUC, which uses every study and needs no threshold.":
+    "اندازه‌گیری‌شده روی آرشیو همین استقرار و در مقایسه با گزارش پزشک، نه روی یک محک عمومی. با تنها {positives} مطالعه دارای پولیپ در گزارش، هر مطالعه حدود {pts} واحد حساسیت ارزش دارد — تفاوت‌های کوچک را نویز بدانید و مقایسه را بر پایه ROC AUC انجام دهید که همه مطالعات را به کار می‌گیرد و به آستانه نیاز ندارد.",
 };
