@@ -56,7 +56,7 @@ export default function ReviewCallout() {
       href="/review"
       className="block p-6 rounded-2xl border-2 border-emerald-600/70 bg-emerald-950/25 hover:border-emerald-400 hover:bg-emerald-950/45 transition-colors"
     >
-      <div className="flex items-center gap-5">
+      <div className="flex flex-col sm:flex-row sm:items-center gap-4 sm:gap-5">
         <span className="text-4xl flex-shrink-0">🩺</span>
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2 flex-wrap">
@@ -78,7 +78,7 @@ export default function ReviewCallout() {
             </div>
           )}
         </div>
-        <span className="text-sm font-medium px-4 py-2.5 rounded-xl bg-emerald-600 text-white flex-shrink-0 whitespace-nowrap">
+        <span className="text-sm font-medium px-4 py-2.5 rounded-xl bg-emerald-600 text-white flex-shrink-0 whitespace-nowrap text-center w-full sm:w-auto">
           {open ? t("Continue reviewing →") : t("Open the review panel →")}
         </span>
       </div>

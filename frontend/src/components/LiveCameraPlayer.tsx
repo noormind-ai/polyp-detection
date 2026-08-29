@@ -6,7 +6,6 @@ import RecordingControls from "./RecordingControls";
 import RecordingsPanel from "./RecordingsPanel";
 import { DEMO_VIDEOS } from "./demos";
 import { useLanguage } from "@/lib/i18n";
-import { useRollingClip } from "@/lib/useRollingClip";
 import { useSessionRecorder } from "@/lib/useSessionRecorder";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "";
@@ -53,6 +52,13 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   const lastAutoCaptureRef = useRef(0);
   const lastDetectionRef   = useRef(0);     // when a box was last seen
   const inEpisodeRef       = useRef(false); // inside one continuous appearance?
+  // One capture upload at a time. A rolling clip plus its frame is megabytes and
+  // a clinic uplink is not fast: without this, a run of detections queues a dozen
+  // multi-megabyte POSTs that compete with the websocket carrying frames for the
+  // same upstream, inference stalls, and the uploads themselves get abandoned
+  // (nginx logged 81 x 499 and 15 x 408 in one day). Skipping a capture costs
+  // little — an episode that is still on screen files one on the next refresh.
+  const uploadingRef       = useRef(false);
   const lastBoxesRef = useRef<Box[]>([]); // AI's most recent detections — attached as context to manual captures
 
   // Pending response promise resolver — one in-flight request at a time
@@ -75,13 +81,29 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   const [demoFile, setDemoFile]           = useState<string | null>(null);
   const [feedbackRefreshKey, setFeedbackRefreshKey] = useState(0);
   const [aspect, setAspect]               = useState("560/480"); // replaced with the stream's real ratio once it starts
+  // Auto-capture is off until the procedure is explicitly started. Before the
+  // scope is in, the camera shows the trolley, the floor, a gloved hand — the
+  // model flags things in all of it and the review queue fills with frames no
+  // one wants. The doctor says when the procedure begins.
+  const [procedureStarted, setProcedureStarted] = useState(false);
+  // The capture loop is started once and closes over the render it began in, so
+  // it cannot read the state above; it reads this instead.
+  const procedureStartedRef = useRef(false);
+  // Confidence gate, client-side and live-adjustable. The server runs the model
+  // at its own low threshold (0.30) and reports every box with its score, so
+  // moving this mid-procedure costs nothing — no round trip, no restart, and it
+  // applies to what is drawn and what is auto-captured alike. A scope that is
+  // noisy today can be tightened without redeploying anything.
+  const [confMin, setConfMin] = useState(0.30);
+  // The capture loop closes over the render it started in and cannot see the
+  // state above.
+  const confMinRef = useRef(0.30);
   const [showDetected, setShowDetected]   = useState(true);
   const [showLive, setShowLive]           = useState(true);
   const msHistory = useRef<number[]>([]);
 
   // Only starts recording once there's actually a stream on the element —
   // captureStream() on an empty <video> yields no tracks and MediaRecorder refuses it.
-  const { getClip } = useRollingClip(streaming ? videoRef.current : null);
 
   // The capture stream as STATE as well as a ref: streamRef is read inside the
   // long-running capture loop, but the session recorder is a hook and has to
@@ -244,6 +266,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // inference, plus what the model saw, plus a rolling clip if available.
   // Throttled so a polyp staying in view for a while doesn't flood the queue.
   function maybeAutoCapture(cap: HTMLCanvasElement, boxes: Box[]) {
+    // Nothing is filed until the procedure has been started. Detection itself
+    // keeps running and stays visible on screen — this only decides whether a
+    // detection is worth keeping.
+    if (!procedureStartedRef.current) return;
     const now = Date.now();
 
     if (boxes.length === 0) {
@@ -263,6 +289,9 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     } else {
       inEpisodeRef.current = true;
     }
+    // An upload still in flight means the uplink is already busy; filing
+    // another now is what turns a slow link into a stalled page.
+    if (uploadingRef.current) return;
     lastAutoCaptureRef.current = now;
 
     cap.toBlob(async (blob) => {
@@ -270,38 +299,64 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       const fd = new FormData();
       fd.append("file", blob, "frame.jpg");
       fd.append("ai_detections", JSON.stringify(boxes));
-      const clip = getClip();
-      if (clip) fd.append("video", clip, "clip.webm");
+      // No clip. The session recording already holds this moment, so all a
+      // reviewer needs is where to seek to — a few bytes instead of the ~250 KB
+      // of video that was starving the live frame stream.
+      const at = recorder.mark();
+      if (at) {
+        fd.append("recording_id", at.recordingId);
+        fd.append("video_offset_ms", String(at.offsetMs));
+      }
+      uploadingRef.current = true;
       try {
         await fetch(`${API}/api/feedback/${caseId}/auto-capture`, { method: "POST", body: fd });
         setFeedbackRefreshKey((k) => k + 1);
-      } catch { /* best-effort — never interrupt the live loop over this */ }
+      } catch { /* best-effort — never interrupt the live loop over this */ } finally { uploadingRef.current = false; }
     }, "image/jpeg", 0.85);
   }
 
   // Instant, no-dialog manual capture of whatever is on screen right now — the
   // one case auto-capture can't cover, a doctor spotting something the model
   // missed. Box drawing/correction happens in the side panel, not in a popup.
+  // A doctor-found capture used to encode the camera's full frame (1280x720+)
+  // at quality 0.9: a synchronous draw + JPEG encode on the same main thread as
+  // the inference loop, then ~200 KB of JPEG plus the clip pushed up in one
+  // burst. Both the encode and the upload showed as a hitch in the live video.
+  // A review still does not need more than this.
+  const CAPTURE_MAX_EDGE = 960;
+
+  function captureCanvas(video: HTMLVideoElement, src: { x: number; y: number; w: number; h: number }) {
+    const scale = Math.min(1, CAPTURE_MAX_EDGE / Math.max(src.w, src.h));
+    const cap = document.createElement("canvas");
+    cap.width = Math.round(src.w * scale);
+    cap.height = Math.round(src.h * scale);
+    cap.getContext("2d")!.drawImage(video, src.x, src.y, src.w, src.h, 0, 0, cap.width, cap.height);
+    return cap;
+  }
+
   function captureDrFound() {
     const video = videoRef.current;
     if (!video || !video.videoWidth) return;
     const src = sourceRect(video);
-    const cap = document.createElement("canvas");
-    cap.width = src.w;
-    cap.height = src.h;
-    cap.getContext("2d")!.drawImage(video, src.x, src.y, src.w, src.h, 0, 0, src.w, src.h);
+    const cap = captureCanvas(video, src);
     cap.toBlob(async (blob) => {
       if (!blob) return;
       const fd = new FormData();
       fd.append("file", blob, "frame.jpg");
       fd.append("ai_detections", JSON.stringify(lastBoxesRef.current));
-      const clip = getClip();
-      if (clip) fd.append("video", clip, "clip.webm");
+      // No clip. The session recording already holds this moment, so all a
+      // reviewer needs is where to seek to — a few bytes instead of the ~250 KB
+      // of video that was starving the live frame stream.
+      const at = recorder.mark();
+      if (at) {
+        fd.append("recording_id", at.recordingId);
+        fd.append("video_offset_ms", String(at.offsetMs));
+      }
       try {
         await fetch(`${API}/api/feedback/${caseId}/dr-found/capture`, { method: "POST", body: fd });
         setFeedbackRefreshKey((k) => k + 1);
       } catch { /* best-effort */ }
-    }, "image/jpeg", 0.9);
+    }, "image/jpeg", 0.82);
   }
 
   // Live loop — send current frame → wait for result → send next. No seeking:
@@ -345,9 +400,11 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
 
       // Draw the frame + its boxes together, win or lose (a timeout leaves the last good frame up)
       if (result) {
-        updateBoxes(result.boxes);
-        drawAnalyzedFrame(cap, result.boxes);
-        maybeAutoCapture(cap, result.boxes);
+        // One gate for both what is shown and what is kept.
+        const shown = result.boxes.filter((b) => b.conf >= confMinRef.current);
+        updateBoxes(shown);
+        drawAnalyzedFrame(cap, shown);
+        maybeAutoCapture(cap, shown);
       }
     }
   }
@@ -735,6 +792,54 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
           <div className="space-y-2 min-w-0 bg-gray-900/50 border border-gray-800 rounded-xl p-3">
             {/* Right at the top of the column — it's pressed mid-procedure, so it
                 should never be somewhere you have to look for or scroll to. */}
+            <button
+              onClick={() => {
+                const next = !procedureStarted;
+                setProcedureStarted(next);
+                procedureStartedRef.current = next;
+                // A fresh start should not inherit the episode state of whatever
+                // was on camera beforehand, or the first real detection is
+                // treated as a continuation and skipped.
+                inEpisodeRef.current = false;
+                lastAutoCaptureRef.current = 0;
+              }}
+              className={`w-full py-2.5 px-4 rounded-xl text-white font-medium text-sm transition-colors ${
+                procedureStarted
+                  ? "bg-gray-700 hover:bg-gray-600"
+                  : "bg-blue-600 hover:bg-blue-500"
+              }`}
+            >
+              {procedureStarted ? t("⏹ Stop auto-capture") : t("▶ Start procedure")}
+            </button>
+            <p className="text-xs text-gray-500 text-center">
+              {procedureStarted
+                ? t("Detections are being filed for review.")
+                : t("Detection is running, but nothing is filed until you start.")}
+            </p>
+
+            <div className="rounded-xl border border-gray-800 bg-gray-900/60 px-3 py-2 space-y-1">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-gray-400">{t("Confidence threshold")}</span>
+                <span className="font-mono text-gray-200">{Math.round(confMin * 100)}%</span>
+              </div>
+              <input
+                type="range"
+                min={0.05}
+                max={0.95}
+                step={0.05}
+                value={confMin}
+                onChange={(e) => {
+                  const v = Number(e.target.value);
+                  setConfMin(v);
+                  confMinRef.current = v;
+                }}
+                className="w-full accent-blue-500 cursor-pointer"
+              />
+              <p className="text-xs text-gray-500">
+                {t("Only detections at or above this score are boxed and filed.")}
+              </p>
+            </div>
+
             <button
               onClick={captureDrFound}
               className="w-full py-2.5 px-4 rounded-xl bg-emerald-700 hover:bg-emerald-600 text-white font-medium text-sm transition-colors"

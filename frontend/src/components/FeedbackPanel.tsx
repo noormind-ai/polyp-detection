@@ -16,6 +16,22 @@ interface Entry {
   bbox_y1?: string;
   bbox_x2?: string;
   bbox_y2?: string;
+  recording_id?: string;
+  video_offset_ms?: string;
+}
+
+/** Position of this frame inside the session recording, as mm:ss. Captures no
+ *  longer carry their own clip — this is how a reviewer finds the moment in the
+ *  full recording instead. */
+function offsetLabel(e: Entry): string | null {
+  const ms = Number(e.video_offset_ms);
+  if (!e.video_offset_ms || Number.isNaN(ms)) return null;
+  const total = Math.floor(ms / 1000);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const sec = total % 60;
+  const two = (n: number) => String(n).padStart(2, "0");
+  return h > 0 ? `${h}:${two(m)}:${two(sec)}` : `${m}:${two(sec)}`;
 }
 
 type UserBox = [number, number, number, number];
@@ -373,7 +389,12 @@ function ReviewCard({ entry, onSkip, renderActions }: {
 
   return (
     <div className="space-y-3">
-      <div className="flex items-center justify-end">
+      <div className="flex items-center justify-between gap-2">
+        {offsetLabel(entry)
+          ? <span className="text-xs text-gray-500 font-mono" title={t("Position in the session recording")}>
+              🎞 {offsetLabel(entry)}
+            </span>
+          : <span />}
         <button onClick={onSkip} className="text-xs text-gray-500 hover:text-gray-300 transition-colors">{t("Skip → next")}</button>
       </div>
 

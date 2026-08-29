@@ -50,11 +50,43 @@ export default function LoginPanel({
 
   const registering = tab === "register";
 
+  /**
+   * What is really in the fields, whatever React thinks.
+   *
+   * A browser restoring saved credentials writes them into the DOM without
+   * firing the events React listens for, so state can still be empty while the
+   * form on screen is visibly complete. Reading the form itself is the only
+   * account of it that is true either way -- and it is why the button below is
+   * never disabled for looking empty: that made a filled-in form look dead.
+   */
+  function read(form: HTMLFormElement) {
+    const fd = new FormData(form);
+    const of = (name: string, fallback: string) =>
+      ((fd.get(name) as string | null) ?? "") || fallback;
+    return {
+      u: of("username", username).trim(),
+      p: of("password", password),
+      p2: of("password2", password2),
+      inv: of("invite", invite).trim(),
+    };
+  }
+
   async function submit(e: React.FormEvent) {
     e.preventDefault();
+    const { u, p, p2, inv } = read(e.currentTarget as HTMLFormElement);
+    // An empty form is answered with a sentence rather than with a control
+    // nobody can press.
+    if (!u || !p) {
+      setError(t("Enter your username and password."));
+      return;
+    }
+    // The change-password step needs the credentials that just worked, and it
+    // reads them from state -- which autofill may never have reached.
+    setUsername(u);
+    setPassword(p);
     // Only on signup. Signing IN needs no confirmation: a wrong password there
     // just fails and can be retried, and a second field would be friction.
-    if (registering && password !== password2) {
+    if (registering && p !== p2) {
       setError(t("Passwords do not match."));
       return;
     }
@@ -62,8 +94,8 @@ export default function LoginPanel({
     setError("");
     try {
       const result = registering
-        ? await register(username, password, invite)
-        : await login(username, password);
+        ? await register(u, p, inv)
+        : await login(u, p);
       if (!result.done) {
         // Password was right; it is just the one an admin issued. Keep it in
         // state — the change needs it as the current password, and making
@@ -87,11 +119,18 @@ export default function LoginPanel({
 
   async function submitNewPassword(e: React.FormEvent) {
     e.preventDefault();
-    if (newPw !== newPw2) { setError(t("Passwords do not match.")); return; }
+    const fd = new FormData(e.currentTarget as HTMLFormElement);
+    const a = ((fd.get("newPassword") as string | null) ?? "") || newPw;
+    const b = ((fd.get("newPassword2") as string | null) ?? "") || newPw2;
+    // Two blanks would "match", so emptiness is checked before equality.
+    if (!a || !b) { setError(t("Choose a password, twice.")); return; }
+    if (a !== b) { setError(t("Passwords do not match.")); return; }
+    setNewPw(a);
+    setNewPw2(b);
     setBusy(true);
     setError("");
     try {
-      await setNewPassword(username, password, newPw);
+      await setNewPassword(username, password, a);
       onSignedIn?.();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
@@ -127,6 +166,7 @@ export default function LoginPanel({
         <form onSubmit={submitNewPassword} className="space-y-3">
           <input
             className={field}
+            name="newPassword"
             type="password"
             value={newPw}
             onChange={(e) => setNewPw(e.target.value)}
@@ -136,6 +176,7 @@ export default function LoginPanel({
           />
           <input
             className={field}
+            name="newPassword2"
             type="password"
             value={newPw2}
             onChange={(e) => setNewPw2(e.target.value)}
@@ -145,7 +186,7 @@ export default function LoginPanel({
           <p className="text-xs text-gray-600">
             {t("At least 12 characters, using three of: lower case, upper case, digits, symbols.")}
           </p>
-          <button type="submit" disabled={busy || !newPw || !newPw2} className={button}>
+          <button type="submit" disabled={busy} className={button}>
             {busy ? t("Please wait…") : t("Save and continue")}
           </button>
         </form>
@@ -194,6 +235,7 @@ export default function LoginPanel({
       <form onSubmit={submit} className="space-y-3">
         <input
           className={field}
+          name="username"
           value={username}
           onChange={(e) => setUsername(e.target.value)}
           placeholder={t("Username")}
@@ -202,6 +244,7 @@ export default function LoginPanel({
         />
         <input
           className={field}
+          name="password"
           type="password"
           value={password}
           onChange={(e) => setPassword(e.target.value)}
@@ -211,6 +254,7 @@ export default function LoginPanel({
         {registering && (
           <input
             className={field}
+            name="password2"
             type="password"
             value={password2}
             onChange={(e) => setPassword2(e.target.value)}
@@ -221,6 +265,7 @@ export default function LoginPanel({
         {registering && inviteRequired && (
           <input
             className={field}
+            name="invite"
             value={invite}
             onChange={(e) => setInvite(e.target.value)}
             placeholder={t("Invite code")}
@@ -229,7 +274,7 @@ export default function LoginPanel({
 
         <button
           type="submit"
-          disabled={busy || !username || !password || (registering && !password2)}
+          disabled={busy}
           className={button}
         >
           {busy ? t("Please wait…") : registering ? t("Create account") : t("Sign in")}

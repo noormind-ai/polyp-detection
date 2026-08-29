@@ -29,10 +29,10 @@ export default function TutorialsPage() {
 
   return (
     <main className="min-h-screen bg-gray-950 text-white">
-      <div className="max-w-4xl mx-auto p-8">
-        <div className="flex items-start justify-between mb-10">
+      <div className="max-w-4xl mx-auto p-4 sm:p-8">
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between mb-6 sm:mb-10">
           <div>
-            <h1 className="text-2xl font-semibold mb-1">{t("Tutorials")}</h1>
+            <h1 className="text-xl sm:text-2xl font-semibold mb-1">{t("Tutorials")}</h1>
             <p className="text-gray-500 text-sm">{t("How to use the feedback panels")}</p>
           </div>
           <div className="flex items-center gap-2 flex-shrink-0">

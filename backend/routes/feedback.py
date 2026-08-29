@@ -33,7 +33,9 @@ can aggregate across cases). Not committed to git (`data/` is gitignored).
 """
 
 import csv
+import asyncio
 import json
+import threading
 import logging
 import re
 import time
@@ -55,6 +57,11 @@ MANIFEST_PATH = DATA_DIR / "manifest.csv"
 MANIFEST_FIELDS = [
     "case_id", "filename", "has_video", "timestamp", "source", "status", "noticed_first",
     "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2", "ai_detections", "box_corrected",
+    # Where this frame sits in the session recording, instead of shipping a copy
+    # of the video with it. The clip upload cost ~250 KB per capture on a link
+    # that measures ~100 KB/s; a recording id and an offset cost nothing and the
+    # reviewer can seek to the exact moment in the full recording.
+    "recording_id", "video_offset_ms",
 ]
 STATUSES = {"pending", "confirmed", "false_positive", "dr_found"}
 NOTICED_FIRST = {"dr", "ai", ""}
@@ -88,6 +95,67 @@ def _write_manifest(rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
+_MANIFEST_LOCK = threading.Lock()
+
+_ROW_DEFAULTS = {
+    "case_id": "", "filename": "", "has_video": False, "timestamp": 0,
+    "source": "auto", "status": "pending", "noticed_first": "",
+    "bbox_x1": "", "bbox_y1": "", "bbox_x2": "", "bbox_y2": "",
+    "ai_detections": "", "box_corrected": "",
+    "recording_id": "", "video_offset_ms": "",
+}
+
+
+def _append_manifest(row: dict) -> None:
+    """Append one row. The old path read the whole manifest and rewrote it on
+    every capture, which is O(rows) per detection during a live procedure and
+    grows for the length of the deployment. Only edits (review/delete) need the
+    read-modify-write; a new capture does not."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with _MANIFEST_LOCK:
+        _migrate_header_locked()
+        fresh = not MANIFEST_PATH.exists()
+        with MANIFEST_PATH.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=MANIFEST_FIELDS)
+            if fresh:
+                writer.writeheader()
+            writer.writerow(row)
+
+
+def _migrate_header_locked() -> None:
+    """Bring an older manifest up to the current columns. Call with the lock
+    held. Appending a row with more fields than the file's header would leave
+    every later column shifted, so this has to happen before the first append,
+    not on some future maintenance run."""
+    if not MANIFEST_PATH.exists():
+        return
+    with MANIFEST_PATH.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames == MANIFEST_FIELDS:
+            return
+        rows = list(reader)
+    log.info("manifest: migrating header to %d columns", len(MANIFEST_FIELDS))
+    with MANIFEST_PATH.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=MANIFEST_FIELDS, restval="",
+                                extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _save_and_record(case_id: str, image: bytes, video: Optional[bytes],
+                     extra: dict) -> str:
+    """Write the frame, the clip and the manifest row. Blocking on purpose —
+    callers hand it to a worker thread. Doing this inline on the event loop
+    froze the inference websocket for the duration of the disk write, which is
+    exactly the video stutter a clinician sees at the moment of capture."""
+    filename, ts, has_video = _save_capture(case_id, image, video)
+    row = dict(_ROW_DEFAULTS)
+    row.update(case_id=case_id, filename=filename, has_video=has_video, timestamp=ts)
+    row.update(extra)
+    _append_manifest(row)
+    return filename
+
+
 def _save_capture(case_id: str, image: bytes, video: Optional[bytes]) -> tuple[str, int, bool]:
     images_dir = _case_dir(case_id)
     ts = int(time.time())
@@ -106,6 +174,8 @@ async def auto_capture(
     file: UploadFile = File(...),
     ai_detections: str = Form(...),
     video: Optional[UploadFile] = File(default=None),
+    recording_id: Optional[str] = Form(default=None),
+    video_offset_ms: Optional[str] = Form(default=None),
 ):
     """Called automatically (client-side throttled) whenever the live model
     detects something. Lands as "pending" for a nurse to triage later."""
@@ -113,16 +183,11 @@ async def auto_capture(
     if not image_bytes:
         raise HTTPException(status_code=400, detail="empty image")
     video_bytes = await video.read() if video else None
-    filename, ts, has_video = _save_capture(case_id, image_bytes, video_bytes)
-
-    rows = _read_manifest()
-    rows.append({
-        "case_id": case_id, "filename": filename, "has_video": has_video,
-        "timestamp": ts, "source": "auto", "status": "pending", "noticed_first": "",
-        "bbox_x1": "", "bbox_y1": "", "bbox_x2": "", "bbox_y2": "",
-        "ai_detections": ai_detections, "box_corrected": "",
-    })
-    _write_manifest(rows)
+    filename = await asyncio.to_thread(
+        _save_and_record, case_id, image_bytes, video_bytes,
+        {"source": "auto", "status": "pending", "ai_detections": ai_detections,
+         "recording_id": recording_id or "", "video_offset_ms": video_offset_ms or ""},
+    )
     return {"filename": filename}
 
 
@@ -133,13 +198,14 @@ async def dr_found_capture(
     bbox: Optional[str] = Form(default=None),
     ai_detections: Optional[str] = Form(default=None),
     video: Optional[UploadFile] = File(default=None),
+    recording_id: Optional[str] = Form(default=None),
+    video_offset_ms: Optional[str] = Form(default=None),
 ):
     """Manual capture — a doctor pointed out a polyp the model didn't flag."""
     image_bytes = await file.read()
     if not image_bytes:
         raise HTTPException(status_code=400, detail="empty image")
     video_bytes = await video.read() if video else None
-    filename, ts, has_video = _save_capture(case_id, image_bytes, video_bytes)
 
     x1 = y1 = x2 = y2 = ""
     if bbox:
@@ -150,14 +216,13 @@ async def dr_found_capture(
         except (ValueError, TypeError):
             log.warning("dr_found_capture: could not parse bbox %r", bbox)
 
-    rows = _read_manifest()
-    rows.append({
-        "case_id": case_id, "filename": filename, "has_video": has_video,
-        "timestamp": ts, "source": "manual", "status": "dr_found", "noticed_first": "dr",
-        "bbox_x1": x1, "bbox_y1": y1, "bbox_x2": x2, "bbox_y2": y2,
-        "ai_detections": ai_detections or "", "box_corrected": "",
-    })
-    _write_manifest(rows)
+    filename = await asyncio.to_thread(
+        _save_and_record, case_id, image_bytes, video_bytes,
+        {"source": "manual", "status": "dr_found", "noticed_first": "dr",
+         "bbox_x1": x1, "bbox_y1": y1, "bbox_x2": x2, "bbox_y2": y2,
+         "ai_detections": ai_detections or "",
+         "recording_id": recording_id or "", "video_offset_ms": video_offset_ms or ""},
+    )
     return {"filename": filename}
 
 
@@ -165,7 +230,10 @@ async def dr_found_capture(
 async def get_queue(case_id: Optional[str] = None):
     """Pending auto-captures awaiting review, oldest first. Pass case_id to
     scope to one procedure, or omit for "Feedback mode" browsing across all."""
-    rows = [r for r in _read_manifest() if r["status"] == "pending"]
+    # "dr_found" belongs here too. It was filed and then never surfaced: the
+    # queue only listed "pending", so a doctor flagging something the model
+    # missed saw the capture vanish — the one workflow this feature exists for.
+    rows = [r for r in _read_manifest() if r["status"] in ("pending", "dr_found")]
     if case_id:
         _check_id(case_id, "case_id")
         rows = [r for r in rows if r["case_id"] == case_id]

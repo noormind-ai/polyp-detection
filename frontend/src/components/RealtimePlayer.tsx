@@ -6,7 +6,6 @@ import FeedbackPanel from "./FeedbackPanel";
 import LoginPanel from "./LoginPanel";
 import { useAuth } from "@/lib/auth";
 import { useLanguage } from "@/lib/i18n";
-import { useRollingClip } from "@/lib/useRollingClip";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "";
 // Resolve the socket origin explicitly rather than leaning on a relative
@@ -63,6 +62,13 @@ export default function RealtimePlayer({
   const lastAutoCaptureRef = useRef(0);
   const lastDetectionRef   = useRef(0);     // when a box was last seen
   const inEpisodeRef       = useRef(false); // inside one continuous appearance?
+  // One capture upload at a time. A rolling clip plus its frame is megabytes and
+  // a clinic uplink is not fast: without this, a run of detections queues a dozen
+  // multi-megabyte POSTs that compete with the websocket carrying frames for the
+  // same upstream, inference stalls, and the uploads themselves get abandoned
+  // (nginx logged 81 x 499 and 15 x 408 in one day). Skipping a capture costs
+  // little — an episode that is still on screen files one on the next refresh.
+  const uploadingRef       = useRef(false);
   // Replay reuses one scratch canvas instead of allocating per animation frame —
   // the live loop can get away with allocating because it runs at inference
   // speed (a few per second), replay runs at frame rate.
@@ -94,13 +100,21 @@ export default function RealtimePlayer({
   const [feedbackRefreshKey, setFeedbackRefreshKey] = useState(0);
   const [videoEnded, setVideoEnded]   = useState(false);
   const [aspect, setAspect]           = useState("560/480"); // replaced with the clip's real ratio on load
+  // Confidence gate, client-side and live-adjustable. The server runs the model
+  // at its own low threshold (0.30) and reports every box with its score, so
+  // moving this mid-procedure costs nothing — no round trip, no restart, and it
+  // applies to what is drawn and what is auto-captured alike. A scope that is
+  // noisy today can be tightened without redeploying anything.
+  const [confMin, setConfMin] = useState(0.30);
+  // The capture loop closes over the render it started in and cannot see the
+  // state above.
+  const confMinRef = useRef(0.30);
   const [showDetected, setShowDetected] = useState(true);
   const [showLive, setShowLive]         = useState(true);
   const msHistory = useRef<number[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const lastBoxesRef = useRef<Box[]>([]); // AI's most recent detections — attached as context to manual captures
 
-  const { getClip } = useRollingClip(videoRef.current);
 
   /** True while showing a clip whose detections come from the GPU, live. */
   const liveInference = videoUrl !== null && pred === null;
@@ -189,22 +203,28 @@ export default function RealtimePlayer({
   function captureDrFound() {
     const video = videoRef.current;
     if (!video || !video.videoWidth) return;
+    // Downscale before encoding: a full-resolution JPEG at 0.9 is a synchronous
+    // encode on the same thread as the inference loop, and a bigger upload
+    // behind the frames. A review does not need more than a 960 px edge.
+    const scale = Math.min(1, 960 / Math.max(video.videoWidth, video.videoHeight));
     const cap = document.createElement("canvas");
-    cap.width = video.videoWidth;
-    cap.height = video.videoHeight;
-    cap.getContext("2d")!.drawImage(video, 0, 0);
+    cap.width = Math.round(video.videoWidth * scale);
+    cap.height = Math.round(video.videoHeight * scale);
+    cap.getContext("2d")!.drawImage(video, 0, 0, cap.width, cap.height);
     cap.toBlob(async (blob) => {
       if (!blob) return;
       const fd = new FormData();
       fd.append("file", blob, "frame.jpg");
       fd.append("ai_detections", JSON.stringify(lastBoxesRef.current));
-      const clip = getClip();
-      if (clip) fd.append("video", clip, "clip.webm");
+      // No clip: for a played file the position in that file is the whole
+      // answer, and it costs nothing to send.
+      const v = videoRef.current;
+      if (v) fd.append("video_offset_ms", String(Math.round(v.currentTime * 1000)));
       try {
         await fetch(`${API}/api/feedback/${caseId}/dr-found/capture`, { method: "POST", body: fd });
         setFeedbackRefreshKey((k) => k + 1);
       } catch { /* best-effort */ }
-    }, "image/jpeg", 0.9);
+    }, "image/jpeg", 0.82);
   }
 
   // Auto-capture — the clean (no-overlay) frame that was already grabbed for
@@ -230,6 +250,9 @@ export default function RealtimePlayer({
     } else {
       inEpisodeRef.current = true;
     }
+    // An upload still in flight means the uplink is already busy; filing
+    // another now is what turns a slow link into a stalled page.
+    if (uploadingRef.current) return;
     lastAutoCaptureRef.current = now;
 
     cap.toBlob(async (blob) => {
@@ -237,12 +260,15 @@ export default function RealtimePlayer({
       const fd = new FormData();
       fd.append("file", blob, "frame.jpg");
       fd.append("ai_detections", JSON.stringify(boxes));
-      const clip = getClip();
-      if (clip) fd.append("video", clip, "clip.webm");
+      // No clip: for a played file the position in that file is the whole
+      // answer, and it costs nothing to send.
+      const v = videoRef.current;
+      if (v) fd.append("video_offset_ms", String(Math.round(v.currentTime * 1000)));
+      uploadingRef.current = true;
       try {
         await fetch(`${API}/api/feedback/${caseId}/auto-capture`, { method: "POST", body: fd });
         setFeedbackRefreshKey((k) => k + 1);
-      } catch { /* best-effort — don't interrupt the live loop over this */ }
+      } catch { /* best-effort — don't interrupt the live loop over this */ } finally { uploadingRef.current = false; }
     }, "image/jpeg", 0.85);
   }
 
@@ -285,9 +311,11 @@ export default function RealtimePlayer({
 
       // Draw the frame + its boxes together, win or lose (a timeout leaves the last good frame up)
       if (result) {
-        updateBoxes(result.boxes);
-        drawAnalyzedFrame(cap, result.boxes);
-        maybeAutoCapture(cap, result.boxes);
+        // One gate for both what is shown and what is kept.
+        const shown = result.boxes.filter((b) => b.conf >= confMinRef.current);
+        updateBoxes(shown);
+        drawAnalyzedFrame(cap, shown);
+        maybeAutoCapture(cap, shown);
       }
     }
   }
@@ -577,6 +605,29 @@ export default function RealtimePlayer({
                 own in the side panel, no button needed to go look for it.
                 Kept at the top of the column — it's pressed mid-procedure, so it
                 should never be somewhere you have to look for or scroll to. */}
+            <div className="rounded-xl border border-gray-800 bg-gray-900/60 px-3 py-2 space-y-1">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-gray-400">{t("Confidence threshold")}</span>
+                <span className="font-mono text-gray-200">{Math.round(confMin * 100)}%</span>
+              </div>
+              <input
+                type="range"
+                min={0.05}
+                max={0.95}
+                step={0.05}
+                value={confMin}
+                onChange={(e) => {
+                  const v = Number(e.target.value);
+                  setConfMin(v);
+                  confMinRef.current = v;
+                }}
+                className="w-full accent-blue-500 cursor-pointer"
+              />
+              <p className="text-xs text-gray-500">
+                {t("Only detections at or above this score are boxed and filed.")}
+              </p>
+            </div>
+
             <button
               onClick={captureDrFound}
               className="w-full py-2.5 px-4 rounded-xl bg-emerald-700 hover:bg-emerald-600 text-white font-medium text-sm transition-colors"

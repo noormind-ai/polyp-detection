@@ -132,7 +132,11 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [caseId, setCaseId] = useState<string | null>(null);
   const [backends, setBackends] = useState<BackendInfo | null>(null);
-  const [backend, setBackend] = useState<string>("modal");
+  // Empty until /api/backends answers, and empty means "whatever this
+  // deployment serves" — the server reads INFERENCE_BACKEND. It used to start
+  // on "modal", so a click landing before that fetch resolved asked a CPU-only
+  // box for a GPU it does not have and came back 400, which read as a hang.
+  const [backend, setBackend] = useState<string>("");
   const gtInputRef = useRef<HTMLInputElement>(null);
   const lastActiveRef = useRef<number>(Date.now());
 
@@ -172,6 +176,11 @@ export default function Home() {
   // the next frame eats a cold start.
   useEffect(() => {
     if (gpu !== "ready") return;
+    // CPU-only boxes (the Iran deployment) have no container to release: the
+    // ONNX session lives in the backend process for as long as it runs. Timing
+    // a clinician out mid-procedure there would cost a session and save
+    // nothing, so the timer only exists when a Modal GPU is actually in play.
+    if (backends?.cpu_only || backend.startsWith("cpu:")) return;
     const interval = setInterval(() => {
       if (Date.now() - lastActiveRef.current > MODAL_IDLE_MS) {
         stopGpu();
@@ -180,7 +189,7 @@ export default function Home() {
       }
     }, 5000);
     return () => clearInterval(interval);
-  }, [gpu, stopGpu, t]);
+  }, [gpu, stopGpu, t, backends, backend]);
 
   /** Live capture modes boot the container first and show the warm-up log while it comes up. */
   async function openMode(next: Mode) {
@@ -192,7 +201,9 @@ export default function Home() {
     try {
       // encode: CPU engines carry a colon, as in "cpu:yolo11n"
       const res = await fetch(
-        `${API}/api/session/start?backend=${encodeURIComponent(backend)}`,
+        backend
+          ? `${API}/api/session/start?backend=${encodeURIComponent(backend)}`
+          : `${API}/api/session/start`,
         { method: "POST", credentials: "include" }
       );
       if (!res.ok) {
@@ -320,17 +331,17 @@ export default function Home() {
   return (
     // The player modes lay video and feedback out side by side, so they get the
     // full desktop width; the pickers/upload screens stay narrow and readable.
-    <main className={`min-h-screen bg-gray-950 text-white mx-auto p-8 ${
+    <main className={`min-h-screen bg-gray-950 text-white mx-auto p-4 sm:p-8 ${
       mode && mode !== "upload" && mode !== "recordings" && !blockedOnLogin ? "max-w-[1700px]" : "max-w-4xl"
     }`}>
-      <div className="flex items-start justify-between mb-10">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between mb-6 sm:mb-10">
         <div>
-          <h1 className="text-2xl font-semibold mb-1">{t("Polyp Detection AI")}</h1>
+          <h1 className="text-xl sm:text-2xl font-semibold mb-1">{t("Polyp Detection AI")}</h1>
           <p className="text-gray-500 text-sm">
             {t("Real-time colonoscopy polyp detection · YOLOv5 · Kvasir-SEG · mAP50 0.93")}
           </p>
         </div>
-        <div className="flex gap-2 flex-shrink-0 flex-wrap justify-end items-center">
+        <div className="flex gap-2 flex-shrink-0 flex-wrap justify-start sm:justify-end items-center">
           {user && (
             <span className="text-sm text-gray-500">
               {t("Signed in as {user}", { user })}
@@ -425,7 +436,7 @@ export default function Home() {
           <p className="text-sm text-gray-500">
             {t("Demo clips replay saved results instantly. Live camera and screen share start a GPU when you open them.")}
           </p>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3 sm:gap-4">
             {MODE_CARDS.map((card) => {
               const locked = NEEDS_ACCOUNT.includes(card.key) && !user;
               const startsGpu = NEEDS_GPU.includes(card.key);
@@ -433,19 +444,23 @@ export default function Home() {
                 <button
                   key={card.key}
                   onClick={() => openMode(card.key)}
-                  className={`flex flex-col items-center gap-3 p-8 rounded-xl border-2 border-gray-700 transition-colors text-center ${card.hover}`}
+                  className={`flex flex-row sm:flex-col items-center gap-4 sm:gap-3 p-4 sm:p-8 rounded-xl border-2 border-gray-700 transition-colors text-start sm:text-center ${card.hover}`}
                 >
-                  <span className="text-3xl">{card.icon}</span>
-                  <span className="text-white font-medium">{t(card.title)}</span>
-                  <span className="text-gray-500 text-sm">{t(card.blurb)}</span>
-                  {locked && (
-                    <span className="text-xs text-gray-600">{t("🔒 Sign-in required")}</span>
-                  )}
-                  {startsGpu && (
-                    <span className="text-xs text-gray-600">
-                      {isCpuEngine(backend) ? t("🖥️ Runs on this server's CPU") : t("⚡ Starts a GPU session")}
-                    </span>
-                  )}
+                  <span className="text-3xl flex-shrink-0">{card.icon}</span>
+                  {/* sm:contents dissolves this wrapper above the breakpoint, so
+                      the desktop card is the column of four it always was. */}
+                  <span className="flex flex-col gap-1 min-w-0 sm:contents">
+                    <span className="text-white font-medium">{t(card.title)}</span>
+                    <span className="text-gray-500 text-sm">{t(card.blurb)}</span>
+                    {locked && (
+                      <span className="text-xs text-gray-600">{t("🔒 Sign-in required")}</span>
+                    )}
+                    {startsGpu && (
+                      <span className="text-xs text-gray-600">
+                        {isCpuEngine(backend) ? t("🖥️ Runs on this server's CPU") : t("⚡ Starts a GPU session")}
+                      </span>
+                    )}
+                  </span>
                 </button>
               );
             })}

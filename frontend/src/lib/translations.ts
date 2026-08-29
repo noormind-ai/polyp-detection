@@ -228,6 +228,18 @@ export const FA: Record<string, string> = {
   // Saved-result replay for the bundled demo clips
   "saved results · no GPU": "نتایج ذخیره‌شده · بدون GPU",
   "idle · nothing running": "بی‌کار · چیزی در حال اجرا نیست",
+  "▶ Start procedure": "▶ شروع پروسیجر",
+  "Confidence threshold": "آستانه اطمینان",
+  "⬇ Save to my computer ({size})": "⬇ ذخیره در رایانه من ({size})",
+  "Uploading to the server — keep this tab open. Or save it to your computer now; the upload continues either way.":
+    "در حال بارگذاری روی سرور — این صفحه را باز نگه دارید. یا همین حالا در رایانه خود ذخیره کنید؛ بارگذاری در هر صورت ادامه می‌یابد.",
+  "Only detections at or above this score are boxed and filed.":
+    "فقط مواردی که امتیازشان از این حد بیشتر باشد کادر می‌گیرند و ثبت می‌شوند.",
+  "⏹ Stop auto-capture": "⏹ توقف ثبت خودکار",
+  "Detections are being filed for review.": "موارد شناسایی‌شده برای بازبینی ثبت می‌شوند.",
+  "Detection is running, but nothing is filed until you start.":
+    "تشخیص در حال اجراست، اما تا زمانی که شروع نکنید چیزی ثبت نمی‌شود.",
+  "Position in the session recording": "جایگاه در ویدیوی ضبط‌شده جلسه",
   "Frames replayed": "فریم‌های پخش‌شده",
   "Detections precomputed once — this clip costs no GPU time":
     "تشخیص‌ها یک‌بار از پیش محاسبه شده‌اند — این کلیپ هیچ زمان GPU مصرف نمی‌کند",
@@ -308,6 +320,10 @@ export const FA: Record<string, string> = {
     "رمز عبور جدید",
   "Repeat new password":
     "تکرار رمز عبور جدید",
+  "Enter your username and password.":
+    "نام کاربری و رمز عبور را وارد کنید.",
+  "Choose a password, twice.":
+    "رمز عبور را وارد کنید و یک بار تکرار کنید.",
   "Passwords do not match.":
     "رمز عبورها یکسان نیستند.",
   "At least 12 characters, using three of: lower case, upper case, digits, symbols.":

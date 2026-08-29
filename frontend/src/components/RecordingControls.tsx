@@ -99,6 +99,21 @@ export default function RecordingControls({ recorder, ready }: { recorder: Sessi
         </div>
       )}
 
+      {recorder.localBytes > 0 && (
+        <button
+          onClick={recorder.downloadLocal}
+          className="w-full py-2 px-4 rounded-xl border border-gray-700 text-gray-300 hover:text-white hover:border-gray-500 text-xs font-medium transition-colors"
+        >
+          {t("⬇ Save to my computer ({size})", { size: formatBytes(recorder.localBytes) })}
+        </button>
+      )}
+
+      {recorder.status === "stopping" && (
+        <p className="px-1 text-xs text-gray-500">
+          {t("Uploading to the server — keep this tab open. Or save it to your computer now; the upload continues either way.")}
+        </p>
+      )}
+
       {recorder.error && (
         <p className="px-1 text-xs text-red-400 break-words">{recorder.error}</p>
       )}

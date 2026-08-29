@@ -28,9 +28,10 @@ const API = process.env.NEXT_PUBLIC_API_URL || "";
 /** How much video each upload carries. Short enough that a crash loses little,
  *  long enough that a 40-minute procedure is ~800 requests, not ~24,000. */
 const CHUNK_MS = 3000;
-/** ~19 MB/minute. Plenty for 720p endoscopy video, and it keeps an hour-long
- *  procedure near 1 GB instead of several. */
-const VIDEO_BITS_PER_SECOND = 2_500_000;
+/** ~9 MB/minute. Chunks are now held until the session ends, so this is what
+ *  the browser buffers in memory as well as what lands on disk. 720p endoscopy
+ *  still reads clearly at this rate. */
+const VIDEO_BITS_PER_SECOND = 1_200_000;
 
 const MIME_CANDIDATES = [
   "video/webm;codecs=vp9",
@@ -53,6 +54,17 @@ export interface SessionRecorder {
   stop: () => void;
   /** Bumped once a recording finishes, so a list can refresh itself. */
   finishedCount: number;
+  /** Where we are in the recording right now — which recording, and how many
+   *  ms in. Null when nothing is recording. Read live rather than from state so
+   *  a capture files the instant it happened, not the last rendered value. */
+  mark: () => { recordingId: string; offsetMs: number } | null;
+  /** Save what has been recorded straight to the operator's own disk, with no
+   *  network at all. On a link that uploads slower than the camera records,
+   *  this is the only way to be sure the video is kept — and it works mid
+   *  recording, so a session in progress can always be rescued. */
+  downloadLocal: () => void;
+  /** Bytes held in the browser and downloadable right now. */
+  localBytes: number;
 }
 
 function pickMimeType(): string | null {
@@ -82,6 +94,13 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen",
   const startedAtRef = useRef(0);
   // Uploads are chained onto this so exactly one is ever in flight.
   const queueRef     = useRef<Promise<void>>(Promise.resolve());
+  // Every chunk of the session, kept until Stop. See finalize().
+  const bufferRef    = useRef<Blob[]>([]);
+  // Survives finalize() so the operator can still save a local copy after the
+  // upload has run — or after it has failed.
+  const savedRef     = useRef<Blob[]>([]);
+  const mimeRef      = useRef<string>("video/webm");
+  const [localBytes, setLocalBytes] = useState(0);
   const abortedRef   = useRef(false);
   const finalizedRef = useRef(false);
   // The stop POST needs the case the recording was OPENED under. Reading state
@@ -90,9 +109,9 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen",
 
   const supported = typeof window !== "undefined" && "MediaRecorder" in window;
 
-  const putChunk = useCallback(async (blob: Blob, seq: number) => {
-    if (abortedRef.current || !idRef.current) return;
-    const url = `${API}/api/recordings/${caseRef.current}/${idRef.current}/chunk?seq=${seq}`;
+  const putChunk = useCallback(async (blob: Blob, seq: number, recId: string) => {
+    if (abortedRef.current || !recId) return;
+    const url = `${API}/api/recordings/${caseRef.current}/${recId}/chunk?seq=${seq}`;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const res = await fetch(url, { method: "PUT", body: blob, credentials: "include" });
@@ -135,7 +154,17 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen",
     if (!id) { setStatus("idle"); return; }
 
     setStatus("stopping");
-    await queueRef.current;          // let every pending chunk land first
+    // Chunks were held in memory for the whole session instead of streamed. At
+    // 3s slices the old path pushed ~19 MB/minute up the same uplink that
+    // carries the inference frames — on a link that measures ~100 KB/s it could
+    // never keep up, and everything else queued behind it. Nothing needs the
+    // video until the session is over, so it all goes now, in order.
+    const buffered = bufferRef.current;
+    bufferRef.current = [];
+    savedRef.current = buffered;   // still downloadable after this runs
+    for (let i = 0; i < buffered.length && !abortedRef.current; i++) {
+      await putChunk(buffered[i], i, id);
+    }
     try {
       const body = new FormData();
       body.append("duration_ms", String(Math.round(durationMs)));
@@ -163,6 +192,9 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen",
     finalizedRef.current = false;
     seqRef.current = 0;
     queueRef.current = Promise.resolve();
+    bufferRef.current = [];
+    savedRef.current = [];
+    setLocalBytes(0);
     caseRef.current = caseId;
 
     const track = stream.getVideoTracks()[0];
@@ -185,11 +217,13 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen",
     }
 
     try {
+      mimeRef.current = mimeType;
       const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: VIDEO_BITS_PER_SECOND });
       recorder.ondataavailable = (e) => {
         if (e.data.size === 0 || abortedRef.current) return;
-        const seq = seqRef.current++;
-        queueRef.current = queueRef.current.then(() => putChunk(e.data, seq));
+        bufferRef.current.push(e.data);
+        savedRef.current = bufferRef.current;
+        setLocalBytes(bufferRef.current.reduce((n, b) => n + b.size, 0));
       };
       recorder.onstop = () => { void finalize(Date.now() - startedAtRef.current); };
       startedAtRef.current = Date.now();
@@ -203,6 +237,26 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen",
       void finalize(0);
     }
   }, [caseId, source, stream, putChunk, finalize]);
+
+  const downloadLocal = useCallback(() => {
+    const chunks = savedRef.current;
+    if (chunks.length === 0) return;
+    const blob = new Blob(chunks, { type: mimeRef.current });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `noormind-${caseRef.current}-${idRef.current ?? "session"}.webm`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    // Revoking immediately can cancel the download in some browsers.
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  }, []);
+
+  const mark = useCallback(() => {
+    if (!idRef.current || !startedAtRef.current) return null;
+    return { recordingId: idRef.current, offsetMs: Date.now() - startedAtRef.current };
+  }, []);
 
   const stop = useCallback(() => {
     const recorder = recorderRef.current;
@@ -244,5 +298,6 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen",
     }
   }, []);
 
-  return { status, elapsedMs, uploadedBytes, error, supported, start, stop, finishedCount };
+  return { status, elapsedMs, uploadedBytes, error, supported, start, stop,
+           finishedCount, mark, downloadLocal, localBytes };
 }

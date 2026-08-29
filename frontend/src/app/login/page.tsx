@@ -83,9 +83,9 @@ export default function LoginPage() {
   const go = () => navigate(next ?? "/");
 
   const heading = (
-    <div className="flex items-start justify-between mb-10">
+    <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between mb-6 sm:mb-10">
       <div>
-        <h1 className="text-2xl font-semibold mb-1">{t("Polyp Detection AI")}</h1>
+        <h1 className="text-xl sm:text-2xl font-semibold mb-1">{t("Polyp Detection AI")}</h1>
         <p className="text-gray-500 text-sm">{t("NoorMind")}</p>
       </div>
       <div className="flex items-center gap-2 flex-shrink-0">
@@ -120,7 +120,7 @@ export default function LoginPage() {
         <p className="text-sm text-gray-500">
           {t("You are signed in as {user}. Review access is issued by an administrator.", { user })}
         </p>
-        <div className="flex gap-2 justify-center">
+        <div className="flex flex-wrap gap-2 justify-center">
           <a
             href="/"
             className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-medium transition-colors"
@@ -166,7 +166,7 @@ export default function LoginPage() {
 
   return (
     <main className="min-h-screen bg-gray-950 text-white">
-      <div className="max-w-4xl mx-auto p-8">
+      <div className="max-w-4xl mx-auto p-4 sm:p-8">
         {heading}
         {body}
         <p className="text-center mt-8">
