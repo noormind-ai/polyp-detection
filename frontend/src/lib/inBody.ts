@@ -202,7 +202,11 @@ export function pInBody(f: InBodyFeatures, motion: number | null = null): number
   z += SPREAD_W * ((SPREAD_REF - f.hueSpread) / SPREAD_SIGMA);
 
   if (motion !== null && motion > 0) {
-    z += MOTION_W * ((Math.log10(motion) - MOTION_REF_LOG10) / MOTION_SIGMA_LOG10);
+    // Clamped at zero: stillness argues against a procedure, movement does not
+    // argue for one. A hand-held camera moves more than an endoscope, and on the
+    // first human-labelled out-of-body frames this term was contributing +5.4,
+    // lifting frames that scored 0.005 on colour alone up to 0.53.
+    z += Math.min(0, MOTION_W * ((Math.log10(motion) - MOTION_REF_LOG10) / MOTION_SIGMA_LOG10));
   }
   return sigmoid(z);
 }
@@ -245,7 +249,7 @@ export function explain(f: InBodyFeatures, motion: number | null = null): {
     key: "motion",
     value: motion === null ? "\u2014" : motion.toExponential(1),
     contribution: motion !== null && motion > 0
-      ? MOTION_W * ((Math.log10(motion) - MOTION_REF_LOG10) / MOTION_SIGMA_LOG10)
+      ? Math.min(0, MOTION_W * ((Math.log10(motion) - MOTION_REF_LOG10) / MOTION_SIGMA_LOG10))
       : 0,
   });
 
