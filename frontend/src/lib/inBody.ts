@@ -157,7 +157,20 @@ export function pInBody(f: InBodyFeatures): number {
 }
 
 const ENTER = 0.70;   // raw p above this for DWELL_IN evaluations => inside
-const EXIT = 0.30;    // raw p below this for DWELL_OUT evaluations => outside
+// 0.01, not 0.30. Room footage sits overwhelmingly below 0.01, so dropping the
+// exit threshold costs almost no detection and buys back procedure frames.
+// Measured on 1,556 in-body frames (1,176 from real patient colonoscopies)
+// against 1,354 room frames:
+//
+//     EXIT    in-body muted    room missed
+//     0.30          0.386%         0.369%
+//     0.10          0.257%         2.585%
+//     0.01          0.064%         3.693%   <- knee
+//     0.001         0.064%        62.186%
+//
+// The wide 0.01/0.70 band matches the asymmetry already in the dwell: hard to
+// stop inference, easy to resume.
+const EXIT = 0.01;    // raw p below this for DWELL_OUT evaluations => outside
 // Asymmetric on purpose: the two errors are not equally costly. Declaring
 // out-of-body stops inference, so if it is wrong a real procedure goes unwatched;
 // declaring in-body merely wastes a forward pass on a room. Leaving therefore
