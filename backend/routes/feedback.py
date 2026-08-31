@@ -277,6 +277,34 @@ async def review_capture(
     raise HTTPException(status_code=404, detail="not found")
 
 
+# What a frame IS, as opposed to whether its detection was right. Kept separate
+# from the review verdicts because they answer different questions and are not
+# alternatives -- an out-of-body frame has no polyp verdict to give.
+FRAME_LABELS = {"out_of_body", "noisy"}
+
+
+@router.post("/feedback/{case_id}/{filename}/label")
+async def label_capture(case_id: str, filename: str, label: str = Form(...)):
+    """Label a capture by what the frame is: out-of-body, or too noisy.
+
+    These are the ground truth the out-of-body and quality gates have never had.
+    Every threshold in them so far was fitted against labels inferred from the
+    gates' own features, which is circular; this records a human judgement about
+    frames from the real capture setup instead."""
+    _check_id(case_id, "case_id")
+    _check_id(filename.split(".")[0], "filename")
+    if label not in FRAME_LABELS:
+        raise HTTPException(
+            status_code=400, detail=f"label must be one of {sorted(FRAME_LABELS)}")
+    rows = _read_manifest()
+    for r in rows:
+        if r["case_id"] == case_id and r["filename"] == filename:
+            r["status"] = label
+            _write_manifest(rows)
+            return {"filename": filename, "status": label}
+    raise HTTPException(status_code=404, detail="not found")
+
+
 @router.get("/feedback/list")
 async def list_captures(status: Optional[str] = None, case_id: Optional[str] = None):
     """Reviewed/submitted history — optionally filtered by status

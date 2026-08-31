@@ -409,6 +409,8 @@ export const FA: Record<string, string> = {
   "in body": "داخل بدن",
   "out of body": "خارج از بدن",
   "still image, so no motion": "تصویر ثابت است، بنابراین حرکتی محاسبه نمی‌شود",
+  "🚫 Out of body": "🚫 خارج از بدن",
+  "🌫 Too noisy": "🌫 بیش از حد نویزی",
   "Out-of-body filter": "فیلتر خارج از بدن",
   "Turn off": "خاموش کردن",
   "Turn on": "روشن کردن",

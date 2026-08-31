@@ -189,6 +189,15 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
     await advance(entry, true);
   }
 
+  /** Records what the frame is, rather than whether its box was a polyp. */
+  async function labelFrame(entry: Entry, label: "out_of_body" | "noisy") {
+    const fd = new FormData();
+    fd.append("label", label);
+    await fetch(`${API}/api/feedback/${entry.case_id}/${entry.filename}/label`,
+                { method: "POST", body: fd });
+    await advance(entry, true);
+  }
+
   async function deleteCapture(entry: Entry) {
     await fetch(`${API}/api/feedback/${entry.case_id}/${entry.filename}`, { method: "DELETE" });
     await advance(entry, true);
@@ -202,8 +211,9 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
       onOpen={(e) => setCurrentKey(e.filename)}
       onDelete={deleteCapture}
       onSkip={(e) => advance(e, true)}
-      renderActions={(entry, box, corrected) =>
-        entry.status === "dr_found" ? (
+      renderActions={(entry, box, corrected) => (
+        <div className="space-y-2">
+        {entry.status === "dr_found" ? (
           <div className="grid grid-cols-2 gap-2">
             <button onClick={() => saveDrFoundBox(entry, box)} className="py-2.5 bg-sky-600 hover:bg-sky-500 rounded-xl text-white font-medium text-sm transition-colors">
               {t("💾 Save")}
@@ -221,8 +231,18 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
               {t("✗ Not a polyp")}
             </button>
           </div>
-        )
-      }
+        )}
+
+          <div className="grid grid-cols-2 gap-2">
+            <button onClick={() => labelFrame(entry, "out_of_body")} className="py-2 bg-gray-800 hover:bg-gray-700 rounded-xl text-amber-300 font-medium text-xs transition-colors">
+              {t("🚫 Out of body")}
+            </button>
+            <button onClick={() => labelFrame(entry, "noisy")} className="py-2 bg-gray-800 hover:bg-gray-700 rounded-xl text-orange-300 font-medium text-xs transition-colors">
+              {t("🌫 Too noisy")}
+            </button>
+          </div>
+        </div>
+      )}
       reviewedTitle={t("Already reviewed")}
       reviewedEntries={reviewedEntries}
       onOpenReviewed={(e) => setCurrentKey(e.filename)}
