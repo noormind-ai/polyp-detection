@@ -196,6 +196,10 @@ export const FA: Record<string, string> = {
   "↺ Restart": "↺ از ابتدا",
 
   // Noisy-frame filter — the classical quality gate in front of the AI.
+  "⏹ Stop procedure": "⏹ توقف پروسیجر",
+  "Stopped — nothing is being filed. Press start to resume.": "متوقف شد — چیزی ثبت نمی‌شود. برای ادامه، شروع را بزنید.",
+  "Outside the patient — filing pauses, and resumes on its own.": "خارج از بدن بیمار — ثبت متوقف می‌شود و خودبه‌خود از سر گرفته می‌شود.",
+  "Filing frames for review while the camera is in the colon.": "تا زمانی که دوربین داخل روده است، فریم‌ها برای بازبینی ثبت می‌شوند.",
   "Noisy-frame filter": "فیلتر فریم نویزی",
 
   // Noisy-frame filter: strictness levels.

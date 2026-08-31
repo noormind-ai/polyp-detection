@@ -148,11 +148,14 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // Auto-capture is off until the procedure is explicitly started. Before the
   // scope is in, the camera shows the trolley, the floor, a gloved hand — the
   // model flags things in all of it and the review queue fills with frames no
-  // one wants. The doctor says when the procedure begins.
-  const [procedureStarted, setProcedureStarted] = useState(false);
+  // one wants. That used to be the doctor's call, made by pressing Start; the
+  // out-of-body gate now answers it directly, so filing runs by default and
+  // stops on its own whenever the camera leaves the patient. The button is
+  // only a way to stop early -- during a break, or a stretch nobody wants kept.
+  const [procedureStarted, setProcedureStarted] = useState(true);
   // The capture loop is started once and closes over the render it began in, so
   // it cannot read the state above; it reads this instead.
-  const procedureStartedRef = useRef(false);
+  const procedureStartedRef = useRef(true);
   // Confidence gate, client-side and live-adjustable. The server runs the model
   // at its own low threshold (0.30) and reports every box with its score, so
   // moving this mid-procedure costs nothing — no round trip, no restart, and it
@@ -422,9 +425,13 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // inference, plus what the model saw, plus a rolling clip if available.
   // Throttled so a polyp staying in view for a while doesn't flood the queue.
   function maybeAutoCapture(cap: HTMLCanvasElement, boxes: Box[]) {
-    // Nothing is filed until the procedure has been started. Detection itself
-    // keeps running and stays visible on screen — this only decides whether a
-    // detection is worth keeping.
+    // Filing runs by default and only stops when someone stops it. Detection
+    // itself keeps running and stays visible on screen either way — this only
+    // decides whether a detection is worth keeping.
+    //
+    // Nothing filters for being inside the patient here, and nothing needs to:
+    // an out-of-body frame is dropped by the gate in the capture loop before it
+    // is ever inferred, so it cannot reach this function with boxes on it.
     if (!procedureStartedRef.current) return;
     const now = Date.now();
 
@@ -1145,12 +1152,14 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
                   : "bg-blue-600 hover:bg-blue-500"
               }`}
             >
-              {procedureStarted ? t("⏹ Stop auto-capture") : t("▶ Start procedure")}
+              {procedureStarted ? t("⏹ Stop procedure") : t("▶ Start procedure")}
             </button>
             <p className="text-xs text-gray-500 text-center">
-              {procedureStarted
-                ? t("Detections are being filed for review.")
-                : t("Detection is running, but nothing is filed until you start.")}
+              {!procedureStarted
+                ? t("Stopped — nothing is being filed. Press start to resume.")
+                : inBody.enabled && !inBody.inside
+                  ? t("Outside the patient — filing pauses, and resumes on its own.")
+                  : t("Filing frames for review while the camera is in the colon.")}
             </p>
 
             <div className="rounded-xl border border-gray-800 bg-gray-900/60 px-3 py-2 space-y-1">
