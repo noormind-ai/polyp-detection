@@ -262,7 +262,7 @@ const EXIT = 0.30;    // raw p below this for DWELL_OUT evaluations => outside
 // same gate runs over demo clips people scrub through. 12 evaluations is about
 // 2.5-5 s depending on inference rate, six times more patient than the single
 // second it used to take, and still quick enough to scrub against.
-const DWELL_OUT = 12;
+const DWELL_OUT = 2;
 const DWELL_IN = 2;
 const EMA = 0.4;      // display smoothing only; the decision uses the raw score
 // Inside-vs-outside changes about twice per procedure, so measuring every frame
