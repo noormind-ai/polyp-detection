@@ -48,6 +48,7 @@ export default function InBodyGateNotice({ gate }: { gate: InBodyGateState }) {
         <div dir="ltr" className="rounded-lg border border-gray-800 bg-black/40 px-2 py-1 font-mono text-[11px] text-gray-500 overflow-x-auto whitespace-nowrap">
           red {gate.metrics.redness.toFixed(2)} · redHue {(gate.metrics.hueRedFrac * 100).toFixed(0)}%
           {" · "}spread {gate.metrics.hueSpread.toFixed(0)}°
+          {" · "}blue {gate.metrics.blueRatio.toFixed(2)}
         </div>
       )}
 
