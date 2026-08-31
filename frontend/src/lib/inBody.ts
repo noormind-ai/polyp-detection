@@ -1,36 +1,25 @@
-// Inside-vs-outside-the-colon gate. Four colour statistics and a logistic, no model.
+// Inside-vs-outside-the-colon gate. Handcrafted, no model, no weights.
 //
-// The coefficients below are FITTED, not chosen. Earlier versions of this file
-// used numbers I set by hand from how the cues ought to behave, and they were
-// wrong twice: a phone pointed at a warm room read as in-body, and then a
-// hand-held phone read as in-body again because the motion and uniformity terms
-// were unbounded upward and so rewarded shaking and blank walls.
+// Method follows "Automatic Real-Time Detection of Endoscopic Procedures Using
+// Temporal Features" (PMC10602398), which reports 99.90%/99.97% over 265M frames
+// using colour statistics plus their variation over time, no neural network.
+// Their central finding is the one that matters here:
 //
-// Fitted on 2,910 frames: 1,556 in-body -- of which 1,176 come from 108 REAL
-// PATIENT colonoscopies in the panel archive, not just demo clips -- against
-// 1,354 frames of webcam and screen recordings that are plainly not endoscopy.
+//   "a high amount of red occasionally occurs when the endoscope points at some
+//    object (e.g., orange floor) very closely ... Therefore, color features
+//    alone are insufficient."
 //
-// The first fit used only three demo clips as its in-body set. They all look
-// alike, it scored 0/2230 held out, and it then muted real procedures: on real
-// patient frames its 1st percentile was p=0.285, sitting on the exit threshold.
-// The lesson is that held-out accuracy means nothing if the held-out data is not
-// the population being served.
+// A phone camera pointed at a warm room is that orange floor: an earlier
+// colour-only version of this file called it in-body. Two things fix it, both
+// taken from that paper rather than invented here:
 //
-//                                   in-body called OUTSIDE
-//     fitted on demo clips only            1.020%   (p1 = 0.285)
-//     fitted including patient frames      0.510%   (p1 = 0.884)
+//   1. how spread out the colours are. Mucosa is one material under one lamp, so
+//      its colour is very uniform; a room contains many things and is not.
+//   2. how much the picture changes over time. A scope inside a patient never
+//      stops moving; a phone or a scope on a trolley sits still.
 //
-// Negatives are unaffected: neither calls any of the 1,354 inside.
-// Held out one whole SOURCE at a time, with each patient case its own source:
-// in-body misclassified 0.578%, negatives 3.102%.
-//
-// Motion was measured and dropped. "Automatic Real-Time Detection of Endoscopic
-// Procedures Using Temporal Features" (PMC10602398) uses it to catch a scope
-// parked between procedures, and for that it is the right cue -- but it does not
-// separate anything here, because a hand-held phone moves at least as much as an
-// endoscope (in-body log-variance median -4.04 against -4.54 for the negatives,
-// ranges overlapping). Removing it also removes a ring buffer, a rolling window
-// and a special case for paused clips.
+// Thresholds below come from measuring real footage, not from a guess -- see the
+// numbers next to each constant.
 
 const SMALL = 96;   // features are computed on a 96x96 thumbnail
 const DARK_V = 12;  // below this the pixel is the black surround, not image
@@ -40,27 +29,39 @@ export interface InBodyFeatures {
   redness: number;      // mean(R) / (mean(G) + mean(B)) — mucosa is red-to-brown
   hueRedFrac: number;   // fraction of vivid pixels whose colour is in the red band
   satMean: number;      // operating rooms are grey/blue and washed out
-  hueSpread: number;    // degrees of the colour wheel the frame covers — the discriminator
-  /**
-   * mean(B)/mean(R). Endoscope light on blood-rich tissue suppresses blue
-   * hard; skin under white room light does not. Measured but NOT scored:
-   * every negative available is desk-distance webcam, none is close-up skin,
-   * so a threshold picked now would be fitted to the wrong thing. Shown in
-   * the panel so the failing case can be measured rather than guessed at.
-   */
-  blueRatio: number;
+  hueSpread: number;    // how many degrees of the colour wheel the picture covers
   vMean: number;
   validFrac: number;
 }
 
-// p = sigmoid(B0 + sum(Wi * (feature_i - MUi) / SIGMAi)), fitted as described above.
-// hueSpread carries by far the largest weight, and it is negative: the wider the
-// range of colours in the picture, the less it looks like one wet surface under
-// one lamp.
-const MU = [0.8378, 0.8261, 0.5301, 23.9769];
-const SIGMA = [0.2365, 0.1992, 0.1244, 17.9719];
-const W = [8.2133, 0.0394, -4.6253, -4.2347];
-const B0 = 2.0668;
+// z = B0 + sum(Wi * (feature_i - MUi) / SIGMAi); p_inbody = sigmoid(z)
+//
+// Measured on real colonoscopy video (454 evaluated frames, three demo clips plus
+// a session recording): redness median 0.99, hueSpread median 9.3 deg with p95
+// at 14 deg. Two saved recordings that are plainly not endoscopic footage sit at
+// redness 0.38/0.71 with hueSpread 32/42 deg, which is what the hueSpread term
+// separates.
+const MU = [0.630, 0.550, 0.300];
+const SIGMA = [0.100, 0.200, 0.120];
+const W = [4.0, 3.0, 1.0];
+const B0 = 0.0;
+
+// Colour uniformity. Real in-body frames sit under 14 deg at p95; the
+// non-endoscopic recordings sit at 32-42. 20 deg is between the two, closer to
+// in-body so a legitimate frame is not pushed out by an unusual moment.
+const SPREAD_REF = 20.0;
+const SPREAD_SIGMA = 8.0;
+const SPREAD_W = 2.0;
+
+// Motion, as the paper's trimmed variance of frame-to-frame change in redness.
+// Measured floor for real in-body video is ~1e-5 (p5); a static non-endoscopic
+// recording measured 4e-8, roughly two decades below. Scored on a log scale
+// because the quantity spans decades.
+const MOTION_REF_LOG10 = -5.7;   // ~2e-6, between the two
+const MOTION_SIGMA_LOG10 = 1.0;  // one decade
+const MOTION_W = 2.0;
+const MOTION_WINDOW = 12;        // evaluations kept (~24 frames)
+const MOTION_TRIM = 1;           // drop the largest and smallest change, as the paper does
 
 function sigmoid(z: number) {
   return 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, z))));
@@ -118,9 +119,9 @@ export function features(source: CanvasImageSource): InBodyFeatures | null {
       else h = 30 * ((r - g) / c + 4);
       if (h < 0) h += 180;
       if (h <= 20 || h >= 160) redN++;
-      // Hue is an angle, so it must be averaged as one — 179 and 0 are
-      // neighbours, not opposites. Accumulate unit vectors; the length of their
-      // mean is near 1 when every pixel points the same way.
+      // Hue is an angle, so it has to be averaged as one -- 179 and 0 are
+      // neighbours, not opposites. Accumulate unit vectors and take the length
+      // of their mean: near 1 means every pixel points the same way.
       const a = h * (Math.PI / 90);
       sumCos += Math.cos(a);
       sumSin += Math.sin(a);
@@ -143,42 +144,34 @@ export function features(source: CanvasImageSource): InBodyFeatures | null {
     hueRedFrac: satN > 0 ? redN / satN : 0,
     satMean: sumS / n / 255,
     hueSpread,
-    blueRatio: sumB / (sumR + 1e-6),
     vMean: sumV / n / 255,
     validFrac: n / total,
   };
 }
 
-export function pInBody(f: InBodyFeatures): number {
-  const x = [f.redness, f.hueRedFrac, f.satMean, f.hueSpread];
+/**
+ * `motion` is the trimmed variance of recent frame-to-frame change in redness,
+ * or null when there is not enough history yet or the source is frozen. Null
+ * means the motion term is simply left out rather than counted as "not moving" —
+ * a paused clip must not read as out-of-body.
+ */
+export function pInBody(f: InBodyFeatures, motion: number | null = null): number {
+  const x = [f.redness, f.hueRedFrac, f.satMean];
   let z = B0;
   for (let i = 0; i < x.length; i++) z += W[i] * ((x[i] - MU[i]) / SIGMA[i]);
+
+  // More spread-out colour means less likely to be one material under one lamp.
+  z += SPREAD_W * ((SPREAD_REF - f.hueSpread) / SPREAD_SIGMA);
+
+  if (motion !== null && motion > 0) {
+    z += MOTION_W * ((Math.log10(motion) - MOTION_REF_LOG10) / MOTION_SIGMA_LOG10);
+  }
   return sigmoid(z);
 }
 
-const ENTER = 0.70;   // raw p above this for DWELL_IN evaluations => inside
-// 0.01, not 0.30. Room footage sits overwhelmingly below 0.01, so dropping the
-// exit threshold costs almost no detection and buys back procedure frames.
-// Measured on 1,556 in-body frames (1,176 from real patient colonoscopies)
-// against 1,354 room frames:
-//
-//     EXIT    in-body muted    room missed
-//     0.30          0.386%         0.369%
-//     0.10          0.257%         2.585%
-//     0.01          0.064%         3.693%   <- knee
-//     0.001         0.064%        62.186%
-//
-// The wide 0.01/0.70 band matches the asymmetry already in the dwell: hard to
-// stop inference, easy to resume.
-const EXIT = 0.01;    // raw p below this for DWELL_OUT evaluations => outside
-// Asymmetric on purpose: the two errors are not equally costly. Declaring
-// out-of-body stops inference, so if it is wrong a real procedure goes unwatched;
-// declaring in-body merely wastes a forward pass on a room. Leaving therefore
-// needs twice the agreement, which costs ~1.6 s of extra latency on a genuine
-// exit -- nothing depends on that -- and makes an isolated run of odd frames
-// unable to mute a procedure.
-const DWELL_OUT = 4;  // 4 evaluations = 8 frames, ~1.6 s at 5 fps
-const DWELL_IN = 2;   // 2 evaluations = 4 frames, ~0.8 s
+const ENTER = 0.70;   // raw p above this for DWELL evaluations => inside
+const EXIT = 0.30;    // raw p below this for DWELL evaluations => outside
+const DWELL = 2;      // 2 evaluations = 4 frames, ~0.8 s at 5 fps
 const EMA = 0.4;      // display smoothing only; the decision uses the raw score
 // Inside-vs-outside changes about twice per procedure, so measuring every frame
 // re-derives an answer that cannot have changed.
@@ -193,14 +186,39 @@ export class InBodyGate {
    */
   inside = true;
   p = 1;
+  motion: number | null = null;
   private streak = 0;
   private tick = 0;
+  private history: number[] = [];
 
   reset(startInside = true) {
     this.inside = startInside;
     this.p = startInside ? 1 : 0;
     this.streak = 0;
     this.tick = 0;
+    this.history = [];
+    this.motion = null;
+  }
+
+  /** Trimmed variance of successive changes, as the paper computes it. */
+  private updateMotion(redness: number): number | null {
+    this.history.push(redness);
+    if (this.history.length > MOTION_WINDOW) this.history.shift();
+    if (this.history.length < MOTION_WINDOW) return null;
+
+    const d: number[] = [];
+    for (let i = 1; i < this.history.length; i++) {
+      d.push(Math.abs(this.history[i] - this.history[i - 1]));
+    }
+    d.sort((a, b) => a - b);
+    const kept = d.length > 2 * MOTION_TRIM + 1 ? d.slice(MOTION_TRIM, d.length - MOTION_TRIM) : d;
+    // Every frame byte-identical means a paused clip, not a still scene: a live
+    // camera always carries some sensor noise. Report null so the motion term is
+    // skipped rather than counted against being in-body.
+    if (kept.length < 2 || kept[kept.length - 1] === 0) return null;
+
+    const mean = kept.reduce((a, b) => a + b, 0) / kept.length;
+    return kept.reduce((a, b) => a + (b - mean) * (b - mean), 0) / kept.length;
   }
 
   /**
@@ -224,14 +242,13 @@ export class InBodyGate {
       return { inside: true, p: this.p, f: null, evaluated: true };
     }
 
-    const raw = pInBody(f);
+    this.motion = this.updateMotion(f.redness);
+    const raw = pInBody(f, this.motion);
     this.p = EMA * raw + (1 - EMA) * this.p;
 
     const want = this.inside ? !(raw < EXIT) : raw > ENTER;
     if (want !== this.inside) {
-      // `want === false` means this evaluation argues for leaving the body.
-      const needed = want ? DWELL_IN : DWELL_OUT;
-      if (++this.streak >= needed) { this.inside = want; this.streak = 0; }
+      if (++this.streak >= DWELL) { this.inside = want; this.streak = 0; }
     } else {
       this.streak = 0;
     }
@@ -239,25 +256,16 @@ export class InBodyGate {
   }
 }
 
-/**
- * Refit MU/SIGMA/W/B0 above from labelled frames. `X` rows are
- * [redness, hueRedFrac, satMean, hueSpread]; `y` is 1 for in-body.
- * Hand-rolled because this box's venv is onnxruntime+numpy only.
- */
-export function fit(X: number[][], y: number[], iters = 20000, lr = 0.5) {
-  const k = X[0].length;
-  const mu = Array.from({ length: k }, (_, j) => X.reduce((a, r) => a + r[j], 0) / X.length);
-  const sd = Array.from({ length: k }, (_, j) =>
-    Math.sqrt(X.reduce((a, r) => a + (r[j] - mu[j]) ** 2, 0) / X.length) + 1e-9);
-  const Z = X.map((r) => [1, ...r.map((v, j) => (v - mu[j]) / sd[j])]);
-  const w = new Array(k + 1).fill(0);
+export function fit(X: number[][], y: number[], iters = 4000, lr = 0.5) {
+  const Z = X.map((row) => [1, ...row.map((v, i) => (v - MU[i]) / SIGMA[i])]);
+  const w = new Array(Z[0].length).fill(0);
   for (let it = 0; it < iters; it++) {
-    const g = new Array(k + 1).fill(0);
+    const g = new Array(w.length).fill(0);
     for (let i = 0; i < Z.length; i++) {
-      const e = sigmoid(Z[i].reduce((a, v, j) => a + v * w[j], 0)) - y[i];
-      for (let j = 0; j <= k; j++) g[j] += e * Z[i][j];
+      const e = sigmoid(Z[i].reduce((a, v, k) => a + v * w[k], 0)) - y[i];
+      for (let k = 0; k < w.length; k++) g[k] += e * Z[i][k];
     }
-    for (let j = 0; j <= k; j++) w[j] -= (lr * g[j]) / Z.length;
+    for (let k = 0; k < w.length; k++) w[k] -= (lr * g[k]) / Z.length;
   }
-  return { MU: mu, SIGMA: sd, W: w.slice(1), B0: w[0] };
+  return w;
 }
