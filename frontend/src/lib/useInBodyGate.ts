@@ -23,7 +23,6 @@ export interface InBodyGateState {
   p: number;
   /** Last measured cues and motion, for the diagnostics line. */
   metrics: InBodyFeatures | null;
-  motion: number | null;
   skipped: number;      // frames not sent because the scope was out of body
   events: InBodyEvent[];
   /** Call with the frame about to be sent. False => skip it, don't infer. */
@@ -48,7 +47,6 @@ export function useInBodyGate(): InBodyGateState {
   const [inside, setInside] = useState(true);
   const [p, setP] = useState(1);
   const [metrics, setMetrics] = useState<InBodyFeatures | null>(null);
-  const [motion, setMotion] = useState<number | null>(null);
   const [skipped, setSkipped] = useState(0);
   const [events, setEvents] = useState<InBodyEvent[]>([]);
   const gateRef = useRef<InBodyGate | null>(null);
@@ -95,7 +93,6 @@ export function useInBodyGate(): InBodyGateState {
       lastUi.current = t;
       setP(prob);
       setMetrics(f);
-      setMotion(gate.motion);
       setSkipped(skippedRef.current);
     }
     if (now !== was) {
@@ -113,7 +110,7 @@ export function useInBodyGate(): InBodyGateState {
     return now;
   }, []);
 
-  return { enabled, setEnabled, inside, p, metrics, motion, skipped, events, shouldInfer, reset };
+  return { enabled, setEnabled, inside, p, metrics, skipped, events, shouldInfer, reset };
 }
 
 function logTransition(inside: boolean, p: number, f: InBodyFeatures | null) {
