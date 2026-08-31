@@ -24,6 +24,14 @@
 const SMALL = 96;   // features are computed on a 96x96 thumbnail
 const DARK_V = 12;  // below this the pixel is the black surround, not image
 const SAT_MIN = 40; // unsaturated pixels have a meaningless hue
+// Mean brightness below which a frame cannot be in-body. HSV saturation is
+// (V - min) / V, so near V = 0 a pixel three units off neutral reports as
+// vividly coloured -- dark sensor noise reads as perfect mucosa, and a
+// near-black frame with a faint warm cast scored p = 0.9986 before this.
+// Across 1,443 real in-body frames the darkest averaged V = 70, p1 was 92 and
+// the median 162, so 50 clears the darkest real frame by 20 and cannot be
+// reached by genuine footage.
+const BRIGHT_MIN = 50;
 
 export interface InBodyFeatures {
   redness: number;      // mean(R) / (mean(G) + mean(B)) — mucosa is red-to-brown
@@ -129,9 +137,13 @@ export function features(source: CanvasImageSource): InBodyFeatures | null {
   }
 
   const total = d.length / 4;
-  // A genuinely dark frame leaves nothing to measure. Fail open rather than
-  // reporting a confident zero on no evidence.
-  if (n < 0.05 * total) return null;
+  // Almost nothing above the black floor: a capped lens or a dead feed. Reported
+  // with vMean = 0 rather than refused, so the brightness rule in pInBody can act
+  // on it. Returning null here would instead force "inside", which is how a black
+  // screen used to be treated as in-body.
+  if (n === 0 || n < 0.05 * total) {
+    return { redness: 0, hueRedFrac: 0, satMean: 0, hueSpread: 180, vMean: 0, validFrac: n / total };
+  }
 
   let hueSpread = 0;
   if (satN > 10) {
@@ -156,6 +168,11 @@ export function features(source: CanvasImageSource): InBodyFeatures | null {
  * a paused clip must not read as out-of-body.
  */
 export function pInBody(f: InBodyFeatures, motion: number | null = null): number {
+  // Checked before anything else: below this the colour cues are not merely weak
+  // but actively misleading, since saturation and hue are computed from
+  // differences of near-zero channels.
+  if (f.vMean * 255 < BRIGHT_MIN) return 0;
+
   const x = [f.redness, f.hueRedFrac, f.satMean];
   let z = B0;
   for (let i = 0; i < x.length; i++) z += W[i] * ((x[i] - MU[i]) / SIGMA[i]);
