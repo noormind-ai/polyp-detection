@@ -6,18 +6,23 @@
 // hand-held phone read as in-body again because the motion and uniformity terms
 // were unbounded upward and so rewarded shaking and blank walls.
 //
-// Fitted on 2,230 evaluated frames from 10 real sources on this server -- three
-// colonoscopy clips plus a session recording (320 in-body frames), and six
-// webcam/screen recordings that are plainly not endoscopy (1,910 frames).
-// Validated by holding out one whole SOURCE at a time, never single frames,
-// since frames from one clip are near-duplicates:
+// Fitted on 2,910 frames: 1,556 in-body -- of which 1,176 come from 108 REAL
+// PATIENT colonoscopies in the panel archive, not just demo clips -- against
+// 1,354 frames of webcam and screen recordings that are plainly not endoscopy.
 //
-//     pooled held-out error 0/2230, worst source 1.0000
-//     min p over in-body frames 0.943   max p over negatives 0.038
+// The first fit used only three demo clips as its in-body set. They all look
+// alike, it scored 0/2230 held out, and it then muted real procedures: on real
+// patient frames its 1st percentile was p=0.285, sitting on the exit threshold.
+// The lesson is that held-out accuracy means nothing if the held-out data is not
+// the population being served.
 //
-// The discriminator is hueSpread, by a distance: in-body 7.6-14 degrees against
-// 30-47 for everything else, and it alone scores 0/2230 held out. The other three
-// are kept as support so the verdict does not rest on a single number.
+//                                   in-body called OUTSIDE
+//     fitted on demo clips only            1.020%   (p1 = 0.285)
+//     fitted including patient frames      0.510%   (p1 = 0.884)
+//
+// Negatives are unaffected: neither calls any of the 1,354 inside.
+// Held out one whole SOURCE at a time, with each patient case its own source:
+// in-body misclassified 0.578%, negatives 3.102%.
 //
 // Motion was measured and dropped. "Automatic Real-Time Detection of Endoscopic
 // Procedures Using Temporal Features" (PMC10602398) uses it to catch a scope
@@ -52,10 +57,10 @@ export interface InBodyFeatures {
 // hueSpread carries by far the largest weight, and it is negative: the wider the
 // range of colours in the picture, the less it looks like one wet surface under
 // one lamp.
-const MU = [0.7227, 0.7127, 0.5105, 37.7218];
-const SIGMA = [0.1662, 0.1690, 0.0977, 12.2064];
-const W = [2.4382, 1.2071, -0.3035, -5.6282];
-const B0 = -7.4844;
+const MU = [0.8378, 0.8261, 0.5301, 23.9769];
+const SIGMA = [0.2365, 0.1992, 0.1244, 17.9719];
+const W = [8.2133, 0.0394, -4.6253, -4.2347];
+const B0 = 2.0668;
 
 function sigmoid(z: number) {
   return 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, z))));
@@ -151,9 +156,16 @@ export function pInBody(f: InBodyFeatures): number {
   return sigmoid(z);
 }
 
-const ENTER = 0.70;   // raw p above this for DWELL evaluations => inside
-const EXIT = 0.30;    // raw p below this for DWELL evaluations => outside
-const DWELL = 2;      // 2 evaluations = 4 frames, ~0.8 s at 5 fps
+const ENTER = 0.70;   // raw p above this for DWELL_IN evaluations => inside
+const EXIT = 0.30;    // raw p below this for DWELL_OUT evaluations => outside
+// Asymmetric on purpose: the two errors are not equally costly. Declaring
+// out-of-body stops inference, so if it is wrong a real procedure goes unwatched;
+// declaring in-body merely wastes a forward pass on a room. Leaving therefore
+// needs twice the agreement, which costs ~1.6 s of extra latency on a genuine
+// exit -- nothing depends on that -- and makes an isolated run of odd frames
+// unable to mute a procedure.
+const DWELL_OUT = 4;  // 4 evaluations = 8 frames, ~1.6 s at 5 fps
+const DWELL_IN = 2;   // 2 evaluations = 4 frames, ~0.8 s
 const EMA = 0.4;      // display smoothing only; the decision uses the raw score
 // Inside-vs-outside changes about twice per procedure, so measuring every frame
 // re-derives an answer that cannot have changed.
@@ -204,7 +216,9 @@ export class InBodyGate {
 
     const want = this.inside ? !(raw < EXIT) : raw > ENTER;
     if (want !== this.inside) {
-      if (++this.streak >= DWELL) { this.inside = want; this.streak = 0; }
+      // `want === false` means this evaluation argues for leaving the body.
+      const needed = want ? DWELL_IN : DWELL_OUT;
+      if (++this.streak >= needed) { this.inside = want; this.streak = 0; }
     } else {
       this.streak = 0;
     }
