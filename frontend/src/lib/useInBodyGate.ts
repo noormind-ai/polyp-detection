@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { InBodyGate, type InBodyFeatures } from "./inBody";
+import { InBodyGate, explain, type InBodyFeatures, type Term } from "./inBody";
 
 const STORAGE_KEY = "polyp_inbody_filter";
 const MAX_EVENTS = 12;
@@ -24,6 +24,10 @@ export interface InBodyGateState {
   /** Last measured cues and motion, for the diagnostics line. */
   metrics: InBodyFeatures | null;
   motion: number | null;
+  /** Per-term breakdown of the current score, for the panel. */
+  terms: Term[];
+  z: number;
+  tooDark: boolean;
   skipped: number;      // frames not sent because the scope was out of body
   events: InBodyEvent[];
   /** Call with the frame about to be sent. False => skip it, don't infer. */
@@ -49,6 +53,9 @@ export function useInBodyGate(): InBodyGateState {
   const [p, setP] = useState(1);
   const [metrics, setMetrics] = useState<InBodyFeatures | null>(null);
   const [motion, setMotion] = useState<number | null>(null);
+  const [terms, setTerms] = useState<Term[]>([]);
+  const [z, setZ] = useState(0);
+  const [tooDark, setTooDark] = useState(false);
   const [skipped, setSkipped] = useState(0);
   const [events, setEvents] = useState<InBodyEvent[]>([]);
   const gateRef = useRef<InBodyGate | null>(null);
@@ -96,6 +103,12 @@ export function useInBodyGate(): InBodyGateState {
       setP(prob);
       setMetrics(f);
       setMotion(gate.motion);
+      if (f) {
+        const e = explain(f, gate.motion);
+        setTerms(e.terms);
+        setZ(e.z);
+        setTooDark(e.tooDark);
+      }
       setSkipped(skippedRef.current);
     }
     if (now !== was) {
@@ -113,7 +126,8 @@ export function useInBodyGate(): InBodyGateState {
     return now;
   }, []);
 
-  return { enabled, setEnabled, inside, p, metrics, motion, skipped, events, shouldInfer, reset };
+  return { enabled, setEnabled, inside, p, metrics, motion, terms, z, tooDark,
+           skipped, events, shouldInfer, reset };
 }
 
 function logTransition(inside: boolean, p: number, f: InBodyFeatures | null) {

@@ -404,6 +404,8 @@ export const FA: Record<string, string> = {
     "این حساب با رمز عبور یک‌بارمصرف ساخته شده است. پیش از ادامه، رمز عبور خود را تعیین کنید.",
   "Repeat password": "تکرار رمز عبور",
   // Out-of-body filter — the colour gate in front of the detector.
+  "too dark to judge colour → outside": "تصویر برای قضاوت رنگ بیش از حد تاریک است → خارج از بدن",
+  "green pushes inside · amber pushes outside": "سبز به سمت داخل بدن · کهربایی به سمت خارج از بدن",
   "Out-of-body filter": "فیلتر خارج از بدن",
   "Turn off": "خاموش کردن",
   "Turn on": "روشن کردن",

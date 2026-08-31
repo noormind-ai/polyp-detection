@@ -32,9 +32,19 @@ const SAT_MIN = 40; // unsaturated pixels have a meaningless hue
 // the median 162, so 50 clears the darkest real frame by 20 and cannot be
 // reached by genuine footage.
 const BRIGHT_MIN = 50;
+// The paper counts a pixel toward mean-normalized-red only when r, g AND b
+// all clear a floor, which is stricter than the value-channel mask used for
+// the hue statistics.
+const VALID_FLOOR = 12;
 
 export interface InBodyFeatures {
-  redness: number;      // mean(R) / (mean(G) + mean(B)) — mucosa is red-to-brown
+  /**
+   * The paper's mean-normalized-red: mean over valid pixels of
+   * 255*r/(r+g+b). Roughly 127 on mucosa and 107-117 on room footage.
+   * Preferred over a ratio of channel averages because every pixel counts
+   * equally, so a few specular highlights cannot swing the frame.
+   */
+  redness: number;
   hueRedFrac: number;   // fraction of vivid pixels whose colour is in the red band
   satMean: number;      // operating rooms are grey/blue and washed out
   hueSpread: number;    // how many degrees of the colour wheel the picture covers
@@ -49,8 +59,11 @@ export interface InBodyFeatures {
 // at 14 deg. Two saved recordings that are plainly not endoscopic footage sit at
 // redness 0.38/0.71 with hueSpread 32/42 deg, which is what the hueSpread term
 // separates.
-const MU = [0.630, 0.550, 0.300];
-const SIGMA = [0.100, 0.200, 0.120];
+// MU[0]/SIGMA[0] are the old 0.630/0.100 translated onto the paper's scale by
+// the measured slope of 77.9 paper-units per unit of the old redness, so the
+// term behaves as before while using the better-conditioned formula.
+const MU = [100.0, 0.550, 0.300];
+const SIGMA = [7.8, 0.200, 0.120];
 const W = [4.0, 3.0, 1.0];
 const B0 = 0.0;
 
@@ -103,6 +116,9 @@ export function features(source: CanvasImageSource): InBodyFeatures | null {
   const d = img.data;
 
   let n = 0, sumR = 0, sumG = 0, sumB = 0, sumS = 0, sumV = 0;
+  // Separate accumulator: mean-normalized-red is a mean of per-pixel ratios,
+  // not a ratio of the sums above, and it uses the stricter pixel test.
+  let normRedN = 0, sumNormRed = 0;
   let satN = 0, redN = 0, sumCos = 0, sumSin = 0;
 
   for (let i = 0; i < d.length; i += 4) {
@@ -115,6 +131,11 @@ export function features(source: CanvasImageSource): InBodyFeatures | null {
     const s = ((v - min) * 255) / v;
 
     n++; sumR += r; sumG += g; sumB += b; sumS += s; sumV += v;
+
+    if (r >= VALID_FLOOR && g >= VALID_FLOOR && b >= VALID_FLOOR) {
+      normRedN++;
+      sumNormRed += Math.floor((255 * r) / (r + g + b));
+    }
 
     if (s > SAT_MIN) {
       satN++;
@@ -152,7 +173,7 @@ export function features(source: CanvasImageSource): InBodyFeatures | null {
   }
 
   return {
-    redness: sumR / (sumG + sumB + 1e-6),
+    redness: normRedN > 0 ? sumNormRed / normRedN : 0,
     hueRedFrac: satN > 0 ? redN / satN : 0,
     satMean: sumS / n / 255,
     hueSpread,
@@ -186,9 +207,63 @@ export function pInBody(f: InBodyFeatures, motion: number | null = null): number
   return sigmoid(z);
 }
 
-const ENTER = 0.70;   // raw p above this for DWELL evaluations => inside
-const EXIT = 0.30;    // raw p below this for DWELL evaluations => outside
-const DWELL = 2;      // 2 evaluations = 4 frames, ~0.8 s at 5 fps
+/** One term of the score: what it measured, and what that did to the verdict. */
+export interface Term {
+  key: string;
+  /** The cue as measured, already formatted for display. */
+  value: string;
+  /** Signed push on the score. Positive argues in-body, negative argues out. */
+  contribution: number;
+}
+
+/**
+ * The same arithmetic pInBody performs, itemised.
+ *
+ * Deliberately a separate function rather than pInBody returning both: the gate
+ * runs on every evaluated frame and must not pay for formatting, while this is
+ * called only when the panel refreshes.
+ */
+export function explain(f: InBodyFeatures, motion: number | null = null): {
+  terms: Term[]; z: number; p: number; tooDark: boolean;
+} {
+  const tooDark = f.vMean * 255 < BRIGHT_MIN;
+  const x = [f.redness, f.hueRedFrac, f.satMean];
+  const labels = ["red", "redHue", "sat"];
+  const shown = [f.redness.toFixed(0), `${(f.hueRedFrac * 100).toFixed(0)}%`, f.satMean.toFixed(2)];
+
+  const terms: Term[] = x.map((v, i) => ({
+    key: labels[i],
+    value: shown[i],
+    contribution: W[i] * ((v - MU[i]) / SIGMA[i]),
+  }));
+  terms.push({
+    key: "spread",
+    value: `${f.hueSpread.toFixed(0)}\u00b0`,
+    contribution: SPREAD_W * ((SPREAD_REF - f.hueSpread) / SPREAD_SIGMA),
+  });
+  terms.push({
+    key: "motion",
+    value: motion === null ? "\u2014" : motion.toExponential(1),
+    contribution: motion !== null && motion > 0
+      ? MOTION_W * ((Math.log10(motion) - MOTION_REF_LOG10) / MOTION_SIGMA_LOG10)
+      : 0,
+  });
+
+  const z = tooDark ? -30 : B0 + terms.reduce((a, t) => a + t.contribution, 0);
+  return { terms, z, p: tooDark ? 0 : sigmoid(z), tooDark };
+}
+
+const ENTER = 0.70;   // raw p above this for DWELL_IN evaluations => inside
+const EXIT = 0.30;    // raw p below this for DWELL_OUT evaluations => outside
+// Leaving takes longer than returning, because the two errors are not equally
+// costly: declaring out-of-body stops inference, declaring in-body only wastes a
+// forward pass. The paper is far more extreme -- it requires 90% of the past
+// FIVE MINUTES before it will call an exit -- which is unusable here, since the
+// same gate runs over demo clips people scrub through. 12 evaluations is about
+// 2.5-5 s depending on inference rate, six times more patient than the single
+// second it used to take, and still quick enough to scrub against.
+const DWELL_OUT = 12;
+const DWELL_IN = 2;
 const EMA = 0.4;      // display smoothing only; the decision uses the raw score
 // Inside-vs-outside changes about twice per procedure, so measuring every frame
 // re-derives an answer that cannot have changed.
@@ -265,7 +340,9 @@ export class InBodyGate {
 
     const want = this.inside ? !(raw < EXIT) : raw > ENTER;
     if (want !== this.inside) {
-      if (++this.streak >= DWELL) { this.inside = want; this.streak = 0; }
+      // want === false means this evaluation argues for leaving the body.
+      const needed = want ? DWELL_IN : DWELL_OUT;
+      if (++this.streak >= needed) { this.inside = want; this.streak = 0; }
     } else {
       this.streak = 0;
     }
