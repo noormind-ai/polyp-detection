@@ -2,6 +2,8 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useLanguage } from "@/lib/i18n";
+import { features, explain } from "@/lib/inBody";
+import ScoreChips from "./ScoreChips";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "";
 
@@ -281,6 +283,10 @@ function ReviewCard({ entry, onSkip, renderActions }: {
   const [dragStart, setDragStart] = useState<[number, number] | null>(null);
   const [moveOffset, setMoveOffset] = useState<[number, number] | null>(null);
   const [imgNatural, setImgNatural] = useState({ w: 0, h: 0 });
+  // What the out-of-body gate makes of this filed frame. Computed here rather
+  // than stored at capture time so old captures get it too, and so it always
+  // reflects the gate as it is now rather than as it was that day.
+  const [gateScore, setGateScore] = useState<ReturnType<typeof explain> | null>(null);
   const originalBoxRef = useRef<UserBox | null>(null);
 
   const aiBoxes: Box[] = useMemo(() => { try { return JSON.parse(entry.ai_detections || "[]"); } catch { return []; } }, [entry.ai_detections]);
@@ -353,7 +359,21 @@ function ReviewCard({ entry, onSkip, renderActions }: {
           alt=""
           draggable={false}
           className="w-full h-auto block cursor-crosshair select-none"
-          onLoad={(e) => setImgNatural({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })}
+          onLoad={(e) => {
+            const img = e.currentTarget;
+            setImgNatural({ w: img.naturalWidth, h: img.naturalHeight });
+            // Same-origin, so the canvas stays readable.
+            try {
+              const c = document.createElement("canvas");
+              c.width = img.naturalWidth;
+              c.height = img.naturalHeight;
+              c.getContext("2d")!.drawImage(img, 0, 0);
+              const f = features(c);
+              setGateScore(f ? explain(f) : null);
+            } catch {
+              setGateScore(null);
+            }
+          }}
           onDragStart={(e) => e.preventDefault()}
           onMouseDown={handleMouseDown}
           onMouseMove={handleMouseMove}
@@ -377,6 +397,16 @@ function ReviewCard({ entry, onSkip, renderActions }: {
           );
         })()}
       </div>
+
+      {gateScore && (
+        <ScoreChips
+          terms={gateScore.terms}
+          z={gateScore.z}
+          p={gateScore.p}
+          tooDark={gateScore.tooDark}
+          note={t("still image, so no motion")}
+        />
+      )}
 
       {renderActions(entry, rounded, corrected)}
     </div>

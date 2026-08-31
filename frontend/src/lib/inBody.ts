@@ -281,6 +281,8 @@ export class InBodyGate {
   motion: number | null = null;
   private streak = 0;
   private tick = 0;
+  /** No verdict has been measured since the last reset. */
+  private cold = true;
   private history: number[] = [];
 
   reset(startInside = true) {
@@ -288,6 +290,7 @@ export class InBodyGate {
     this.p = startInside ? 1 : 0;
     this.streak = 0;
     this.tick = 0;
+    this.cold = true;
     this.history = [];
     this.motion = null;
   }
@@ -337,6 +340,18 @@ export class InBodyGate {
     this.motion = this.updateMotion(f.redness);
     const raw = pInBody(f, this.motion);
     this.p = EMA * raw + (1 - EMA) * this.p;
+
+    // First measurement since a reset: take it at face value. The dwell exists
+    // to stop a stray frame overturning an established verdict, and at this point
+    // there is none -- `inside` is only the fail-open assumption the gate opened
+    // with. Requiring agreement with an assumption just delays the first real
+    // answer by DWELL evaluations.
+    if (this.cold) {
+      this.cold = false;
+      this.inside = raw > EXIT;
+      this.streak = 0;
+      return { inside: this.inside, p: this.p, f, evaluated: true };
+    }
 
     const want = this.inside ? !(raw < EXIT) : raw > ENTER;
     if (want !== this.inside) {

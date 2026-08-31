@@ -406,6 +406,9 @@ export const FA: Record<string, string> = {
   // Out-of-body filter — the colour gate in front of the detector.
   "too dark to judge colour → outside": "تصویر برای قضاوت رنگ بیش از حد تاریک است → خارج از بدن",
   "green pushes inside · amber pushes outside": "سبز به سمت داخل بدن · کهربایی به سمت خارج از بدن",
+  "in body": "داخل بدن",
+  "out of body": "خارج از بدن",
+  "still image, so no motion": "تصویر ثابت است، بنابراین حرکتی محاسبه نمی‌شود",
   "Out-of-body filter": "فیلتر خارج از بدن",
   "Turn off": "خاموش کردن",
   "Turn on": "روشن کردن",
