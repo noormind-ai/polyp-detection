@@ -21,11 +21,11 @@ def current_user(polyp_session: str = Cookie(default="")) -> str | None:
 
 
 def require_user(user: str | None = Depends(current_user)) -> str:
-    """Gate for anything that spends GPU on a user-supplied video."""
+    """Gate for anything that spends GPU: upload, live camera, screen share."""
     if not user:
         raise HTTPException(
             status_code=401,
-            detail="برای بارگذاری ویدیو باید وارد شوید. Sign in to upload a video.",
+            detail="برای استفاده باید وارد شوید. Sign in to continue.",
         )
     return user
 
