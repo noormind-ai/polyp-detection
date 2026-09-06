@@ -73,9 +73,12 @@ async def backends():
 
 
 @router.post("/session/start")
-async def session_start(backend: str | None = None):
+async def session_start(backend: str | None = None, user: str = Depends(require_user)):
     """Boot the engine. Called when someone opens live camera or screen share —
     NOT on page load, and never for the demos.
+
+    Gated the same as infer-video: this is what actually spends GPU, so
+    starting it anonymously would make the login on the other paths decorative.
 
     For a CPU engine there is no container to provision; warmup just builds the
     ONNX session so the first clinical frame doesn't pay for it.
@@ -193,10 +196,19 @@ async def _stream_inference(websocket: WebSocket, label: str):
 
 @router.websocket("/ws/infer")
 async def infer_stream(websocket: WebSocket):
-    """Live camera and screen share — open, no login. This is the real clinical
-    path, and the footage never leaves the operator's own capture device."""
+    """Live camera and screen share. This is the real clinical path, and the
+    footage never leaves the operator's own capture device — but it still
+    spends the same GPU as any other mode, so it is gated the same way as
+    ws/infer-file below.
+    """
+    user = auth.read_session(websocket.cookies.get(auth.COOKIE_NAME, ""))
+    if not user:
+        await websocket.accept()
+        await websocket.close(code=1008, reason="sign-in required")
+        log.info("WS rejected (live): not signed in")
+        return
     await websocket.accept()
-    await _stream_inference(websocket, "live")
+    await _stream_inference(websocket, f"live/{user}")
 
 
 @router.websocket("/ws/infer-file")

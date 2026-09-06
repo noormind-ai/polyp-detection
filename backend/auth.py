@@ -16,11 +16,10 @@ design notes below are the ones that matter for keeping the copy correct.
 
 What login actually gates here
 ------------------------------
-Only the paths that push a NEW video through the GPU: the whole-file upload
-and the frame-by-frame upload player. Live camera and screen share are open on
-purpose — they are the real clinical use — and the bundled demos are open
-because they no longer touch the GPU at all (their detections are precomputed;
-see data/precompute_demos.py).
+Every path that touches the GPU: the whole-file upload, the frame-by-frame
+upload player, and live camera / screen share. The bundled demos stay open
+because they no longer touch the GPU at all (their detections are
+precomputed; see data/precompute_demos.py).
 
 Which is why registration DEFAULTS TO CLOSED here, unlike OrganAI. There,
 anyone may sign up but an account grants only the public demo cases — real

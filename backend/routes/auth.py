@@ -1,7 +1,7 @@
-"""Login / registration routes, and the dependency that gates GPU uploads.
+"""Login / registration routes, and the dependency that gates GPU spend.
 
-Only the upload paths are gated — see backend/auth.py for why live camera,
-screen share and the bundled demos are deliberately open.
+Every mode that touches the GPU is gated — see backend/auth.py for why the
+bundled demos are the one thing left open.
 """
 
 import logging

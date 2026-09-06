@@ -110,8 +110,8 @@ const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001";
 // response, so the timer only counts down once streaming has actually stopped.
 const MODAL_IDLE_MS = 2 * 60 * 1000;
 
-/** The modes that spend GPU on a video the user supplied, and so need an account. */
-const NEEDS_ACCOUNT: Mode[] = ["upload"];
+/** The modes that spend GPU, and so need an account. */
+const NEEDS_ACCOUNT: Mode[] = ["upload", "camera", "screen"];
 /** The modes that need a warm GPU container before they can do anything. */
 const NEEDS_GPU: Mode[] = ["camera", "screen"];
 
@@ -184,6 +184,9 @@ export default function Home() {
     setError(null);
     setMode(next);
     if (!NEEDS_GPU.includes(next)) return;
+    // Signed-out visitors see the login panel instead (blockedOnLogin below) —
+    // don't spend a GPU boot just to find that out from a 401.
+    if (NEEDS_ACCOUNT.includes(next) && !user) return;
 
     setGpu("starting");
     try {
@@ -282,8 +285,9 @@ export default function Home() {
     </button>
   );
 
-  // An upload mode opened by someone signed out shows the login form in place of
-  // the mode itself. Nothing else on the page is gated.
+  // A GPU mode (upload, live camera, screen share) opened by someone signed out
+  // shows the login form in place of the mode itself. Only the precomputed
+  // demos are ungated.
   const blockedOnLogin = mode !== null && NEEDS_ACCOUNT.includes(mode) && !user && !authLoading;
   const warmingUp = mode !== null && NEEDS_GPU.includes(mode) && gpu !== "ready";
 
