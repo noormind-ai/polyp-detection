@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from backend import auth
 from backend.routes.auth import require_user
 from backend.services import engine
+from backend.services.tracker import PersistenceTracker
 
 log = logging.getLogger("infer")
 
@@ -149,6 +150,17 @@ async def _stream_inference(websocket: WebSocket, label: str):
         await websocket.close()
         return
 
+    # Real ByteTrack, run unconditionally alongside the existing client-side
+    # heuristic in lib/temporal.ts (see backend/services/tracker.py for what's
+    # actually different between the two). Deliberately NOT gated by a query
+    # param: the frontend's Off/Heuristic/ByteTrack switch needs to flip
+    # instantly on the same live stream for a fair side-by-side, and a param
+    # baked into the socket URL would force a reconnect (and silently drop
+    # the capture loop) on every switch. Cost is negligible either way — a
+    # numpy/scipy pass over at most a couple of boxes next to a ~40ms detector
+    # call — so there's nothing to save by making this optional.
+    tracker = PersistenceTracker()
+
     frame_n = 0
     latencies: list[int] = []
     log.info("WS session opened (%s) | engine=%s", label, engine_name)
@@ -179,6 +191,9 @@ async def _stream_inference(websocket: WebSocket, label: str):
         t_total = time.perf_counter()
         try:
             detections, timing = await eng.infer_frame(frame_bytes)
+            # Tags each box with track_id/persistent; does not drop or reorder
+            # anything, so a client that ignores these two keys sees no change.
+            detections = tracker.update(detections)
             timing["recv_ms"] = recv_ms
             timing["total_ms"] = int((time.perf_counter() - t_total) * 1000)
             latencies.append(timing["modal_ms"])
