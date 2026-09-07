@@ -1,0 +1,252 @@
+"""Frame-quality gate for live inference.
+
+Runs on the frame the CPU path has ALREADY decoded (`local_cpu._infer_sync`),
+so the marginal cost is the metric arithmetic alone -- no second decode, no
+resize to a second model's input size, no second ONNX session and therefore
+none of the thread-pool contention that makes adding a real classifier cost
+~2.8x. Measured at well under 1 ms against ~40 ms for the detector.
+
+WHY THESE FILTERS
+-----------------
+Nine cheap operators were implemented and measured against 246 frames labelled
+for blur by a reviewer (see NOISE-GATE.md). The result was not the expected one:
+
+    gra1  (Sobel gradient mean)      AUC 0.816   <- already deployed in tier1.py
+    teng  (Tenengrad)                    0.770
+    lapv  (Laplacian variance)           0.759
+    ipr   (Oh 2007, edge continuity)     0.692
+    wavelet (Tong 2004)                  0.634
+    dft   (high-frequency share)         0.616
+    edgewidth (Marziliano 2002)          0.571
+
+The endoscopy literature's edge-continuity and edge-width methods lose to the
+plain gradient mean on this footage. So the default is `gra1`, and the others
+are here to be switched to rather than argued about.
+
+REPORT-ONLY BY DEFAULT
+----------------------
+`POLYP_GATE_ENFORCE` defaults to off. The gate is computed and reported on every
+frame, but detections are NOT suppressed until someone turns enforcement on
+deliberately. Silently muting a detector in a clinical demo is not a thing to
+switch on as a side effect of a deploy -- and at the fitted cut this gate still
+mutes ~1.7% of frames a doctor called `polyp`, which is a decision for a
+clinician, not a config default.
+
+    POLYP_GATE=gra1            which filter (or "off")
+    POLYP_GATE_CUT=14.47       fitted: catches 20.7% of blurry frames while
+                               muting 1.7% of doctor-confirmed polyp frames
+    POLYP_GATE_ENFORCE=1       actually drop boxes; otherwise report only
+"""
+import os
+
+import cv2
+import numpy as np
+
+SMALL = 256  # longest side; the fitted cuts assume this, so do not change alone
+
+NAME = os.getenv("POLYP_GATE", "gra1").strip().lower()
+ENFORCE = os.getenv("POLYP_GATE_ENFORCE", "").strip() in ("1", "true", "yes", "on")
+
+# Cuts fitted by compute_filters.py on the reviewer's blur labels, at the
+# operating point that mutes at most 2% of doctor-confirmed polyp frames.
+# Stored in SIGN-FLIPPED space: a filter fires when `sign * value < cut`.
+# Read from the fit rather than typed here -- transcribing them by hand is what
+# left ipr/wavelet/edgewidth firing on every frame.
+_FALLBACK = {
+    "gra1": (1, 14.469), "teng": (1, 796.62), "lapv": (1, 71.405),
+    "lapm": (1, 4.9294), "glva": (1, 602.9), "dft": (1, 0.014073),
+    "ipr": (-1, -1.0), "wavelet": (-1, -1.466), "edgewidth": (-1, -0.53562),
+}
+
+
+def _load_cuts():
+    path = os.getenv("POLYP_GATE_CUTS",
+                     "/home/fati/noormind/noisy-review-data/cuts.json")
+    try:
+        import json
+        with open(path) as fh:
+            d = json.load(fh)
+        return {k: (int(v["sign"]), float(v["cut"])) for k, v in d.items()}
+    except Exception:
+        return dict(_FALLBACK)
+
+
+CUTS = _load_cuts()
+CUT = float(os.getenv("POLYP_GATE_CUT", CUTS.get(NAME, (1, 0.0))[1]))
+# Report the whole bank, not only the enforcing filter. Off-switch is provided
+# because it is the difference between ~2 ms and ~6 ms per frame.
+BANK = os.getenv("POLYP_GATE_BANK", "1").strip() not in ("0", "false", "no", "off")
+
+LABELS = {
+    "gra1": "Sobel mean (GRA1)",
+    "teng": "Tenengrad",
+    "lapv": "Laplacian variance",
+    "lapm": "Modified Laplacian",
+    "glva": "Grey-level variance",
+    "dft": "DFT high-freq ratio",
+    "ipr": "IPR (Oh 2007)",
+    "wavelet": "Wavelet (Tong 2004)",
+    "edgewidth": "Edge width (Marziliano)",
+}
+SIGN = CUTS.get(NAME, (1, 0.0))[0]
+
+
+def _prep(bgr):
+    h, w = bgr.shape[:2]
+    if max(h, w) > SMALL:
+        r = SMALL / max(h, w)
+        bgr = cv2.resize(bgr, (max(1, int(w * r)), max(1, int(h * r))),
+                         interpolation=cv2.INTER_AREA)
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+
+
+def _gra1(g):
+    f = g.astype(np.float32)
+    gx = cv2.Sobel(f, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(f, cv2.CV_32F, 0, 1, ksize=3)
+    return float(np.sqrt(gx * gx + gy * gy).mean())
+
+
+def _teng(g):
+    f = g.astype(np.float32)
+    gx = cv2.Sobel(f, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(f, cv2.CV_32F, 0, 1, ksize=3)
+    return float((gx * gx + gy * gy).mean())
+
+
+def _lapv(g):
+    return float(cv2.Laplacian(g, cv2.CV_64F).var())
+
+
+def _lapm(g):
+    f = g.astype(np.float32)
+    kx = np.array([[-1, 2, -1]], np.float32)
+    return float((np.abs(cv2.filter2D(f, cv2.CV_32F, kx)) +
+                  np.abs(cv2.filter2D(f, cv2.CV_32F, kx.T))).mean())
+
+
+def _glva(g):
+    return float(g.astype(np.float32).var())
+
+
+def _dft(g, cutoff=0.25):
+    f = g.astype(np.float32) / 255.0
+    f = f - f.mean()
+    F = np.fft.fftshift(np.abs(np.fft.fft2(f)) ** 2)
+    h, w = F.shape
+    y, x = np.ogrid[:h, :w]
+    r = np.sqrt(((y - h / 2) / (h / 2)) ** 2 + ((x - w / 2) / (w / 2)) ** 2)
+    tot = float(F.sum())
+    return float(F[r > cutoff].sum() / tot) if tot > 0 else 0.0
+
+
+def _ipr(g):
+    edges = cv2.Canny(g, 50, 150) > 0
+    total = int(edges.sum())
+    if total < 30:
+        return 0.0
+    e = edges.astype(np.uint8)
+    nb = cv2.filter2D(e, cv2.CV_16U, np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], np.uint8),
+                      borderType=cv2.BORDER_CONSTANT)
+    return int(((nb > 0) & edges).sum()) / total
+
+
+def _wavelet(g):
+    f = g.astype(np.float32)
+
+    def haar(a):
+        a = a[:a.shape[0] // 2 * 2, :a.shape[1] // 2 * 2]
+        lo, hi = (a[0::2, :] + a[1::2, :]) / 2, (a[0::2, :] - a[1::2, :]) / 2
+        return ((lo[:, 0::2] + lo[:, 1::2]) / 2,
+                ((lo[:, 0::2] - lo[:, 1::2]) / 2,
+                 (hi[:, 0::2] + hi[:, 1::2]) / 2,
+                 (hi[:, 0::2] - hi[:, 1::2]) / 2))
+
+    l1, d1 = haar(f)
+    _, d2 = haar(l1)
+    e1 = float(sum((d ** 2).mean() for d in d1))
+    e2 = float(sum((d ** 2).mean() for d in d2))
+    return e1 / e2 if e2 > 1e-9 else 0.0
+
+
+def _edgewidth(g):
+    a = g.astype(np.int16)
+    edges = cv2.Canny(g, 50, 150) > 0
+    ys, xs = np.nonzero(edges)
+    if len(ys) < 30:
+        return 0.0
+    if len(ys) > 400:
+        sel = np.linspace(0, len(ys) - 1, 400).astype(int)
+        ys, xs = ys[sel], xs[sel]
+    w = a.shape[1]
+    widths = []
+    for y, x in zip(ys, xs):
+        row = a[y]
+        i = x
+        while i > 0 and row[i - 1] <= row[i]:
+            i -= 1
+        j = x
+        while j < w - 1 and row[j + 1] >= row[j]:
+            j += 1
+        widths.append(j - i + 1)
+    m = float(np.mean(widths))
+    return 1.0 / m if m > 0 else 0.0
+
+
+_ALL = {"gra1": _gra1, "teng": _teng, "lapv": _lapv, "lapm": _lapm,
+        "glva": _glva, "dft": _dft, "ipr": _ipr, "wavelet": _wavelet,
+        "edgewidth": _edgewidth}
+
+# Nine were measured; four are kept. The cut is by MECHANISM, not by rank --
+# keeping the top four by AUC would keep gra1 and teng, which are the same Sobel
+# gradient with and without the square root and therefore say the same thing
+# twice. One survivor per family, the best of each:
+#
+#   gra1     0.816  first-derivative energy   (beats teng 0.770)
+#   lapv     0.759  second-derivative energy  (ties lapm 0.759)
+#   ipr      0.692  edge continuity           -- a genuinely different mechanism
+#   wavelet  0.634  multi-scale detail ratio  (beats dft 0.616)
+#
+# Dropped outright: glva (0.590) measures contrast, not focus, and edgewidth
+# (0.571) is close enough to a coin flip that a red chip from it means nothing.
+KEEP = [n.strip() for n in
+        os.getenv("POLYP_GATE_KEEP", "gra1,lapv,ipr,wavelet").split(",") if n.strip()]
+FILTERS = {n: _ALL[n] for n in KEEP if n in _ALL}
+
+
+def check(frame) -> dict | None:
+    """-> the whole filter bank evaluated on an already-decoded BGR frame.
+
+    Every filter is computed, not just the enforcing one, because the point of
+    the live readout is to watch all nine disagree with each other on real
+    footage. Only `filter` decides whether boxes are dropped.
+
+    The grey conversion and downsample are done ONCE and shared, so nine filters
+    cost barely more than one.
+    """
+    fn = FILTERS.get(NAME)
+    if fn is None and not BANK:
+        return None
+    g = _prep(frame)
+
+    out = {}
+    for n, f in (FILTERS.items() if BANK else [(NAME, fn)]):
+        sign, cut = CUTS.get(n, (1, 0.0))
+        if n == NAME:
+            cut = CUT
+        try:
+            v = f(g)
+        except Exception:
+            continue
+        out[n] = {"value": round(v, 4), "cut": round(cut, 4),
+                  "fired": bool(sign * v < cut), "label": LABELS.get(n, n)}
+
+    main = out.get(NAME)
+    return {
+        "filter": NAME,
+        "value": main["value"] if main else None,
+        "cut": round(CUT, 4),
+        "fired": bool(main["fired"]) if main else False,
+        "enforce": ENFORCE,
+        "filters": out,
+    }

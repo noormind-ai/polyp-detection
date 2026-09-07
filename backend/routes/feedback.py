@@ -280,7 +280,10 @@ async def review_capture(
 # What a frame IS, as opposed to whether its detection was right. Kept separate
 # from the review verdicts because they answer different questions and are not
 # alternatives -- an out-of-body frame has no polyp verdict to give.
-FRAME_LABELS = {"out_of_body", "noisy"}
+# `clean` exists so a noise experiment can record a negative. Without it
+# the only evidence a reviewer leaves is what they flagged, and "not
+# flagged" cannot be told apart from "not looked at".
+FRAME_LABELS = {"out_of_body", "noisy", "clean"}
 
 
 @router.post("/feedback/{case_id}/{filename}/label")

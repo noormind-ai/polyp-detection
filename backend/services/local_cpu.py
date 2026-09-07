@@ -57,12 +57,35 @@ THREADS = int(os.getenv("POLYP_CPU_THREADS", "4"))
 
 # name -> (onnx file, UI label, detects polyps?, frame confidence threshold)
 MODELS = {
+    # Scored on 7,166 in-house frames against the doctor's labels: 51 false
+    # positives against yolov5m's 167, for 80.9% recall against 83.1%. The
+    # difference is the training data, not the architecture -- this one saw
+    # full procedures with their long artefact-heavy negative stretches, while
+    # the YOLO was fine-tuned on Kvasir and has barely seen a non-polyp frame.
+    "rtdetr": ("tc-rtdetr-s123_320.onnx", "RT-DETR · TRUE-Colon · fewest false positives", True, 0.30),
+    # 2.7x faster than RT-DETR and still far cleaner than the old yolov5m: at a
+    # matched 80% recall it produces 23 false positives against RT-DETR's 13 and
+    # yolov5m's 57. Same TRUE-Colon training, cheaper architecture.
+    #
+    # Its threshold is LOW because its scores are compressed, not because it is
+    # reckless: 0.27 is where it reaches 70% recall. Confidence scales do not
+    # transfer between architectures -- reading this number next to RT-DETR's
+    # 0.30 as if they meant the same thing is the mistake to avoid.
+    "tc_yolo11m": ("tc-yolo11m-s123_320.onnx", "YOLO11m · TRUE-Colon · fast", True, 0.27),
     "yolo11n_polyp": ("yolo11n_polyp.onnx", "YOLO11n · polyp fine-tune · fastest", True, 0.50),
-    "yolov5m": ("yolov5m.onnx", "YOLOv5m · polyp (deployed model)", True, 0.30),
+    "yolov5m": ("yolov5m.onnx", "YOLOv5m · polyp (previous default)", True, 0.30),
     "yolo11n": ("yolo11n.onnx", "YOLO11n · NOT polyp-trained — speed test only", False, 0.30),
     "yolo26n": ("yolo26n.onnx", "YOLO26n · NOT polyp-trained — speed test only", False, 0.30),
 }
-DEFAULT_MODEL = "yolov5m"
+DEFAULT_MODEL = os.getenv("POLYP_CPU_DEFAULT", "rtdetr")
+
+# Exported at 320, matching the resolution the frontend already sends. The
+# 640 export is 2.2x slower (251 ms vs 116 ms at 14 threads) for no gain:
+# measured on 400 in-house frames it found 45 polyp frames against 44, and
+# produced 25 false positives against 10. Upscaling a 320 frame to 640 buys
+# nothing but compute and, on this footage, extra false positives.
+RTDETR = {"rtdetr"}
+RTDETR_IMGSZ = 320
 
 _sessions: dict[str, object] = {}
 _load_lock = threading.Lock()
@@ -154,6 +177,37 @@ def _letterbox(frame: np.ndarray) -> tuple[np.ndarray, float, int, int]:
     return np.ascontiguousarray(x), r, left, top
 
 
+def _stretch(frame: np.ndarray, imgsz: int = RTDETR_IMGSZ) -> np.ndarray:
+    """Plain resize to a square. Aspect ratio NOT preserved, no padding.
+
+    Not interchangeable with _letterbox -- see this module's RT-DETR note.
+    """
+    import cv2
+
+    x = cv2.resize(frame, (imgsz, imgsz), interpolation=cv2.INTER_LINEAR)
+    x = x[:, :, ::-1].transpose(2, 0, 1)[None].astype(np.float32) / 255.0
+    return np.ascontiguousarray(x)
+
+
+def _decode_rtdetr(out: np.ndarray, conf_thr: float,
+                   ow: int, oh: int) -> tuple[np.ndarray, np.ndarray]:
+    """(1, 300, 6) -> (xyxy in ORIGINAL frame pixels, conf).
+
+    NMS-free: the head already emits its top queries. Columns are normalised
+    cxcywh and scale by the original frame size -- the stretch means there is no
+    padding to undo.
+    """
+    o = out[0]
+    conf = o[:, 4].astype(np.float32)
+    m = conf >= conf_thr
+    o, conf = o[m], conf[m]
+    if not len(o):
+        return np.empty((0, 4), np.float32), conf
+    cx, cy, w, h = o[:, 0] * ow, o[:, 1] * oh, o[:, 2] * ow, o[:, 3] * oh
+    xyxy = np.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], axis=1)
+    return xyxy.astype(np.float32), conf
+
+
 def _nms(boxes: np.ndarray, scores: np.ndarray, iou_thr: float) -> list[int]:
     """Plain greedy NMS. boxes are xyxy."""
     x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
@@ -233,14 +287,24 @@ def _to_frame_coords(xyxy: np.ndarray, r: float, pad_x: int, pad_y: int,
 def _predict(name: str, frame: np.ndarray) -> tuple[list[dict], float]:
     sess = _session(name)
     conf_thr = MODELS[name][3]
-    x, r, pad_x, pad_y = _letterbox(frame)
+    rt = name in RTDETR
+    h0, w0 = frame.shape[:2]
+
+    if rt:
+        x = _stretch(frame)
+        r = pad_x = pad_y = 0.0
+    else:
+        x, r, pad_x, pad_y = _letterbox(frame)
 
     t = time.perf_counter()
     out = sess.run(None, {sess.get_inputs()[0].name: x})[0]
     infer_ms = (time.perf_counter() - t) * 1000
 
-    xyxy, conf = _decode(out, conf_thr)
-    xyxy = _to_frame_coords(xyxy, r, pad_x, pad_y, frame.shape[:2])
+    if rt:
+        xyxy, conf = _decode_rtdetr(out, conf_thr, w0, h0)
+    else:
+        xyxy, conf = _decode(out, conf_thr)
+        xyxy = _to_frame_coords(xyxy, r, pad_x, pad_y, frame.shape[:2])
     boxes = [
         {"bbox": [round(float(v)) for v in box], "conf": round(float(c), 3)}
         for box, c in zip(xyxy, conf)
@@ -248,7 +312,7 @@ def _predict(name: str, frame: np.ndarray) -> tuple[list[dict], float]:
     return boxes, infer_ms
 
 
-def _infer_sync(name: str, frame_bytes: bytes) -> tuple[list[dict], float, float]:
+def _infer_sync(name: str, frame_bytes: bytes) -> tuple[list[dict], float, float, dict | None]:
     import cv2
 
     t0 = time.perf_counter()
@@ -257,8 +321,21 @@ def _infer_sync(name: str, frame_bytes: bytes) -> tuple[list[dict], float, float
         raise ValueError("payload was not a decodable image")
     decode_ms = (time.perf_counter() - t0) * 1000
 
+    gate = None
+    try:
+        from . import frame_gate
+        gate = frame_gate.check(frame)
+    except Exception:                      # a gate must never break inference
+        gate = None
+
+    # Enforcement is opt-in (POLYP_GATE_ENFORCE). Report-only is the default:
+    # at the fitted cut this still mutes ~1.7% of frames a doctor called polyp,
+    # which is a clinician's call, not a deploy-time default.
+    if gate and gate["fired"] and gate["enforce"]:
+        return [], decode_ms, 0.0, gate
+
     boxes, infer_ms = _predict(name, frame)
-    return boxes, decode_ms, infer_ms
+    return boxes, decode_ms, infer_ms, gate
 
 
 def _infer_video_sync(name: str, video_bytes: bytes) -> dict:
@@ -306,7 +383,8 @@ class _Bound:
 
     async def infer_frame(self, frame_bytes: bytes) -> tuple[list[dict], dict]:
         t0 = time.perf_counter()
-        boxes, decode_ms, infer_ms = await asyncio.to_thread(_infer_sync, self.name, frame_bytes)
+        boxes, decode_ms, infer_ms, gate = await asyncio.to_thread(
+            _infer_sync, self.name, frame_bytes)
         total_ms = int((time.perf_counter() - t0) * 1000)
         # "modal_ms" is a misnomer kept on purpose — it is the key the frontend
         # already reads for its latency readout, so the UI needs no change.
@@ -315,6 +393,7 @@ class _Bound:
             "decode_ms": round(decode_ms, 2),
             "cpu_ms": round(infer_ms, 2),
             "model": self.name,
+            "gate": gate,
         }
 
     async def infer_video(self, video_bytes: bytes) -> dict:

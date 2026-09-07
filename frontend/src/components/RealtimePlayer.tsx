@@ -9,7 +9,11 @@ import { useLanguage } from "@/lib/i18n";
 import { useInBodyGate } from "@/lib/useInBodyGate";
 import InBodyGateNotice from "./InBodyGateNotice";
 import { useQualityGate } from "@/lib/useQualityGate";
+import { frameQuality } from "@/lib/frameQuality";
 import QualityGateNotice from "./QualityGateNotice";
+import FilterBankNotice, { type GateState } from "./FilterBankNotice";
+import { useTemporalGate } from "@/lib/useTemporalGate";
+import TemporalGateNotice from "./TemporalGateNotice";
 import { detectFovRect, unionRect, trimmedFraction, NEGLIGIBLE_TRIM, type Rect } from "@/lib/fov";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "";
@@ -28,16 +32,64 @@ const INFER_WIDTH = 320;
 // lib/fov.ts — the union of several beats one, and the border does not move.
 const FOV_SAMPLE_FRAMES = 8;
 const SPEEDS = [0.1, 0.25, 0.5, 0.7, 1, 1.5, 2];
-// Don't auto-capture the same ongoing detection every single frame — once a
-// polyp is flagged, wait this long before the next auto-capture so the
-// review queue fills with distinct moments, not near-duplicates.
-// A polyp that is STILL on screen is re-filed at most this often. A polyp that
-// has just appeared is filed immediately regardless — see maybeAutoCapture.
+// A polyp that is STILL on screen is re-filed at most this often, so a long
+// look is not represented in the queue by a single frame.
 const AUTO_CAPTURE_REFRESH_MS = 8000;
 // A detection gap shorter than this counts as the same episode. The detector
 // drops the odd frame on a lesion that never left the screen, and treating that
 // as "gone" would re-trigger a capture on the very next frame.
 const DETECTION_GAP_MS = 1000;
+
+// ---------------------------------------------------------------------------
+// Three tiers of response, each with a harder bar than the last.
+//
+//   tier 1  box on screen   temporal gate, 2-of-3 (~0.5 s)   lib/temporal.ts
+//   tier 2  filed capture   FILE_MIN_MS  + FILE_MIN_HITS
+//   tier 3  audible alert   ALERT_MIN_MS + ALERT_MIN_CONF
+//
+// Cheapest signal, loosest bar; loudest signal, tightest bar. The thresholds
+// are the operating points Holzwanger et al. (Endoscopy 2021) measured for how
+// long a CADe detection has to last before it carries information -- CADe
+// specificity/accuracy 93.2%/97.8% at >=0.5 s, 98.6%/99.5% at >=1 s, and
+// 99.8%/99.9% at >=2 s. The same work found that over 95% of per-frame false
+// positives are ignored by endoscopists outright, which is why a single frame
+// triggers nothing here but a box.
+//
+// The bar rises with the cost of being wrong. A spurious box is glanced at and
+// dismissed; a spurious capture wastes a reviewer's time; a spurious beep is
+// the one that does damage -- CADe alert fatigue tracks with adenoma detection
+// falling from 49.9% to 39.9% across a list.
+// ---------------------------------------------------------------------------
+
+// Tier 2 -- file a capture. Both bars must be cleared: an appearance has to
+// have lasted this long AND been seen on this many inferred frames, so neither
+// a slow frame rate nor a burst of frames on its own can carry it.
+const FILE_MIN_MS   = 1000;
+const FILE_MIN_HITS = 2;
+// Tier 3 -- sound the alert. Twice tier 2's patience, plus a confidence floor,
+// because this is the tier that interrupts the room. Fires once per appearance.
+const ALERT_MIN_MS   = 2000;
+const ALERT_MIN_CONF = 0.5;
+
+// FILE_MIN_MS is also the window over which the best frame of an appearance is
+// chosen, which is not a coincidence: the delay spent making sure is the same
+// delay spent finding a better picture, so waiting costs nothing twice.
+//
+// Why the best frame and not the first: a lesion "appears" precisely because
+// the scope is moving, so the rising-edge frame is systematically the worst of
+// the encounter -- blurred, half out of frame, or partly occluded. What a
+// reviewer needs is the clearest look, not the earliest one.
+const BEST_W_SHARP = 0.5, BEST_W_CONF = 0.3, BEST_W_SIZE = 0.2;
+// Mean Sobel gradient saturates around here on an in-focus frame; see the
+// operating-point table in lib/frameQuality.ts.
+const SHARP_REF = 30;
+// Longest edge of a filed frame. The inference canvas is INFER_WIDTH (320) --
+// enough for the model, not enough for a human, and the doctor-found path has
+// always saved 960. Both paths now agree.
+const CAPTURE_EDGE = 960;
+// Off unless the operator asks for it: switching on audio in a procedure room
+// is their call, not a default.
+const ALERT_KEY = "polyp_alert_sound";
 
 interface Box { bbox: [number, number, number, number]; conf: number; }
 interface Timing { recv_ms: number; modal_ms: number; total_ms: number; }
@@ -63,6 +115,17 @@ export default function RealtimePlayer({
   // worth inferring. Its own switch, because unlike the out-of-body gate it
   // has a measured cost in true polyps and is off until someone opts in.
   const quality = useQualityGate();
+  // Third gate, and the only one that costs no lesions: a detection has to
+  // survive several consecutive frames before it is drawn. Artefacts flicker;
+  // a polyp in view does not.
+  const temporal = useTemporalGate();
+  // Exact test window, in seconds. The comparison this exists for -- same
+  // footage with persistence on and off -- is only a comparison if both runs
+  // cover identical frames, and "I pressed stop at about the same place" is
+  // not identical.
+  const [winStart, setWinStart] = useState("");
+  const [winStop, setWinStop] = useState("");
+  const winRef = useRef<{ a: number; b: number } | null>(null);
   // The engine is pinned for the life of the socket — the server reads it once,
   // so the latency average never blends two very different backends.
   const [isDemo, setIsDemo] = useState(false);
@@ -85,6 +148,32 @@ export default function RealtimePlayer({
   // (nginx logged 81 x 499 and 15 x 408 in one day). Skipping a capture costs
   // little — an episode that is still on screen files one on the next refresh.
   const uploadingRef       = useRef(false);
+
+  // One appearance of a lesion, as a small state machine. `hits` and `start`
+  // decide which tier has been earned; `best` holds the best frame seen so far,
+  // and `filed`/`alerted` make each tier fire once rather than once per frame.
+  const episodeStartRef   = useRef(0);
+  const episodeHitsRef    = useRef(0);
+  const episodeFiledRef   = useRef(false);
+  const episodeAlertedRef = useRef(false);
+  const bestRef = useRef<{ score: number; boxes: Box[] } | null>(null);
+  // Two scratch canvases, reused for the life of the session: the frame being
+  // considered, and the best one held so far. A fresh 960px canvas per inferred
+  // frame would be megabytes a second of garbage on a clinic PC.
+  const hiScratchRef  = useRef<HTMLCanvasElement | null>(null);
+  const bestCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const audioCtxRef   = useRef<AudioContext | null>(null);
+  // At most one capture may wait behind an in-flight upload. More than one and
+  // we are back to queueing POSTs against the same upstream the frame stream
+  // uses; none at all and a capture that merely coincided with a busy uplink is
+  // lost outright — which is a lesion the reviewer never sees.
+  const deferredRef = useRef<{ blob: Blob; boxes: Box[] } | null>(null);
+  // Tier 3 is configured in the live player; here we only read the setting, so a
+  // demo run behaves like the room it is demonstrating.
+  const alertEnabledRef = useRef(false);
+  useEffect(() => {
+    try { alertEnabledRef.current = localStorage.getItem(ALERT_KEY) === "1"; } catch { /* ignore */ }
+  }, []);
   // Replay reuses one scratch canvas instead of allocating per animation frame —
   // the live loop can get away with allocating because it runs at inference
   // speed (a few per second), replay runs at frame rate.
@@ -110,6 +199,11 @@ export default function RealtimePlayer({
   // much. Must stay a member of SPEEDS or no button renders as selected.
   const [speed, setSpeed]         = useState(0.5);
   const [stats, setStats]         = useState({ sent: 0, received: 0, avgMs: 0 });
+  // Whole filter bank as reported by the backend for the last frame that
+  // came back, so the panel answers "which paper filter fired on THIS
+  // scene" rather than showing one operator's raw numbers.
+  const [gate, setGate] = useState<GateState | null>(null);
+  const [showBank, setShowBank] = useState(true);
   const [lastError, setLastError] = useState("");
   const [duration, setDuration]   = useState(0);
   const [curTime, setCurTime]     = useState(0);
@@ -162,6 +256,8 @@ export default function RealtimePlayer({
       }
 
       const { boxes, timing } = data as { boxes: Box[]; timing: Timing };
+      const g = (data as { timing?: { gate?: GateState } }).timing?.gate;
+      if (g) setGate(g);
       onActivity?.();
       msHistory.current.push(timing.modal_ms);
       if (msHistory.current.length > 10) msHistory.current.shift();
@@ -301,50 +397,197 @@ export default function RealtimePlayer({
     }, "image/jpeg", 0.82);
   }
 
-  // Auto-capture — the clean (no-overlay) frame that was already grabbed for
-  // inference, plus what the model saw, plus a rolling clip if available.
-  // Throttled so a polyp staying in view for a while doesn't flood the queue.
-  function maybeAutoCapture(cap: HTMLCanvasElement, boxes: Box[]) {
+  /** Score one candidate frame of an appearance; higher is the better keepsake.
+   *  Measured on the 320px inference canvas, which is what the thresholds in
+   *  lib/frameQuality were calibrated against. */
+  function frameScore(cap: HTMLCanvasElement, boxes: Box[]): number {
+    const m = frameQuality(cap);
+    const sharp = m ? Math.min(1, m.gradmean / SHARP_REF) : 0.5;
+    let conf = 0, area = 0;
+    for (const b of boxes) {
+      if (b.conf > conf) conf = b.conf;
+      const a = Math.max(0, b.bbox[2] - b.bbox[0]) * Math.max(0, b.bbox[3] - b.bbox[1]);
+      if (a > area) area = a;
+    }
+    const frameArea = cap.width * cap.height;
+    // Square-rooted so this reads as "how far across the frame", not as area.
+    const size = frameArea > 0 ? Math.min(1, Math.sqrt(area / frameArea)) : 0;
+    return BEST_W_SHARP * sharp + BEST_W_CONF * conf + BEST_W_SIZE * size;
+  }
+
+  /** Grab the frame a reviewer will look at, from the SAME video frame the
+   *  model was given. Re-grabbing after the inference round trip would file an
+   *  image the boxes no longer describe -- on CPU that trip is a couple of
+   *  hundred milliseconds, and the scope moves in that time. */
+  function grabCapture(video: HTMLVideoElement, sx: number, sy: number, sw: number, sh: number) {
+    const scale = Math.min(1, CAPTURE_EDGE / Math.max(sw, sh));
+    const w = Math.max(1, Math.round(sw * scale)), h = Math.max(1, Math.round(sh * scale));
+    const c = hiScratchRef.current ?? (hiScratchRef.current = document.createElement("canvas"));
+    if (c.width !== w) c.width = w;
+    if (c.height !== h) c.height = h;
+    c.getContext("2d")!.drawImage(video, sx, sy, sw, sh, 0, 0, w, h);
+    return c;
+  }
+
+  /** Keep this frame if it is the best of the appearance so far. */
+  function considerBest(cap: HTMLCanvasElement, hi: HTMLCanvasElement | null, boxes: Box[]) {
+    const score = frameScore(cap, boxes);
+    if (bestRef.current && score <= bestRef.current.score) return;
+    const src = hi ?? cap;
+    const dst = bestCanvasRef.current ?? (bestCanvasRef.current = document.createElement("canvas"));
+    if (dst.width !== src.width) dst.width = src.width;
+    if (dst.height !== src.height) dst.height = src.height;
+    dst.getContext("2d")!.drawImage(src, 0, 0);
+    // FeedbackPanel reads ai_detections as pixels of the image it draws them
+    // over (it scales by naturalWidth), and the filed image is no longer the
+    // inference canvas -- so the boxes have to be carried into its space.
+    const k = cap.width > 0 ? src.width / cap.width : 1;
+    const scaled = k === 1 ? boxes : boxes.map((b) => ({
+      ...b,
+      bbox: [
+        Math.round(b.bbox[0] * k), Math.round(b.bbox[1] * k),
+        Math.round(b.bbox[2] * k), Math.round(b.bbox[3] * k),
+      ] as [number, number, number, number],
+    }));
+    bestRef.current = { score, boxes: scaled };
+  }
+
+  function resetEpisode() {
+    inEpisodeRef.current = false;
+    episodeHitsRef.current = 0;
+    episodeFiledRef.current = false;
+    episodeAlertedRef.current = false;
+    bestRef.current = null;
+  }
+
+  /** Tier 3. A short two-tone chirp synthesised on the spot -- no asset to
+   *  ship, no network, and nothing to fail at the one moment it matters. */
+  function alertSound() {
+    if (!alertEnabledRef.current) return;
+    try {
+      const Ctor = window.AudioContext
+        || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!Ctor) return;
+      const ctx = audioCtxRef.current ?? (audioCtxRef.current = new Ctor());
+      if (ctx.state === "suspended") void ctx.resume();
+      const t0 = ctx.currentTime;
+      [880, 1245].forEach((freq, i) => {
+        const osc = ctx.createOscillator(), gain = ctx.createGain();
+        osc.type = "sine";
+        osc.frequency.value = freq;
+        const s = t0 + i * 0.09;
+        // Ramped rather than switched: a step on a gain node clicks, and a
+        // click in a procedure room reads as equipment trouble.
+        gain.gain.setValueAtTime(0, s);
+        gain.gain.linearRampToValueAtTime(0.18, s + 0.012);
+        gain.gain.linearRampToValueAtTime(0, s + 0.08);
+        osc.connect(gain).connect(ctx.destination);
+        osc.start(s);
+        osc.stop(s + 0.09);
+      });
+    } catch { /* an alert that cannot sound must never break the live loop */ }
+  }
+
+  // Auto-capture — one filed frame per appearance, chosen for being the
+  // clearest frame of that appearance rather than the first one. The tier table
+  // at the top of this file says why each bar is where it is.
+  function maybeAutoCapture(boxes: Box[], cap: HTMLCanvasElement | null, hi: HTMLCanvasElement | null) {
     const now = Date.now();
 
-    if (boxes.length === 0) {
-      if (now - lastDetectionRef.current > DETECTION_GAP_MS) inEpisodeRef.current = false;
+    if (boxes.length === 0 || !cap) {
+      // The appearance is over once the detector has been quiet for longer than
+      // a single dropped frame. Flush whatever the best frame of it was: an
+      // appearance that ended before FILE_MIN_MS elapsed is still real, so the
+      // window only ever DELAYS a capture -- FILE_MIN_HITS is the only thing
+      // that suppresses one outright.
+      if (inEpisodeRef.current && now - lastDetectionRef.current > DETECTION_GAP_MS) {
+        if (episodeHitsRef.current >= FILE_MIN_HITS) flushBest(now);
+        resetEpisode();
+      }
       return;
     }
     lastDetectionRef.current = now;
 
-    // The event worth reviewing is a polyp APPEARING, so capture on the rising
-    // edge. A fixed cooldown could not tell a new lesion from the one already on
-    // screen, so a second polyp arriving inside the window was dropped entirely
-    // while a single polyp was re-filed every few seconds. Edge-triggering
-    // inverts that: every distinct appearance lands, and one that lingers is
-    // only refreshed occasionally instead of once per frame.
-    if (inEpisodeRef.current) {
-      if (now - lastAutoCaptureRef.current < AUTO_CAPTURE_REFRESH_MS) return;
-    } else {
+    if (!inEpisodeRef.current) {
       inEpisodeRef.current = true;
+      episodeStartRef.current = now;
+      episodeHitsRef.current = 0;
+      episodeFiledRef.current = false;
+      episodeAlertedRef.current = false;
+      bestRef.current = null;
     }
-    // An upload still in flight means the uplink is already busy; filing
-    // another now is what turns a slow link into a stalled page.
-    if (uploadingRef.current) return;
-    lastAutoCaptureRef.current = now;
+    episodeHitsRef.current += 1;
+    considerBest(cap, hi, boxes);
 
-    cap.toBlob(async (blob) => {
-      if (!blob) return;
-      const fd = new FormData();
-      fd.append("file", blob, "frame.jpg");
-      fd.append("ai_detections", JSON.stringify(boxes));
-      // No clip: for a played file the position in that file is the whole
-      // answer, and it costs nothing to send.
-      const v = videoRef.current;
-      if (v) fd.append("video_offset_ms", String(Math.round(v.currentTime * 1000)));
-      uploadingRef.current = true;
+    const age = now - episodeStartRef.current;
+
+    // Tier 3 — the alert. Deliberately independent of the capture path: a
+    // capture can sit behind a slow uplink, and telling the room about a lesion
+    // must never wait on an upload queue.
+    if (!episodeAlertedRef.current && age >= ALERT_MIN_MS
+        && episodeHitsRef.current >= FILE_MIN_HITS
+        && boxes.some((b) => b.conf >= ALERT_MIN_CONF)) {
+      episodeAlertedRef.current = true;
+      alertSound();
+    }
+
+    // Tier 2 — the capture. First filing waits for the window to close; after
+    // that a lesion still on screen is refreshed occasionally, so a long look is
+    // not represented by one frame.
+    if (episodeHitsRef.current < FILE_MIN_HITS) return;
+    const due = episodeFiledRef.current
+      ? now - lastAutoCaptureRef.current >= AUTO_CAPTURE_REFRESH_MS
+      : age >= FILE_MIN_MS;
+    if (due) flushBest(now);
+  }
+
+  /** Tier 2. Hand the best frame of this appearance to the uploader. */
+  function flushBest(now: number) {
+    const best = bestRef.current;
+    const canvas = bestCanvasRef.current;
+    if (!best || !canvas) return;
+    episodeFiledRef.current = true;
+    lastAutoCaptureRef.current = now;
+    const boxes = best.boxes;
+    bestRef.current = null;  // a refresh picks a fresh best, not this one again
+    canvas.toBlob((blob) => { if (blob) sendCapture(blob, boxes); }, "image/jpeg", 0.82);
+  }
+
+  /** One upload at a time, with a single holding slot behind it.
+   *
+   *  The old code checked "is an upload in flight" and simply returned — after
+   *  it had already marked the appearance as handled. That combination is what
+   *  lost whole lesions: the next frame saw an appearance that had supposedly
+   *  been filed and throttled it for a full refresh window, measured against
+   *  the PREVIOUS appearance's timestamp, so a lesion that came and went inside
+   *  that window was never filed at all. Deferring instead of dropping means
+   *  the bookkeeping above can be honest — the capture really will be sent. */
+  function sendCapture(blob: Blob, boxes: Box[]) {
+    if (uploadingRef.current) { deferredRef.current = { blob, boxes }; return; }
+    uploadingRef.current = true;
+    const fd = new FormData();
+    fd.append("file", blob, "frame.jpg");
+    fd.append("ai_detections", JSON.stringify(boxes));
+    // No clip: for a played file the position in that file is the whole
+    // answer, and it costs nothing to send.
+    const v = videoRef.current;
+    if (v) fd.append("video_offset_ms", String(Math.round(v.currentTime * 1000)));
+    void (async () => {
       try {
         await fetch(`${API}/api/feedback/${caseId}/auto-capture`, { method: "POST", body: fd });
         setFeedbackRefreshKey((k) => k + 1);
-      } catch { /* best-effort — don't interrupt the live loop over this */ } finally { uploadingRef.current = false; }
-    }, "image/jpeg", 0.85);
+      } catch {
+        /* best-effort — never interrupt the live loop over this */
+      } finally {
+        uploadingRef.current = false;
+        const next = deferredRef.current;
+        deferredRef.current = null;
+        if (next) sendCapture(next.blob, next.boxes);
+      }
+    })();
   }
+
+
 
   // Live loop — send whatever frame is currently playing → wait for result → send next.
   // The video plays continuously (at the chosen speed); we just grab whatever frame is
@@ -354,6 +597,21 @@ export default function RealtimePlayer({
     scanRef.current = true;
     video.loop = false;
     video.playbackRate = speed;
+
+    // Seek before playing, so the first inferred frame is inside the window
+    // rather than wherever the scrub bar happened to be left.
+    const a = parseFloat(winStart), b = parseFloat(winStop);
+    winRef.current = (isFinite(a) || isFinite(b))
+      ? { a: isFinite(a) ? a : 0, b: isFinite(b) ? b : Infinity }
+      : null;
+    if (winRef.current) {
+      video.currentTime = winRef.current.a;
+      await new Promise<void>((res) => {
+        const done = () => { video.removeEventListener("seeked", done); res(); };
+        video.addEventListener("seeked", done);
+      });
+      temporal.reset();   // no carry-over of confirmations between runs
+    }
     await video.play();
 
     while (scanRef.current) {
@@ -361,6 +619,12 @@ export default function RealtimePlayer({
       if (!ws || ws.readyState !== WebSocket.OPEN || !video.videoWidth) {
         await new Promise<void>((res) => requestAnimationFrame(() => res()));
         continue;
+      }
+
+      if (winRef.current && video.currentTime >= winRef.current.b) {
+        scanRef.current = false;
+        video.pause();
+        break;
       }
 
       sampleFov(video);
@@ -374,6 +638,9 @@ export default function RealtimePlayer({
       cap.width   = capW;
       cap.height  = capH;
       cap.getContext("2d")!.drawImage(video, srcX, srcY, srcW, srcH, 0, 0, capW, capH);
+      // Grabbed now, from this same video frame, so a filed capture and the boxes
+      // drawn on it describe the same instant. See grabCapture.
+      const hi = grabCapture(video, srcX, srcY, srcW, srcH);
 
       // Out of body: no JPEG encode, no round trip, no inference. The panel keeps
       // showing the real frame with no boxes, so it stays obvious that the feed is
@@ -382,16 +649,22 @@ export default function RealtimePlayer({
       if (!inBody.shouldInfer(cap)) {
         updateBoxes([]);
         drawAnalyzedFrame(cap, []);
+        // Let the appearance state machine see the quiet frame — see the else
+        // branch below the inference call for why this matters.
+        maybeAutoCapture([], null, null);
         await new Promise<void>((res) => setTimeout(res, 100));
         continue;
       }
 
       // Second gate: inside the patient, but the picture is too poor to be worth a
       // forward pass. Same contract as the first -- nothing is encoded or sent.
-      // Off by default; see useQualityGate for the measured reason why.
+      // ON by default at level "medium" (useQualityGate.ts), which by the table
+      // in lib/frameQuality also rejects ~3.5% of frames a doctor labelled as
+      // containing a polyp. That is a real cost, paid before inference runs.
       if (!quality.shouldInfer(cap)) {
         updateBoxes([]);
         drawAnalyzedFrame(cap, []);
+        maybeAutoCapture([], null, null);
         await new Promise<void>((res) => setTimeout(res, 100));
         continue;
       }
@@ -411,10 +684,18 @@ export default function RealtimePlayer({
       // Draw the frame + its boxes together, win or lose (a timeout leaves the last good frame up)
       if (result) {
         // One gate for both what is shown and what is kept.
-        const shown = result.boxes.filter((b) => b.conf >= confMinRef.current);
+        const shown = temporal.filter(
+          result.boxes.filter((b) => b.conf >= confMinRef.current));
         updateBoxes(shown);
         drawAnalyzedFrame(cap, shown);
-        maybeAutoCapture(cap, shown);
+        maybeAutoCapture(shown, cap, hi);
+      } else {
+        // A timed-out frame is not evidence the lesion left, but it is not
+        // evidence it is still there either. maybeAutoCapture is the only writer
+        // of the gap timer, so a stretch of skipped frames used to freeze the
+        // state machine mid-appearance and throttle the NEXT lesion against a
+        // stale timestamp. Feeding the quiet frame through lets it close.
+        maybeAutoCapture([], null, null);
       }
     }
   }
@@ -458,7 +739,7 @@ export default function RealtimePlayer({
       ctx.drawImage(video, 0, 0, cap.width, cap.height);
       updateBoxes(boxes);
       drawAnalyzedFrame(cap, boxes);
-      maybeAutoCapture(cap, boxes);
+      maybeAutoCapture(boxes, cap, grabCapture(video, 0, 0, video.videoWidth, video.videoHeight));
       setStats((s) => ({ sent: s.sent + 1, received: s.received + 1, avgMs: 0 }));
     }
   }
@@ -501,7 +782,7 @@ export default function RealtimePlayer({
    *  clips leaves a stale "Polyp detected" lit over footage that has none. */
   function resetClipState() {
     setIsDemo(false);
-    inEpisodeRef.current = false;
+    resetEpisode();
     lastDetectionRef.current = 0;
     scanRef.current = false;
     setPolyp(false);
@@ -773,6 +1054,37 @@ export default function RealtimePlayer({
             <InBodyGateNotice gate={inBody} />
 
             <QualityGateNotice gate={quality} />
+
+            {/* Exact seconds to replay. The whole point of the persistence
+                experiment is running identical frames twice, which eyeballing
+                the scrub bar cannot deliver. */}
+            <div data-testid="test-window" className="space-y-1">
+              <p className="text-xs text-gray-500 uppercase tracking-wide">{t("Test window")}</p>
+              <div dir="ltr" className="flex items-center gap-2 text-xs">
+                <input value={winStart} onChange={(e) => setWinStart(e.target.value)}
+                       placeholder="start s" inputMode="decimal"
+                       className="w-20 px-2 py-1 rounded-md bg-gray-800 border border-gray-700 text-gray-200 font-mono" />
+                <span className="text-gray-600">→</span>
+                <input value={winStop} onChange={(e) => setWinStop(e.target.value)}
+                       placeholder="stop s" inputMode="decimal"
+                       className="w-20 px-2 py-1 rounded-md bg-gray-800 border border-gray-700 text-gray-200 font-mono" />
+                {(winStart || winStop) && (
+                  <button onClick={() => { setWinStart(""); setWinStop(""); }}
+                          className="text-xs px-2 py-0.5 rounded-md border border-gray-800 text-gray-500 hover:text-gray-300">
+                    {t("Clear")}
+                  </button>
+                )}
+              </div>
+              <p className="text-[11px] text-gray-600">
+                {winStart || winStop
+                  ? t("Seeks to the start on play and stops at the end. Persistence counters reset each run.")
+                  : t("Empty = play the whole clip. Set both to replay identical frames with persistence on and off.")}
+              </p>
+            </div>
+
+            <TemporalGateNotice gate={temporal} />
+
+            <FilterBankNotice gate={gate} temporal={temporal} show={showBank} onToggle={() => setShowBank(!showBank)} />
 
             {/* Live source underneath, as the reference feed */}
             <div className="space-y-1">

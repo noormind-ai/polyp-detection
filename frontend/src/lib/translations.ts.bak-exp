@@ -1,22 +1,6 @@
 // Farsi translations, gettext-style: the English source string is the lookup
 // key (same convention used in OrganAI's translations, kept consistent here).
 export const FA: Record<string, string> = {
-  "Saved Video": "ویدیوی ذخیره‌شده",
-  "Replay a clip through the live pipeline": "پخش دوباره یک کلیپ از مسیر پردازش زنده",
-  "Saved video, live camera and screen share all run the same pipeline — each starts a session when you open it.": "ویدیوی ذخیره‌شده، دوربین زنده و اشتراک صفحه همگی از یک مسیر پردازش عبور می‌کنند — هرکدام با باز شدن، یک نشست آغاز می‌کند.",
-  "Test window": "بازهٔ آزمایش",
-  "Clear": "پاک کردن",
-  "Run the window again": "اجرای دوبارهٔ بازه",
-  "Run the window from its start": "اجرای بازه از ابتدای آن",
-  "Stopped at the end of the window. Change the persistence setting and run it again for the second pass.": "در پایان بازه متوقف شد. تنظیم پایداری را تغییر دهید و برای اجرای دوم دوباره آن را اجرا کنید.",
-  "Seeks to the start when the clip is loaded and stops at the end. Persistence counters reset each run.": "با بارگذاری کلیپ به ابتدای بازه می‌رود و در پایان متوقف می‌شود. شمارنده‌های پایداری در هر اجرا صفر می‌شوند.",
-  "Empty = play the whole clip. Set both to replay identical frames with persistence on and off.": "خالی = پخش کل کلیپ. برای پخش دوبارهٔ فریم‌های یکسان با پایداری روشن و خاموش، هر دو را پر کنید.",
-  "From this computer": "از این رایانه",
-  "Use a clip from this computer": "استفاده از کلیپی در این رایانه",
-  "Your clip: {name}": "کلیپ شما: {name}",
-  "Replay a saved clip": "پخش دوبارهٔ یک کلیپ ذخیره‌شده",
-  "A bundled clip, a session already recorded here, or a file from this computer. All three go through the same pipeline a capture card drives — which is what makes a replay a rehearsal rather than a preview.": "یک کلیپ همراه برنامه، نشستی که پیش‌تر همین‌جا ضبط شده، یا فایلی از این رایانه. هر سه از همان مسیری عبور می‌کنند که کارت تصویربرداری هدایت می‌کند — و همین است که پخش دوباره را به تمرین تبدیل می‌کند، نه پیش‌نمایش.",
-  "Use a real camera instead": "به جای آن از دوربین واقعی استفاده کنید",
   "Polyp Detection AI": "هوش مصنوعی تشخیص پولیپ",
   "Real-time colonoscopy polyp detection · YOLOv5 · Kvasir-SEG · mAP50 0.93": "تشخیص بلادرنگ پولیپ در کولونوسکوپی · YOLOv5 · Kvasir-SEG · mAP50 0.93",
   "Backend error {status}: {text}": "خطای بک‌اند {status}: {text}",
@@ -174,10 +158,6 @@ export const FA: Record<string, string> = {
   "box": "کادر",
   "Confirmed polyps": "پولیپ‌های تأییدشده",
   "False alarms": "هشدارهای کاذب",
-  "Sound on": "صدا روشن",
-  "Sound off": "صدا خاموش",
-  "Sound a short alert once a detection has held for {sec}s — the loudest signal gets the strictest bar.":
-    "پس از آنکه یک تشخیص {sec} ثانیه پایدار ماند، هشدار کوتاه صوتی پخش می‌شود — بلندترین سیگنال، سخت‌گیرانه‌ترین شرط را دارد.",
   "Dr. found, AI missed": "پزشک یافت، هوش مصنوعی تشخیص نداد",
   "Dr. noticed first": "پزشک ابتدا متوجه شد",
   "AI caught it first": "هوش مصنوعی ابتدا تشخیص داد",

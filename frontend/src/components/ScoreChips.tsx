@@ -17,14 +17,20 @@ import type { Term } from "@/lib/inBody";
  * fact.
  */
 export default function ScoreChips({
-  terms, z, p, tooDark, note,
+  terms, z, p, tooDark, note, summary, legend,
 }: {
   terms: Term[];
-  z: number;
-  p: number;
-  tooDark: boolean;
+  z?: number;
+  p?: number;
+  tooDark?: boolean;
   /** Optional caption, e.g. to say motion is unavailable on a still image. */
   note?: string;
+  /** Replaces the in-body total/probability line. The chip grid is the reusable
+   *  part; what the numbers add up to is not the same question in every panel,
+   *  so a caller with a different verdict supplies its own line. */
+  summary?: React.ReactNode;
+  /** Replaces "green pushes inside · amber pushes outside". */
+  legend?: string;
 }) {
   const { t } = useLanguage();
   if (terms.length === 0) return null;
@@ -51,16 +57,21 @@ export default function ScoreChips({
           );
         })}
       </div>
-      <div className="font-mono text-[10px] text-gray-500">
-        {tooDark
-          ? t("too dark to judge colour → outside")
-          : `total ${z >= 0 ? "+" : ""}${z.toFixed(1)} → p=${p.toFixed(3)}`}
-        <span className={`ml-2 ${p > 0.5 ? "text-emerald-400/70" : "text-amber-400/70"}`}>
-          {p > 0.5 ? t("in body") : t("out of body")}
-        </span>
-      </div>
+      {summary !== undefined ? (
+        <div className="font-mono text-[10px] text-gray-500">{summary}</div>
+      ) : (
+        <div className="font-mono text-[10px] text-gray-500">
+          {tooDark
+            ? t("too dark to judge colour → outside")
+            : `total ${(z ?? 0) >= 0 ? "+" : ""}${(z ?? 0).toFixed(1)} → p=${(p ?? 0).toFixed(3)}`}
+          <span className={`ml-2 ${(p ?? 0) > 0.5 ? "text-emerald-400/70" : "text-amber-400/70"}`}>
+            {(p ?? 0) > 0.5 ? t("in body") : t("out of body")}
+          </span>
+        </div>
+      )}
       <p className="text-[10px] text-gray-700">
-        {note ? `${note} · ` : ""}{t("green pushes inside · amber pushes outside")}
+        {note ? `${note} · ` : ""}
+        {legend ?? t("green pushes inside · amber pushes outside")}
       </p>
     </div>
   );

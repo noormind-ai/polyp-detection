@@ -9,7 +9,6 @@ import { useLanguage } from "@/lib/i18n";
 import { useInBodyGate } from "@/lib/useInBodyGate";
 import InBodyGateNotice from "./InBodyGateNotice";
 import { useQualityGate } from "@/lib/useQualityGate";
-import { frameQuality } from "@/lib/frameQuality";
 import QualityGateNotice from "./QualityGateNotice";
 import FilterBankNotice, { type GateState } from "./FilterBankNotice";
 import { useTemporalGate } from "@/lib/useTemporalGate";
@@ -35,64 +34,15 @@ const SPEEDS = [0.1, 0.25, 0.5, 0.7, 1, 1.5, 2];
 // per-frame one. Several rather than one because the union of several frames
 // cannot be fooled by a single dark frame — see lib/fov.ts.
 const FOV_SAMPLE_FRAMES = 8;
-// A polyp that is STILL on screen is re-filed at most this often, so a long
-// look is not represented in the queue by a single frame.
+// Same throttle as the real-time player: once a polyp is flagged, wait this long
+// before auto-capturing again so the queue fills with distinct moments.
+// A polyp that is STILL on screen is re-filed at most this often. A polyp that
+// has just appeared is filed immediately regardless — see maybeAutoCapture.
 const AUTO_CAPTURE_REFRESH_MS = 8000;
 // A detection gap shorter than this counts as the same episode. The detector
 // drops the odd frame on a lesion that never left the screen, and treating that
 // as "gone" would re-trigger a capture on the very next frame.
 const DETECTION_GAP_MS = 1000;
-
-// ---------------------------------------------------------------------------
-// Three tiers of response, each with a harder bar than the last.
-//
-//   tier 1  box on screen   temporal gate, 2-of-3 (~0.5 s)   lib/temporal.ts
-//   tier 2  filed capture   FILE_MIN_MS  + FILE_MIN_HITS
-//   tier 3  audible alert   ALERT_MIN_MS + ALERT_MIN_CONF
-//
-// Cheapest signal, loosest bar; loudest signal, tightest bar. The thresholds
-// are the operating points Holzwanger et al. (Endoscopy 2021) measured for how
-// long a CADe detection has to last before it carries information -- CADe
-// specificity/accuracy 93.2%/97.8% at >=0.5 s, 98.6%/99.5% at >=1 s, and
-// 99.8%/99.9% at >=2 s. The same work found that over 95% of per-frame false
-// positives are ignored by endoscopists outright, which is why a single frame
-// triggers nothing here but a box.
-//
-// The bar rises with the cost of being wrong. A spurious box is glanced at and
-// dismissed; a spurious capture wastes a reviewer's time; a spurious beep is
-// the one that does damage -- CADe alert fatigue tracks with adenoma detection
-// falling from 49.9% to 39.9% across a list.
-// ---------------------------------------------------------------------------
-
-// Tier 2 -- file a capture. Both bars must be cleared: an appearance has to
-// have lasted this long AND been seen on this many inferred frames, so neither
-// a slow frame rate nor a burst of frames on its own can carry it.
-const FILE_MIN_MS   = 1000;
-const FILE_MIN_HITS = 2;
-// Tier 3 -- sound the alert. Twice tier 2's patience, plus a confidence floor,
-// because this is the tier that interrupts the room. Fires once per appearance.
-const ALERT_MIN_MS   = 2000;
-const ALERT_MIN_CONF = 0.5;
-
-// FILE_MIN_MS is also the window over which the best frame of an appearance is
-// chosen, which is not a coincidence: the delay spent making sure is the same
-// delay spent finding a better picture, so waiting costs nothing twice.
-//
-// Why the best frame and not the first: a lesion "appears" precisely because
-// the scope is moving, so the rising-edge frame is systematically the worst of
-// the encounter -- blurred, half out of frame, or partly occluded. What a
-// reviewer needs is the clearest look, not the earliest one.
-const BEST_W_SHARP = 0.5, BEST_W_CONF = 0.3, BEST_W_SIZE = 0.2;
-// Mean Sobel gradient saturates around here on an in-focus frame; see the
-// operating-point table in lib/frameQuality.ts.
-const SHARP_REF = 30;
-// Longest edge of a filed frame. The inference canvas is INFER_WIDTH (320) --
-// enough for the model, not enough for a human, and the doctor-found path has
-// always saved 960. Both paths now agree.
-const CAPTURE_EDGE = 960;
-// Off unless the operator asks for it: switching on audio in a procedure room
-// is their call, not a default.
-const ALERT_KEY = "polyp_alert_sound";
 
 // A demo clip is a third source alongside the two real ones, and a recording
 // already on this server is a fourth. Neither is a separate playback mode: the
@@ -100,17 +50,13 @@ const ALERT_KEY = "polyp_alert_sound";
 // and session-recording path, so from here down both behave like a camera.
 // That is the point of replaying a recording — it is not a preview, it is the
 // live pipeline fed from a file instead of from the capture card.
-type CaptureMode = "camera" | "screen" | "demo" | "recording" | "local";
+type CaptureMode = "camera" | "screen" | "demo" | "recording";
 // Demo entries share the device <select> with real cameras, so their option
 // values have to be distinguishable from a deviceId.
 const DEMO_PREFIX = "demo:";
 // Recordings share the same <select>, so their option values have to be
 // distinguishable from both a deviceId and a demo filename.
 const REC_PREFIX = "rec:";
-// A clip the operator picked off their own machine. It joins the same list
-// as the bundled demos rather than getting a control of its own: from the
-// pipeline's point of view the three file sources are indistinguishable.
-const LOCAL_PREFIX = "local:";
 
 /** Just the fields the source picker needs — RecordingsPanel owns the full shape. */
 interface ServerRecording {
@@ -137,7 +83,7 @@ function describeRecording(r: ServerRecording): string {
 interface Box { bbox: [number, number, number, number]; conf: number; }
 interface Timing { recv_ms: number; modal_ms: number; total_ms: number; }
 
-export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = "/api/ws/infer", initialMode = "camera", backend }: { caseId: string; onStop: () => void; onActivity?: () => void; wsPath?: string; initialMode?: "camera" | "screen" | "demo"; backend?: string }) {
+export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = "/api/ws/infer", initialMode = "camera", backend }: { caseId: string; onStop: () => void; onActivity?: () => void; wsPath?: string; initialMode?: "camera" | "screen"; backend?: string }) {
   const { t } = useLanguage();
   // Cheap colour gate in front of the detector: while the camera is outside the
   // patient there is nothing to detect, so the frame is never sent. The operator
@@ -151,17 +97,6 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // survive several consecutive frames before it is drawn. Artefacts flicker;
   // a polyp in view does not.
   const temporal = useTemporalGate();
-  // Exact test window, in seconds. The comparison this exists for -- the same
-  // footage with persistence on and off -- is only a comparison if both runs
-  // cover identical frames, and "I pressed stop at about the same place" is
-  // not identical. Only a file-backed source has a timeline to hold to: a
-  // camera runs once, forwards, and cannot be asked for the same seconds twice.
-  const [winStart, setWinStart] = useState("");
-  const [winStop, setWinStop] = useState("");
-  const winRef = useRef<{ a: number; b: number } | null>(null);
-  // Set when the loop has stopped itself at the end of the window, so play
-  // means "run it again" rather than "resume past what was being measured".
-  const [winDone, setWinDone] = useState(false);
   // The engine is pinned for the life of the socket — the server reads it once,
   // so the latency average never blends two very different backends.
   const WS_URL = `${API_WS}${wsPath}${backend ? `?backend=${encodeURIComponent(backend)}` : ""}`;
@@ -181,41 +116,6 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // little — an episode that is still on screen files one on the next refresh.
   const uploadingRef       = useRef(false);
   const lastBoxesRef = useRef<Box[]>([]); // AI's most recent detections — attached as context to manual captures
-
-  // One appearance of a lesion, as a small state machine. `hits` and `start`
-  // decide which tier has been earned; `best` holds the best frame seen so far,
-  // and `filed`/`alerted` make each tier fire once rather than once per frame.
-  const episodeStartRef   = useRef(0);
-  const episodeHitsRef    = useRef(0);
-  const episodeFiledRef   = useRef(false);
-  const episodeAlertedRef = useRef(false);
-  const bestRef = useRef<{ score: number; boxes: Box[] } | null>(null);
-  // Two scratch canvases, reused for the life of the session: the frame being
-  // considered, and the best one held so far. A fresh 960px canvas per inferred
-  // frame would be megabytes a second of garbage on a clinic PC.
-  const hiScratchRef  = useRef<HTMLCanvasElement | null>(null);
-  const bestCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const audioCtxRef   = useRef<AudioContext | null>(null);
-  // At most one capture may wait behind an in-flight upload. More than one and
-  // we are back to queueing POSTs against the same upstream the frame stream
-  // uses; none at all and a capture that merely coincided with a busy uplink is
-  // lost outright — which is a lesion the reviewer never sees.
-  const deferredRef = useRef<{ blob: Blob; boxes: Box[] } | null>(null);
-  // Tier 3 is opt-in and remembered, like the other gates.
-  const [alertEnabled, setAlertEnabledState] = useState(false);
-  const alertEnabledRef = useRef(false);
-  function setAlertEnabled(on: boolean) {
-    alertEnabledRef.current = on;
-    setAlertEnabledState(on);
-    try { localStorage.setItem(ALERT_KEY, on ? "1" : "0"); } catch { /* ignore */ }
-  }
-  useEffect(() => {
-    try {
-      const on = localStorage.getItem(ALERT_KEY) === "1";
-      alertEnabledRef.current = on;
-      setAlertEnabledState(on);
-    } catch { /* ignore */ }
-  }, []);
 
   // Pending response promise resolver — one in-flight request at a time
   const pendingRef = useRef<((v: { boxes: Box[]; timing: Timing } | null) => void) | null>(null);
@@ -251,10 +151,6 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // would otherwise read whatever the mode was when it started.
   const captureModeRef = useRef<CaptureMode>("camera");
   const [demoFile, setDemoFile]           = useState<string | null>(null);
-  // A clip from the operator's own machine, held as an object URL for as long
-  // as it stays in the source list. Same-origin, so the canvas stays readable
-  // and the FOV probe keeps working.
-  const [localFile, setLocalFile]         = useState<{ url: string; name: string } | null>(null);
   // Recordings already on this server, offered as a capture source so a past
   // session can be pushed back through the live pipeline exactly as it ran.
   const [recordings, setRecordings]       = useState<ServerRecording[]>([]);
@@ -318,13 +214,6 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   const [fovRect, setFovRectState] = useState<Rect | null>(null);
   const fovRectRef  = useRef<Rect | null>(null);
   const fovSamplesRef = useRef(0);
-  // The region the FOV was measured INSIDE, in native frame pixels. With a
-  // screen-share crop active that is the crop, not the frame — and "how much
-  // does this trim" only means anything relative to it.
-  const [fovBase, setFovBase] = useState<Rect | null>(null);
-  const fovBaseRef = useRef<Rect | null>(null);
-  // Scratch canvas for measuring the picture area inside the crop.
-  const fovProbeRef = useRef<HTMLCanvasElement | null>(null);
   // Native frame size the rect was measured against — needed to express it as a
   // fraction for the overlay, and not the same as the analyzed `aspect`.
   const [fovFrame, setFovFrame] = useState<{ w: number; h: number } | null>(null);
@@ -348,8 +237,6 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   function resetFovDetection() {
     fovRectRef.current = null;
     fovSamplesRef.current = 0;
-    fovBaseRef.current = null;
-    setFovBase(null);
     setFovRectState(null);
     setFovFrame(null);
     setShowFovOverlay(false);
@@ -391,11 +278,6 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   function setCropRect(rect: typeof cropRect) {
     cropRectRef.current = rect;
     setCropRectState(rect);
-    // The FOV is measured inside the crop, so changing the crop invalidates it.
-    // Without this the rect in force stayed the one measured on the uncropped
-    // desktop, before the operator had drawn anything — and it was never
-    // re-measured, because sampling stops after FOV_SAMPLE_FRAMES.
-    resetFovDetection();
     try {
       if (rect) localStorage.setItem(CROP_KEY, JSON.stringify(rect));
       else localStorage.removeItem(CROP_KEY);
@@ -527,18 +409,11 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     // on what is worth sending, so both apply. Intersecting also means a region
     // drawn tightly inside the picture is never widened back out by this.
     const fov = fovEnabledRef.current ? fovRectRef.current : null;
-    if (!fov) return base;
-    const r = intersectRect(base, fov);
-    if (r.w <= 0 || r.h <= 0) return base;
     // A frame that arrived already cropped trims a percent or two; applying that
     // buys nothing and only adds a coordinate transform to every capture.
-    //
-    // Measured against what we would OTHERWISE send, not against the whole
-    // signal. With a screen-share crop those are very different numbers: a real
-    // border inside the crop looked like nothing next to the full frame, so it
-    // was discarded as negligible every time.
-    if (1 - (r.w * r.h) / (base.w * base.h) < NEGLIGIBLE_TRIM) return base;
-    return r;
+    if (!fov || trimmedFraction(fov, vw, vh) < NEGLIGIBLE_TRIM) return base;
+    const r = intersectRect(base, fov);
+    return r.w > 0 && r.h > 0 ? r : base;
   }
 
   // Measure the picture area from the first frames of the session, then leave
@@ -548,44 +423,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     if (fovSamplesRef.current >= FOV_SAMPLE_FRAMES) return;
     fovSamplesRef.current += 1;
     const vw = video.videoWidth, vh = video.videoHeight;
-    if (!vw || !vh) return;
-    // Measure INSIDE the operator's crop, never on the whole signal.
-    //
-    // On a screen share the signal is a desktop. Chrome and white UI are "lit"
-    // at any luma threshold, so the detected span is the entire frame, the trim
-    // reads as ~0, and the border that actually matters — the processor's,
-    // inside the shared window — is never found at all. When the desktop IS
-    // dark enough to detect something, fov.ts then refuses any rect under
-    // MIN_AREA_FRACTION of what it was handed, so the correct answer gets
-    // thrown out for being "small" relative to a screen; and unionRect, which
-    // only ever widens, swallows any bright dialog that appears while sampling.
-    // All three failures are the same mistake: measuring the wrong region.
-    const crop = captureModeRef.current !== "camera" ? cropRectRef.current : null;
-    const base: Rect = crop
-      ? { x: Math.round(crop.x * vw), y: Math.round(crop.y * vh),
-          w: Math.round(crop.w * vw), h: Math.round(crop.h * vh) }
-      : { x: 0, y: 0, w: vw, h: vh };
-    if (base.w <= 0 || base.h <= 0) return;
-    let found: Rect | null;
-    if (crop) {
-      const probe = fovProbeRef.current ?? (fovProbeRef.current = document.createElement("canvas"));
-      if (probe.width !== base.w) probe.width = base.w;
-      if (probe.height !== base.h) probe.height = base.h;
-      probe.getContext("2d")!.drawImage(video, base.x, base.y, base.w, base.h, 0, 0, base.w, base.h);
-      const r = detectFovRect(probe, base.w, base.h);
-      // Back into full-frame coordinates: everything downstream — fovNorm, the
-      // overlay, the intersect in sourceRect — speaks native frame pixels.
-      found = r ? { x: r.x + base.x, y: r.y + base.y, w: r.w, h: r.h } : null;
-    } else {
-      found = detectFovRect(video, vw, vh);
-    }
+    const found = detectFovRect(video, vw, vh);
     if (!found) return;
     const merged = unionRect(fovRectRef.current, found);
     fovRectRef.current = merged;
-    fovBaseRef.current = base;
-    setFovBase((prev) =>
-      prev && prev.x === base.x && prev.y === base.y
-        && prev.w === base.w && prev.h === base.h ? prev : base);
     setFovFrame((prev) => (prev && prev.w === vw && prev.h === vh ? prev : { w: vw, h: vh }));
     // Only push to React state when it actually moved — this runs inside the
     // capture loop and a setState per frame would re-render the whole player.
@@ -594,101 +435,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         && prev.w === merged.w && prev.h === merged.h ? prev : merged);
   }
 
-  /** Score one candidate frame of an appearance; higher is the better keepsake.
-   *  Measured on the 320px inference canvas, which is what the thresholds in
-   *  lib/frameQuality were calibrated against. */
-  function frameScore(cap: HTMLCanvasElement, boxes: Box[]): number {
-    const m = frameQuality(cap);
-    const sharp = m ? Math.min(1, m.gradmean / SHARP_REF) : 0.5;
-    let conf = 0, area = 0;
-    for (const b of boxes) {
-      if (b.conf > conf) conf = b.conf;
-      const a = Math.max(0, b.bbox[2] - b.bbox[0]) * Math.max(0, b.bbox[3] - b.bbox[1]);
-      if (a > area) area = a;
-    }
-    const frameArea = cap.width * cap.height;
-    // Square-rooted so this reads as "how far across the frame", not as area.
-    const size = frameArea > 0 ? Math.min(1, Math.sqrt(area / frameArea)) : 0;
-    return BEST_W_SHARP * sharp + BEST_W_CONF * conf + BEST_W_SIZE * size;
-  }
-
-  /** Grab the frame a reviewer will look at, from the SAME video frame the
-   *  model was given. Re-grabbing after the inference round trip would file an
-   *  image the boxes no longer describe -- on CPU that trip is a couple of
-   *  hundred milliseconds, and the scope moves in that time. */
-  function grabCapture(video: HTMLVideoElement, sx: number, sy: number, sw: number, sh: number) {
-    const scale = Math.min(1, CAPTURE_EDGE / Math.max(sw, sh));
-    const w = Math.max(1, Math.round(sw * scale)), h = Math.max(1, Math.round(sh * scale));
-    const c = hiScratchRef.current ?? (hiScratchRef.current = document.createElement("canvas"));
-    if (c.width !== w) c.width = w;
-    if (c.height !== h) c.height = h;
-    c.getContext("2d")!.drawImage(video, sx, sy, sw, sh, 0, 0, w, h);
-    return c;
-  }
-
-  /** Keep this frame if it is the best of the appearance so far. */
-  function considerBest(cap: HTMLCanvasElement, hi: HTMLCanvasElement | null, boxes: Box[]) {
-    const score = frameScore(cap, boxes);
-    if (bestRef.current && score <= bestRef.current.score) return;
-    const src = hi ?? cap;
-    const dst = bestCanvasRef.current ?? (bestCanvasRef.current = document.createElement("canvas"));
-    if (dst.width !== src.width) dst.width = src.width;
-    if (dst.height !== src.height) dst.height = src.height;
-    dst.getContext("2d")!.drawImage(src, 0, 0);
-    // FeedbackPanel reads ai_detections as pixels of the image it draws them
-    // over (it scales by naturalWidth), and the filed image is no longer the
-    // inference canvas -- so the boxes have to be carried into its space.
-    const k = cap.width > 0 ? src.width / cap.width : 1;
-    const scaled = k === 1 ? boxes : boxes.map((b) => ({
-      ...b,
-      bbox: [
-        Math.round(b.bbox[0] * k), Math.round(b.bbox[1] * k),
-        Math.round(b.bbox[2] * k), Math.round(b.bbox[3] * k),
-      ] as [number, number, number, number],
-    }));
-    bestRef.current = { score, boxes: scaled };
-  }
-
-  function resetEpisode() {
-    inEpisodeRef.current = false;
-    episodeHitsRef.current = 0;
-    episodeFiledRef.current = false;
-    episodeAlertedRef.current = false;
-    bestRef.current = null;
-  }
-
-  /** Tier 3. A short two-tone chirp synthesised on the spot -- no asset to
-   *  ship, no network, and nothing to fail at the one moment it matters. */
-  function alertSound() {
-    if (!alertEnabledRef.current) return;
-    try {
-      const Ctor = window.AudioContext
-        || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-      if (!Ctor) return;
-      const ctx = audioCtxRef.current ?? (audioCtxRef.current = new Ctor());
-      if (ctx.state === "suspended") void ctx.resume();
-      const t0 = ctx.currentTime;
-      [880, 1245].forEach((freq, i) => {
-        const osc = ctx.createOscillator(), gain = ctx.createGain();
-        osc.type = "sine";
-        osc.frequency.value = freq;
-        const s = t0 + i * 0.09;
-        // Ramped rather than switched: a step on a gain node clicks, and a
-        // click in a procedure room reads as equipment trouble.
-        gain.gain.setValueAtTime(0, s);
-        gain.gain.linearRampToValueAtTime(0.18, s + 0.012);
-        gain.gain.linearRampToValueAtTime(0, s + 0.08);
-        osc.connect(gain).connect(ctx.destination);
-        osc.start(s);
-        osc.stop(s + 0.09);
-      });
-    } catch { /* an alert that cannot sound must never break the live loop */ }
-  }
-
-  // Auto-capture — one filed frame per appearance, chosen for being the
-  // clearest frame of that appearance rather than the first one. The tier table
-  // at the top of this file says why each bar is where it is.
-  function maybeAutoCapture(boxes: Box[], cap: HTMLCanvasElement | null, hi: HTMLCanvasElement | null) {
+  // Auto-capture — the clean (no-overlay) frame that was already grabbed for
+  // inference, plus what the model saw, plus a rolling clip if available.
+  // Throttled so a polyp staying in view for a while doesn't flood the queue.
+  function maybeAutoCapture(cap: HTMLCanvasElement, boxes: Box[]) {
     // Filing runs by default and only stops when someone stops it. Detection
     // itself keeps running and stays visible on screen either way — this only
     // decides whether a detection is worth keeping.
@@ -699,104 +449,48 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     if (!procedureStartedRef.current) return;
     const now = Date.now();
 
-    if (boxes.length === 0 || !cap) {
-      // The appearance is over once the detector has been quiet for longer than
-      // a single dropped frame. Flush whatever the best frame of it was: an
-      // appearance that ended before FILE_MIN_MS elapsed is still real, so the
-      // window only ever DELAYS a capture -- FILE_MIN_HITS is the only thing
-      // that suppresses one outright.
-      if (inEpisodeRef.current && now - lastDetectionRef.current > DETECTION_GAP_MS) {
-        if (episodeHitsRef.current >= FILE_MIN_HITS) flushBest(now);
-        resetEpisode();
-      }
+    if (boxes.length === 0) {
+      if (now - lastDetectionRef.current > DETECTION_GAP_MS) inEpisodeRef.current = false;
       return;
     }
     lastDetectionRef.current = now;
 
-    if (!inEpisodeRef.current) {
+    // The event worth reviewing is a polyp APPEARING, so capture on the rising
+    // edge. A fixed cooldown could not tell a new lesion from the one already on
+    // screen, so a second polyp arriving inside the window was dropped entirely
+    // while a single polyp was re-filed every few seconds. Edge-triggering
+    // inverts that: every distinct appearance lands, and one that lingers is
+    // only refreshed occasionally instead of once per frame.
+    if (inEpisodeRef.current) {
+      if (now - lastAutoCaptureRef.current < AUTO_CAPTURE_REFRESH_MS) return;
+    } else {
       inEpisodeRef.current = true;
-      episodeStartRef.current = now;
-      episodeHitsRef.current = 0;
-      episodeFiledRef.current = false;
-      episodeAlertedRef.current = false;
-      bestRef.current = null;
     }
-    episodeHitsRef.current += 1;
-    considerBest(cap, hi, boxes);
-
-    const age = now - episodeStartRef.current;
-
-    // Tier 3 — the alert. Deliberately independent of the capture path: a
-    // capture can sit behind a slow uplink, and telling the room about a lesion
-    // must never wait on an upload queue.
-    if (!episodeAlertedRef.current && age >= ALERT_MIN_MS
-        && episodeHitsRef.current >= FILE_MIN_HITS
-        && boxes.some((b) => b.conf >= ALERT_MIN_CONF)) {
-      episodeAlertedRef.current = true;
-      alertSound();
-    }
-
-    // Tier 2 — the capture. First filing waits for the window to close; after
-    // that a lesion still on screen is refreshed occasionally, so a long look is
-    // not represented by one frame.
-    if (episodeHitsRef.current < FILE_MIN_HITS) return;
-    const due = episodeFiledRef.current
-      ? now - lastAutoCaptureRef.current >= AUTO_CAPTURE_REFRESH_MS
-      : age >= FILE_MIN_MS;
-    if (due) flushBest(now);
-  }
-
-  /** Tier 2. Hand the best frame of this appearance to the uploader. */
-  function flushBest(now: number) {
-    const best = bestRef.current;
-    const canvas = bestCanvasRef.current;
-    if (!best || !canvas) return;
-    episodeFiledRef.current = true;
+    // An upload still in flight means the uplink is already busy; filing
+    // another now is what turns a slow link into a stalled page.
+    if (uploadingRef.current) return;
     lastAutoCaptureRef.current = now;
-    const boxes = best.boxes;
-    bestRef.current = null;  // a refresh picks a fresh best, not this one again
-    canvas.toBlob((blob) => { if (blob) sendCapture(blob, boxes); }, "image/jpeg", 0.82);
-  }
 
-  /** One upload at a time, with a single holding slot behind it.
-   *
-   *  The old code checked "is an upload in flight" and simply returned — after
-   *  it had already marked the appearance as handled. That combination is what
-   *  lost whole lesions: the next frame saw an appearance that had supposedly
-   *  been filed and throttled it for a full refresh window, measured against
-   *  the PREVIOUS appearance's timestamp, so a lesion that came and went inside
-   *  that window was never filed at all. Deferring instead of dropping means
-   *  the bookkeeping above can be honest — the capture really will be sent. */
-  function sendCapture(blob: Blob, boxes: Box[]) {
-    if (uploadingRef.current) { deferredRef.current = { blob, boxes }; return; }
-    uploadingRef.current = true;
-    const fd = new FormData();
-    fd.append("file", blob, "frame.jpg");
-    fd.append("ai_detections", JSON.stringify(boxes));
-    // No clip. The session recording already holds this moment, so all a
-    // reviewer needs is where to seek to — a few bytes instead of the ~250 KB
-    // of video that was starving the live frame stream.
-    const at = recorder.mark();
-    if (at) {
-      fd.append("recording_id", at.recordingId);
-      fd.append("video_offset_ms", String(at.offsetMs));
-    }
-    void (async () => {
+    cap.toBlob(async (blob) => {
+      if (!blob) return;
+      const fd = new FormData();
+      fd.append("file", blob, "frame.jpg");
+      fd.append("ai_detections", JSON.stringify(boxes));
+      // No clip. The session recording already holds this moment, so all a
+      // reviewer needs is where to seek to — a few bytes instead of the ~250 KB
+      // of video that was starving the live frame stream.
+      const at = recorder.mark();
+      if (at) {
+        fd.append("recording_id", at.recordingId);
+        fd.append("video_offset_ms", String(at.offsetMs));
+      }
+      uploadingRef.current = true;
       try {
         await fetch(`${API}/api/feedback/${caseId}/auto-capture`, { method: "POST", body: fd });
         setFeedbackRefreshKey((k) => k + 1);
-      } catch {
-        /* best-effort — never interrupt the live loop over this */
-      } finally {
-        uploadingRef.current = false;
-        const next = deferredRef.current;
-        deferredRef.current = null;
-        if (next) sendCapture(next.blob, next.boxes);
-      }
-    })();
+      } catch { /* best-effort — never interrupt the live loop over this */ } finally { uploadingRef.current = false; }
+    }, "image/jpeg", 0.85);
   }
-
-
 
   // Instant, no-dialog manual capture of whatever is on screen right now — the
   // one case auto-capture can't cover, a doctor spotting something the model
@@ -844,7 +538,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
 
   // A demo clip or a saved recording is a file, so it has a timeline that staff
   // can scrub. A camera or screen share does not — nothing to seek in a stream.
-  const seekable = captureMode === "demo" || captureMode === "recording" || captureMode === "local";
+  const seekable = captureMode === "demo" || captureMode === "recording";
 
   function handleTimeUpdate() {
     if (videoRef.current) setCurTime(videoRef.current.currentTime);
@@ -877,53 +571,12 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     setCurTime(target);
   }
 
-  /** Read the test-window inputs and put the clip at the start of them.
-   *  Returns false when no window is set, in which case the source plays end
-   *  to end exactly as it always did.
-   *
-   *  Clears the persistence counters on the way in: a second pass over the
-   *  same seconds has to start from the same state as the first, or
-   *  confirmations carry over from the previous run and the two runs are not
-   *  comparable. */
-  async function armWindow(video: HTMLVideoElement): Promise<boolean> {
-    const a = parseFloat(winStart), b = parseFloat(winStop);
-    winRef.current = (isFinite(a) || isFinite(b))
-      ? { a: isFinite(a) ? a : 0, b: isFinite(b) ? b : Infinity }
-      : null;
-    setWinDone(false);
-    if (!winRef.current) return false;
-    // A clip that wrapped round to the beginning would replay part of the
-    // window twice, and count its captures twice with it.
-    video.loop = false;
-    video.currentTime = winRef.current.a;
-    await new Promise<void>((res) => {
-      const done = () => { video.removeEventListener("seeked", done); res(); };
-      video.addEventListener("seeked", done);
-    });
-    temporal.reset();
-    return true;
-  }
-
-  /** Replay the window from its start. Safe to call with the loop stopped at
-   *  the end of a previous run — that is the usual case, since the loop breaks
-   *  out of itself when it reaches the end. */
-  async function rerunWindow() {
-    const video = videoRef.current;
-    if (!video) return;
-    await armWindow(video);
-    await video.play().catch(() => {});
-    startLoop();
-  }
-
   /** Stop and hold on the current frame. The inference loop keeps grabbing that
    *  frozen frame, so the detector — and both gates — keep scoring it, which is
    *  what makes a single moment inspectable. */
   function togglePlay() {
     const video = videoRef.current;
     if (!video) return;
-    // The window ran to its end and stopped the loop with it. Play here means
-    // the next pass of the experiment, not a resume into frames outside it.
-    if (winDone) { void rerunWindow(); return; }
     if (video.paused) video.play().catch(() => {});
     else video.pause();
   }
@@ -959,17 +612,6 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         continue;
       }
 
-      // End of the test window: stop, rather than loop round. Pausing alone is
-      // not enough -- this loop keeps inferring a held frame on purpose, so it
-      // would go on scoring and auto-capturing the last frame of the window
-      // indefinitely, inflating the very count the experiment is measuring.
-      if (winRef.current && video.currentTime >= winRef.current.b) {
-        scanRef.current = false;
-        video.pause();
-        setWinDone(true);
-        break;
-      }
-
       // Before choosing the region, not after — the first frames of a session
       // are exactly the ones that decide it.
       sampleFov(video);
@@ -986,9 +628,6 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       cap.width   = capW;
       cap.height  = capH;
       cap.getContext("2d")!.drawImage(video, srcX, srcY, srcW, srcH, 0, 0, capW, capH);
-      // Grabbed now, from this same video frame, so a filed capture and the boxes
-      // drawn on it describe the same instant. See grabCapture.
-      const hi = grabCapture(video, srcX, srcY, srcW, srcH);
 
       // Out of body: no JPEG encode, no round trip, no inference. The panel keeps
       // showing the real frame with no boxes, so it stays obvious that the feed is
@@ -997,22 +636,16 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       if (!inBody.shouldInfer(cap)) {
         updateBoxes([]);
         drawAnalyzedFrame(cap, []);
-        // Let the appearance state machine see the quiet frame — see the else
-        // branch below the inference call for why this matters.
-        maybeAutoCapture([], null, null);
         await new Promise<void>((res) => setTimeout(res, 100));
         continue;
       }
 
       // Second gate: inside the patient, but the picture is too poor to be worth a
       // forward pass. Same contract as the first -- nothing is encoded or sent.
-      // ON by default at level "medium" (useQualityGate.ts), which by the table
-      // in lib/frameQuality also rejects ~3.5% of frames a doctor labelled as
-      // containing a polyp. That is a real cost, paid before inference runs.
+      // Off by default; see useQualityGate for the measured reason why.
       if (!quality.shouldInfer(cap)) {
         updateBoxes([]);
         drawAnalyzedFrame(cap, []);
-        maybeAutoCapture([], null, null);
         await new Promise<void>((res) => setTimeout(res, 100));
         continue;
       }
@@ -1036,14 +669,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
           result.boxes.filter((b) => b.conf >= confMinRef.current));
         updateBoxes(shown);
         drawAnalyzedFrame(cap, shown);
-        maybeAutoCapture(shown, cap, hi);
-      } else {
-        // A timed-out frame is not evidence the lesion left, but it is not
-        // evidence it is still there either. maybeAutoCapture is the only writer
-        // of the gap timer, so a stretch of skipped frames used to freeze the
-        // state machine mid-appearance and throttle the NEXT lesion against a
-        // stale timestamp. Feeding the quiet frame through lets it close.
-        maybeAutoCapture([], null, null);
+        maybeAutoCapture(cap, shown);
       }
     }
   }
@@ -1110,7 +736,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
    * Loops on purpose: a capture card never reaches an end, and a source that
    * stops would end the session in a way the real one never does.
    */
-  async function startFileSource(src: string, mode: "demo" | "recording" | "local", optionValue: string,
+  async function startFileSource(src: string, mode: "demo" | "recording", optionValue: string,
                                  knownDurationSec = 0) {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     scanRef.current = false;
@@ -1154,10 +780,6 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       streamRef.current = stream;
       setActiveStream(stream);
 
-      // Seek into the window before a single frame is inferred, so the run
-      // covers the seconds asked for and nothing ahead of them.
-      await armWindow(video);
-
       startLoop();
     } catch (err: unknown) {
       setStreaming(false);
@@ -1171,17 +793,6 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     setDemoFile(file);
     setRecordingLabel(null);
     await startFileSource(`${BASE_PATH}/demos/${file}`, "demo", `${DEMO_PREFIX}${file}`);
-  }
-
-  /** A clip off the operator's own machine, played through the pipeline the
-   *  capture card drives. Only where the bytes came from differs from a demo. */
-  async function startLocalFile(file: File) {
-    if (localFile) URL.revokeObjectURL(localFile.url);
-    const url = URL.createObjectURL(file);
-    setLocalFile({ url, name: file.name });
-    setDemoFile(null);
-    setRecordingLabel(null);
-    await startFileSource(url, "local", `${LOCAL_PREFIX}${file.name}`);
   }
 
   async function startRecording(rec: ServerRecording) {
@@ -1294,11 +905,6 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       const rec = recordings.find((r) => r.case_id === caseId && r.id === recId);
       if (rec) startRecording(rec);
     }
-    // Re-selecting the operator's own clip replays the object URL already
-    // held; there is no file to re-read and no second dialog to sit through.
-    else if (id.startsWith(LOCAL_PREFIX)) {
-      if (localFile) startFileSource(localFile.url, "local", id);
-    }
     else startStream(id);
   }
 
@@ -1339,12 +945,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     ? { x: fovRect.x / fovFrame.w, y: fovRect.y / fovFrame.h,
         w: fovRect.w / fovFrame.w, h: fovRect.h / fovFrame.h }
     : null;
-  // Against the region the FOV was measured inside, not the whole frame — with
-  // a screen-share crop those differ by a lot and the full-frame number is
-  // meaningless (see sampleFov).
-  const fovTrim = fovRect && fovBase && fovBase.w > 0 && fovBase.h > 0
-    ? Math.max(0, 1 - (fovRect.w * fovRect.h) / (fovBase.w * fovBase.h))
-    : fovRect && fovFrame ? trimmedFraction(fovRect, fovFrame.w, fovFrame.h) : 0;
+  const fovTrim = fovRect && fovFrame ? trimmedFraction(fovRect, fovFrame.w, fovFrame.h) : 0;
   // Worth acting on only if there is a real border. A frame that arrived already
   // cropped trims a percent or two, and applying that buys nothing.
   const fovWorthIt = !!fovNorm && fovTrim >= NEGLIGIBLE_TRIM;
@@ -1379,64 +980,36 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     wsStatus === "closed" ? t("closed ({code})", { code: closeCode ?? "" }) :
     t(wsStatus);
   const deviceSelect = (
-    <div className="flex flex-wrap items-center justify-center gap-2">
-      <select
-        value={selectedDeviceId}
-        onChange={handleDeviceChange}
-        className="bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white"
-      >
-        {!selectedDeviceId && <option value="">{t("Select a source…")}</option>}
-        {devices.length > 0 && (
-          <optgroup label={t("Cameras")}>
-            {devices.map((d) => (
-              <option key={d.deviceId} value={d.deviceId}>
-                {d.label || t("Camera {id}", { id: d.deviceId.slice(0, 6) })}
-              </option>
-            ))}
-          </optgroup>
-        )}
-        <optgroup label={t("Demo clips")}>
-          {DEMO_VIDEOS.map((v) => (
-            <option key={v.file} value={`${DEMO_PREFIX}${v.file}`}>{t(v.label)}</option>
+    <select
+      value={selectedDeviceId}
+      onChange={handleDeviceChange}
+      className="bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white"
+    >
+      {!selectedDeviceId && <option value="">{t("Select a source…")}</option>}
+      {devices.length > 0 && (
+        <optgroup label={t("Cameras")}>
+          {devices.map((d) => (
+            <option key={d.deviceId} value={d.deviceId}>
+              {d.label || t("Camera {id}", { id: d.deviceId.slice(0, 6) })}
+            </option>
           ))}
         </optgroup>
-        {recordings.length > 0 && (
-          <optgroup label={t("Saved on this server")}>
-            {recordings.map((r) => (
-              <option key={`${r.case_id}/${r.id}`} value={`${REC_PREFIX}${r.case_id}/${r.id}`}>
-                {describeRecording(r)}
-              </option>
-            ))}
-          </optgroup>
-        )}
-        {localFile && (
-          <optgroup label={t("From this computer")}>
-            <option value={`${LOCAL_PREFIX}${localFile.name}`}>{localFile.name}</option>
-          </optgroup>
-        )}
-      </select>
-      {/* Beside the list rather than in it: picking a file is a dialog, not a
-          selection, and a browser will not open one from a <select>.
-
-          A label wrapping the input rather than a button holding a ref to it:
-          this whole control is rendered twice at once — once on the idle screen
-          and once in the running session's controls — and one ref cannot point
-          at two inputs. The label pairs each copy with its own. */}
-      <label className="px-3 py-2 rounded-lg border border-gray-700 bg-gray-900 text-sm text-gray-300 hover:border-gray-500 transition-colors cursor-pointer">
-        {t("Use a clip from this computer")}
-        <input
-          type="file"
-          accept="video/*"
-          className="hidden"
-          onChange={(e) => {
-            const f = e.target.files?.[0];
-            if (f) startLocalFile(f);
-            // Clear it, or picking the same file twice fires no change event.
-            e.target.value = "";
-          }}
-        />
-      </label>
-    </div>
+      )}
+      <optgroup label={t("Demo clips")}>
+        {DEMO_VIDEOS.map((v) => (
+          <option key={v.file} value={`${DEMO_PREFIX}${v.file}`}>{t(v.label)}</option>
+        ))}
+      </optgroup>
+      {recordings.length > 0 && (
+        <optgroup label={t("Saved on this server")}>
+          {recordings.map((r) => (
+            <option key={`${r.case_id}/${r.id}`} value={`${REC_PREFIX}${r.case_id}/${r.id}`}>
+              {describeRecording(r)}
+            </option>
+          ))}
+        </optgroup>
+      )}
+    </select>
   );
 
   return (
@@ -1458,26 +1031,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
               {t("Demo clip: {name}", { name: t(DEMO_VIDEOS.find((v) => v.file === demoFile)?.label ?? demoFile) })}
             </span>
           )}
-          {captureMode === "local" && localFile && (
-            <span className="text-xs px-2 py-0.5 rounded-md border border-purple-800 bg-purple-950/40 text-purple-300">
-              {t("Your clip: {name}", { name: localFile.name })}
-            </span>
-          )}
           {polyp && <span className="text-[#39ff14] font-medium animate-pulse">{t("Polyp detected")}</span>}
-          {/* Tier 3. Off unless asked for: turning on audio in a procedure room
-              is the operator's call, not a default. */}
-          <button
-            onClick={() => setAlertEnabled(!alertEnabled)}
-            title={t("Sound a short alert once a detection has held for {sec}s — the loudest signal gets the strictest bar.",
-                     { sec: ALERT_MIN_MS / 1000 })}
-            className={`text-xs px-2 py-0.5 rounded-md border transition-colors ${
-              alertEnabled
-                ? "border-emerald-700 bg-emerald-950/40 text-emerald-300"
-                : "border-gray-800 text-gray-500 hover:text-gray-300 hover:border-gray-600"
-            }`}
-          >
-            {alertEnabled ? t("Sound on") : t("Sound off")}
-          </button>
         </div>
         <button onClick={() => { stopCamera(); onStop(); }} className="text-sm text-red-400 hover:text-red-300 transition-colors">{t("Stop")}</button>
       </div>
@@ -1506,23 +1060,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
 
       {!streaming && (
         <div className="space-y-4 text-center py-16 border-2 border-dashed border-gray-700 rounded-xl">
-          {initialMode === "demo" ? (
-            <>
-              <p className="text-gray-200 text-lg">{t("Replay a saved clip")}</p>
-              <p className="text-gray-500 text-sm max-w-md mx-auto px-4">
-                {t("A bundled clip, a session already recorded here, or a file from this computer. All three go through the same pipeline a capture card drives — which is what makes a replay a rehearsal rather than a preview.")}
-              </p>
-              <div>{deviceSelect}</div>
-              <div className="pt-2 flex items-center justify-center gap-3 text-xs">
-                <button onClick={requestDevices} className="text-gray-500 hover:text-gray-300 underline transition-colors">
-                  {permission === "requesting" ? t("Requesting access...") : t("Use a real camera instead")}
-                </button>
-                <button onClick={() => startScreenShare("window")} className="text-gray-500 hover:text-gray-300 underline transition-colors">
-                  {t("Share a window instead")}
-                </button>
-              </div>
-            </>
-          ) : initialMode === "screen" ? (
+          {initialMode === "screen" ? (
             <>
               <p className="text-gray-200 text-lg">{t("Share a screen or window")}</p>
               <p className="text-gray-500 text-sm max-w-sm mx-auto px-4">
@@ -1620,7 +1158,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
                 // A fresh start should not inherit the episode state of whatever
                 // was on camera beforehand, or the first real detection is
                 // treated as a continuation and skipped.
-                resetEpisode();
+                inEpisodeRef.current = false;
                 lastAutoCaptureRef.current = 0;
               }}
               className={`w-full md:w-auto py-2.5 px-4 rounded-xl text-white font-medium text-sm transition-colors ${
@@ -1696,44 +1234,6 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
             <InBodyGateNotice gate={inBody} />
 
             <QualityGateNotice gate={quality} />
-
-            {/* Exact seconds to replay. The whole point of the persistence
-                comparison is running identical frames twice, which eyeballing
-                the scrub bar cannot deliver. Only shown for a source that has a
-                timeline: there is nothing to seek in a camera. */}
-            {seekable && (
-              <div data-testid="test-window" className="space-y-1">
-                <p className="text-xs text-gray-500 uppercase tracking-wide">{t("Test window")}</p>
-                <div dir="ltr" className="flex items-center gap-2 text-xs">
-                  <input value={winStart} onChange={(e) => setWinStart(e.target.value)}
-                         placeholder="start s" inputMode="decimal"
-                         className="w-20 px-2 py-1 rounded-md bg-gray-800 border border-gray-700 text-gray-200 font-mono" />
-                  <span className="text-gray-600">→</span>
-                  <input value={winStop} onChange={(e) => setWinStop(e.target.value)}
-                         placeholder="stop s" inputMode="decimal"
-                         className="w-20 px-2 py-1 rounded-md bg-gray-800 border border-gray-700 text-gray-200 font-mono" />
-                  {(winStart || winStop) && (
-                    <button onClick={() => { setWinStart(""); setWinStop(""); }}
-                            className="text-xs px-2 py-0.5 rounded-md border border-gray-800 text-gray-500 hover:text-gray-300">
-                      {t("Clear")}
-                    </button>
-                  )}
-                </div>
-                {(winStart || winStop) && (
-                  <button onClick={() => void rerunWindow()}
-                          className="text-xs px-2 py-1 rounded-md border border-green-800 bg-green-950/30 text-green-300 hover:border-green-600 transition-colors">
-                    {winDone ? t("Run the window again") : t("Run the window from its start")}
-                  </button>
-                )}
-                <p className="text-[11px] text-gray-600">
-                  {winDone
-                    ? t("Stopped at the end of the window. Change the persistence setting and run it again for the second pass.")
-                    : winStart || winStop
-                      ? t("Seeks to the start when the clip is loaded and stops at the end. Persistence counters reset each run.")
-                      : t("Empty = play the whole clip. Set both to replay identical frames with persistence on and off.")}
-                </p>
-              </div>
-            )}
 
             <TemporalGateNotice gate={temporal} />
 

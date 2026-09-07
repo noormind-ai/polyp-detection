@@ -78,7 +78,20 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
   const { t } = useLanguage();
   const [pending, setPending] = useState<Entry[]>([]);
   const [drFound, setDrFound] = useState<Entry[]>([]);
-  const [reviewed, setReviewed] = useState<Entry[]>([]); // confirmed + false_positive (ex-pending)
+  const [reviewed, setReviewed] = useState<Entry[]>([]);
+  // Noise experiment: one question per pass. Asking "is it a polyp" and "is
+  // it readable" in the same sitting is exactly how the clinical panel ended
+  // up with a `noisy` label that means five different things.
+  const [noiseMode, setNoiseMode] = useState(false);
+  useEffect(() => {
+    setNoiseMode(window.localStorage.getItem("polyp_noise_mode") === "on");
+  }, []);
+  function toggleNoiseMode() {
+    setNoiseMode((v) => {
+      window.localStorage.setItem("polyp_noise_mode", v ? "off" : "on");
+      return !v;
+    });
+  } // confirmed + false_positive (ex-pending)
   const [currentKey, setCurrentKey] = useState<string | null>(null);
   // Filenames are unique across both kinds, so one dismissed set covers both.
   // A dr_found item never changes status server-side, so dismissing is the only
@@ -190,7 +203,7 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
   }
 
   /** Records what the frame is, rather than whether its box was a polyp. */
-  async function labelFrame(entry: Entry, label: "out_of_body" | "noisy") {
+  async function labelFrame(entry: Entry, label: "out_of_body" | "noisy" | "clean") {
     const fd = new FormData();
     fd.append("label", label);
     await fetch(`${API}/api/feedback/${entry.case_id}/${entry.filename}/label`,
@@ -203,9 +216,28 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
     await advance(entry, true);
   }
 
+  // The switch rides in the lane title so it is visible without opening
+  // anything: which question this pass is answering has to be obvious, or
+  // half the labels end up answering the other one.
+  const laneTitle = (
+    <span data-testid="noise-mode-switch" className="flex items-center justify-between gap-2 w-full">
+      <span>{noiseMode ? t("Noise experiment · noisy vs not") : t("Review · newest first")}</span>
+      <button
+        onClick={toggleNoiseMode}
+        className={`text-xs px-2 py-0.5 rounded-md border transition-colors ${
+          noiseMode
+            ? "border-orange-700/60 bg-orange-900/40 text-orange-300"
+            : "border-gray-800 text-gray-500 hover:text-gray-300 hover:border-gray-600"
+        }`}
+      >
+        {noiseMode ? t("Noise mode: on") : t("Noise mode: off")}
+      </button>
+    </span>
+  );
+
   return (
     <Lane
-      title={t("Review · newest first")}
+      title={laneTitle}
       activeEntries={activeEntries}
       current={current}
       onOpen={(e) => setCurrentKey(e.filename)}
@@ -222,7 +254,7 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
               {t("🗑 Discard")}
             </button>
           </div>
-        ) : (
+        ) : noiseMode ? null : (
           <div className="grid grid-cols-2 gap-2">
             <button onClick={() => submitReview(entry, true, box, corrected)} className="py-2.5 bg-emerald-600 hover:bg-emerald-500 rounded-xl text-white font-medium text-sm transition-colors">
               {t("✓ Confirm polyp")}
@@ -233,14 +265,25 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
           </div>
         )}
 
-          <div className="grid grid-cols-2 gap-2">
-            <button onClick={() => labelFrame(entry, "out_of_body")} className="py-2 bg-gray-800 hover:bg-gray-700 rounded-xl text-amber-300 font-medium text-xs transition-colors">
-              {t("🚫 Out of body")}
-            </button>
-            <button onClick={() => labelFrame(entry, "noisy")} className="py-2 bg-gray-800 hover:bg-gray-700 rounded-xl text-orange-300 font-medium text-xs transition-colors">
-              {t("🌫 Too noisy")}
-            </button>
-          </div>
+          {noiseMode ? (
+            <div className="grid grid-cols-2 gap-2">
+              <button onClick={() => labelFrame(entry, "noisy")} className="py-3 bg-orange-600 hover:bg-orange-500 rounded-xl text-white font-semibold text-sm transition-colors">
+                {t("🌫 Noisy")}
+              </button>
+              <button onClick={() => labelFrame(entry, "clean")} className="py-3 bg-emerald-600 hover:bg-emerald-500 rounded-xl text-white font-semibold text-sm transition-colors">
+                {t("✓ Not noisy")}
+              </button>
+            </div>
+          ) : (
+            <div className="grid grid-cols-2 gap-2">
+              <button onClick={() => labelFrame(entry, "out_of_body")} className="py-2 bg-gray-800 hover:bg-gray-700 rounded-xl text-amber-300 font-medium text-xs transition-colors">
+                {t("🚫 Out of body")}
+              </button>
+              <button onClick={() => labelFrame(entry, "noisy")} className="py-2 bg-gray-800 hover:bg-gray-700 rounded-xl text-orange-300 font-medium text-xs transition-colors">
+                {t("🌫 Too noisy")}
+              </button>
+            </div>
+          )}
         </div>
       )}
       reviewedTitle={t("Already reviewed")}
@@ -255,7 +298,7 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
 function Lane({
   title, activeEntries, current, onOpen, onDelete, onSkip, renderActions, reviewedTitle, reviewedEntries, onOpenReviewed,
 }: {
-  title: string;
+  title: React.ReactNode;
   activeEntries: Entry[];
   current: Entry | null;
   onOpen: (e: Entry) => void;
@@ -269,7 +312,7 @@ function Lane({
   const { t } = useLanguage();
   return (
     <div className="space-y-3 bg-gray-900/50 border border-gray-800 rounded-xl p-3">
-      <p className="text-sm text-gray-300 font-medium">{title}</p>
+      <div className="text-sm text-gray-300 font-medium">{title}</div>
 
       {current ? (
         <ReviewCard entry={current} onSkip={() => onSkip(current)} renderActions={renderActions} />

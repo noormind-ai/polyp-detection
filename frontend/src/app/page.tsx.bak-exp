@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import UploadPanel from "@/components/UploadPanel";
 import WarmupPanel from "@/components/WarmupPanel";
 import VideoPlayer from "@/components/VideoPlayer";
+import RealtimePlayer from "@/components/RealtimePlayer";
 import LiveCameraPlayer from "@/components/LiveCameraPlayer";
 import SignInPrompt, { goToLogin } from "@/components/SignInPrompt";
 import RecordingsPanel from "@/components/RecordingsPanel";
@@ -16,7 +17,7 @@ import { useLanguage } from "@/lib/i18n";
 type UploadStage = "idle" | "processing" | "done";
 /** Modal GPU container state. Only the live capture modes ever move this. */
 type GpuState = "off" | "starting" | "ready";
-type Mode = "upload" | "simulation" | "camera" | "screen" | "recordings";
+type Mode = "upload" | "realtime" | "camera" | "screen" | "recordings";
 
 interface Detection {
   bbox: [number, number, number, number];
@@ -108,7 +109,7 @@ const MODAL_IDLE_MS = 2 * 60 * 1000;
  *  supplied, and the one that plays back patient video held on this server. */
 const NEEDS_ACCOUNT: Mode[] = ["upload", "recordings"];
 /** The modes that need a warm GPU container before they can do anything. */
-const NEEDS_GPU: Mode[] = ["simulation", "camera", "screen"];
+const NEEDS_GPU: Mode[] = ["camera", "screen"];
 
 export default function Home() {
   const { t, lang, toggleLang } = useLanguage();
@@ -303,9 +304,9 @@ export default function Home() {
 
   const MODE_CARDS: { key: Mode; icon: string; title: string; blurb: string; hover: string }[] = [
     {
-      key: "simulation", icon: "📼",
-      title: "Saved Video",
-      blurb: "Replay a clip through the live pipeline",
+      key: "realtime", icon: "📷",
+      title: "Real-time",
+      blurb: "Frame-by-frame on a demo or your own clip",
       hover: "hover:border-green-500 hover:bg-green-950/10",
     },
     {
@@ -439,7 +440,7 @@ export default function Home() {
           )}
 
           <p className="text-sm text-gray-500">
-            {t("Saved video, live camera and screen share all run the same pipeline — each starts a session when you open it.")}
+            {t("Demo clips replay saved results instantly. Live camera and screen share start a GPU when you open them.")}
           </p>
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3 sm:gap-4">
             {MODE_CARDS.map((card) => {
@@ -494,7 +495,7 @@ export default function Home() {
         <div className="space-y-3">
           {backButton}
 
-          {blockedOnLogin && <SignInPrompt onOpenDemos={() => openMode("simulation")} />}
+          {blockedOnLogin && <SignInPrompt onOpenDemos={() => openMode("realtime")} />}
 
           {!blockedOnLogin && warmingUp && <WarmupPanel backend={backend} />}
 
@@ -517,12 +518,8 @@ export default function Home() {
                 </div>
               )}
 
-              {/* The same player the capture card drives, fed from a file
-                  instead. Deliberately not a second playback implementation:
-                  an experiment run on a separate code path measures that path,
-                  not the one that runs in clinic. */}
-              {mode === "simulation" && (
-                <LiveCameraPlayer caseId={caseId ?? "no-case"} onStop={closeMode} onActivity={markActive} initialMode="demo" backend={backend} />
+              {mode === "realtime" && (
+                <RealtimePlayer caseId={caseId ?? "no-case"} onStop={closeMode} onActivity={markActive} backend={backend} cpuOnly={backends?.cpu_only ?? false} />
               )}
 
               {mode === "camera" && (
