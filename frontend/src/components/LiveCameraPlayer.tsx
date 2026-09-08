@@ -243,7 +243,11 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // on a cue-less WebM takes a moment, and letting curTime drive the thumb
   // makes it jump backwards under the user's finger.
   const [paused, setPaused]               = useState(false);
-  const [speed, setSpeed]                 = useState(1);
+  // Demo clips are the thing this control mostly gets used on, and they read
+  // better slightly slowed: less motion between frames, so the raw and
+  // annotated panels drift apart less. Must stay a member of SPEEDS or no
+  // button renders as selected.
+  const [speed, setSpeed]                 = useState(0.7);
   const [scrubbing, setScrubbing]         = useState(false);
   const [scrubValue, setScrubValue]       = useState(0);
   const pendingSeekRef                    = useRef<number | null>(null);
