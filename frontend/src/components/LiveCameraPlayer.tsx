@@ -30,6 +30,11 @@ const INFER_WIDTH = 320;
 // Same ladder RealtimePlayer offers, so the two players behave alike. Only
 // meaningful for a file-backed source; a camera runs at whatever rate it runs.
 const SPEEDS = [0.1, 0.25, 0.5, 0.7, 1, 1.5, 2];
+// Demo clips are watched slowed down: less motion between frames, so the raw
+// and annotated panels drift apart less. Only the demos -- a saved recording
+// or the operator's own file starts at 1x. Must be a member of SPEEDS or no
+// button renders as selected.
+const DEMO_SPEED = 0.7;
 // How many of the first frames of a session are measured to find the picture
 // area. The border does not move, so this is a fixed startup cost, not a
 // per-frame one. Several rather than one because the union of several frames
@@ -243,11 +248,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // on a cue-less WebM takes a moment, and letting curTime drive the thumb
   // makes it jump backwards under the user's finger.
   const [paused, setPaused]               = useState(false);
-  // Demo clips are the thing this control mostly gets used on, and they read
-  // better slightly slowed: less motion between frames, so the raw and
-  // annotated panels drift apart less. Must stay a member of SPEEDS or no
-  // button renders as selected.
-  const [speed, setSpeed]                 = useState(0.7);
+  const [speed, setSpeed]                 = useState(1);
+  // Set once the operator picks a speed themselves, after which their choice
+  // sticks for the session and no source overrides it with its own default.
+  const speedChosenRef                    = useRef(false);
   const [scrubbing, setScrubbing]         = useState(false);
   const [scrubValue, setScrubValue]       = useState(0);
   const pendingSeekRef                    = useRef<number | null>(null);
@@ -933,6 +937,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   }
 
   function changeSpeed(s: number) {
+    speedChosenRef.current = true;
     setSpeed(s);
     if (videoRef.current) videoRef.current.playbackRate = s;
   }
@@ -1126,9 +1131,13 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       video.srcObject = null;
       video.src = src;
       video.loop = true;
-      // Assigning src resets the rate to 1, so the chosen speed has to be
-      // re-applied rather than set once at mount.
-      video.playbackRate = speed;
+      // Assigning src resets the rate to 1, so the rate has to be re-applied
+      // rather than set once at mount. Which rate depends on the source: a
+      // demo clip defaults to DEMO_SPEED, anything else to 1x -- unless the
+      // operator has already picked a speed, which wins over both.
+      const rate = speedChosenRef.current ? speed : mode === "demo" ? DEMO_SPEED : 1;
+      setSpeed(rate);
+      video.playbackRate = rate;
       // Both sources are same-origin (demos are static assets, recordings come
       // from this server's own API), so the canvas stays readable and the FOV
       // probe works. A cross-origin file would taint it and silently disable it.
