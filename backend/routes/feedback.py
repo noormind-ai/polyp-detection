@@ -43,9 +43,10 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
+from backend.routes.auth import current_user
 
 log = logging.getLogger("feedback")
 
@@ -62,9 +63,23 @@ MANIFEST_FIELDS = [
     # that measures ~100 KB/s; a recording id and an offset cost nothing and the
     # reviewer can seek to the exact moment in the full recording.
     "recording_id", "video_offset_ms",
+    # "" until a recording covering this capture finishes and the server tries
+    # cutting a short clip around video_offset_ms (see review_clips.py);
+    # "ready" once it's servable, "failed" if ffmpeg couldn't produce one --
+    # either way the reviewer still has the recording_id/offset text fallback.
+    "review_clip_status",
+    # Morphology, not a review verdict -- a flat lesion is still a confirmed
+    # polyp, just noted as harder to spot/resect than the polypoid default.
+    "morphology",
+    # Who performed the human action on this row (dr-found capture, review
+    # verdict, or frame label) -- the signed-in username, or "" when nobody
+    # was signed in. Not enforced: these actions still work signed out, so
+    # this is best-effort attribution, not an audit guarantee.
+    "reviewed_by",
 ]
 STATUSES = {"pending", "confirmed", "false_positive", "dr_found"}
 NOTICED_FIRST = {"dr", "ai", ""}
+MORPHOLOGY = {"", "flat"}
 _SAFE_ID = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 
@@ -102,8 +117,48 @@ _ROW_DEFAULTS = {
     "source": "auto", "status": "pending", "noticed_first": "",
     "bbox_x1": "", "bbox_y1": "", "bbox_x2": "", "bbox_y2": "",
     "ai_detections": "", "box_corrected": "",
-    "recording_id": "", "video_offset_ms": "",
+    "recording_id": "", "video_offset_ms": "", "review_clip_status": "",
+    "morphology": "", "reviewed_by": "",
 }
+
+CLIPS_DIRNAME = "clips"
+
+
+def _clip_path(case_id: str, filename_base: str) -> Path:
+    _check_id(case_id, "case_id")
+    _check_id(filename_base, "filename")
+    d = CASES_DIR / case_id / CLIPS_DIRNAME
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{filename_base}.mp4"
+
+
+def clip_output_path(case_id: str, filename: str) -> Path:
+    """Where review_clips.py should write the clip for a given manifest row's
+    `filename` (its image name, e.g. "170...abcd1234.jpg"). Public wrapper
+    around _clip_path so recordings.py doesn't reach into a private name."""
+    return _clip_path(case_id, filename.rsplit(".", 1)[0])
+
+
+def list_pending_clip_sources(recording_id: str) -> list[dict]:
+    """Manifest rows that reference this recording and don't have a ready
+    clip yet. Used once a recording finishes uploading to generate review
+    clips for every capture that was filed against it while it was live."""
+    return [
+        r for r in _read_manifest()
+        if r.get("recording_id") == recording_id
+        and r.get("video_offset_ms")
+        and r.get("review_clip_status") != "ready"
+    ]
+
+
+def set_review_clip_status(case_id: str, filename: str, status: str) -> None:
+    with _MANIFEST_LOCK:
+        rows = _read_manifest()
+        for r in rows:
+            if r["case_id"] == case_id and r["filename"] == filename:
+                r["review_clip_status"] = status
+                _write_manifest(rows)
+                return
 
 
 def _append_manifest(row: dict) -> None:
@@ -200,6 +255,7 @@ async def dr_found_capture(
     video: Optional[UploadFile] = File(default=None),
     recording_id: Optional[str] = Form(default=None),
     video_offset_ms: Optional[str] = Form(default=None),
+    user: Optional[str] = Depends(current_user),
 ):
     """Manual capture — a doctor pointed out a polyp the model didn't flag."""
     image_bytes = await file.read()
@@ -221,7 +277,8 @@ async def dr_found_capture(
         {"source": "manual", "status": "dr_found", "noticed_first": "dr",
          "bbox_x1": x1, "bbox_y1": y1, "bbox_x2": x2, "bbox_y2": y2,
          "ai_detections": ai_detections or "",
-         "recording_id": recording_id or "", "video_offset_ms": video_offset_ms or ""},
+         "recording_id": recording_id or "", "video_offset_ms": video_offset_ms or "",
+         "reviewed_by": user or ""},
     )
     return {"filename": filename}
 
@@ -249,23 +306,31 @@ async def review_capture(
     noticed_first: str = Form(...),
     bbox: Optional[str] = Form(default=None),
     box_corrected: bool = Form(default=False),
+    morphology: str = Form(default=""),
+    user: Optional[str] = Depends(current_user),
 ):
     """Nurse reviews a pending auto-capture: confirms it's a real polyp
     (optionally adjusting the box) or marks it a false positive, and records
     whether the doctor had already noticed it or the model caught it first.
     box_corrected flags whether the saved box is the AI's own detection as-is
     or one the nurse moved/redrew — lets later analysis separate "AI box was
-    right" from "AI box needed a correction"."""
+    right" from "AI box needed a correction". morphology is separate from the
+    confirm/reject verdict — "flat" still confirms the polyp, it just notes
+    that it isn't the default polypoid shape."""
     _check_id(case_id, "case_id")
     _check_id(filename.split(".")[0], "filename")
     if noticed_first not in NOTICED_FIRST:
         raise HTTPException(status_code=400, detail="noticed_first must be 'dr' or 'ai'")
+    if morphology not in MORPHOLOGY:
+        raise HTTPException(status_code=400, detail=f"morphology must be one of {sorted(MORPHOLOGY)}")
     rows = _read_manifest()
     for r in rows:
         if r["case_id"] == case_id and r["filename"] == filename:
             r["status"] = "confirmed" if correct else "false_positive"
             r["noticed_first"] = noticed_first
             r["box_corrected"] = box_corrected
+            r["morphology"] = morphology if correct else ""
+            r["reviewed_by"] = user or r.get("reviewed_by", "")
             if bbox:
                 try:
                     x1, y1, x2, y2 = json.loads(bbox)
@@ -287,7 +352,8 @@ FRAME_LABELS = {"out_of_body", "noisy", "clean"}
 
 
 @router.post("/feedback/{case_id}/{filename}/label")
-async def label_capture(case_id: str, filename: str, label: str = Form(...)):
+async def label_capture(case_id: str, filename: str, label: str = Form(...),
+                        user: Optional[str] = Depends(current_user)):
     """Label a capture by what the frame is: out-of-body, or too noisy.
 
     These are the ground truth the out-of-body and quality gates have never had.
@@ -303,6 +369,7 @@ async def label_capture(case_id: str, filename: str, label: str = Form(...)):
     for r in rows:
         if r["case_id"] == case_id and r["filename"] == filename:
             r["status"] = label
+            r["reviewed_by"] = user or r.get("reviewed_by", "")
             _write_manifest(rows)
             return {"filename": filename, "status": label}
     raise HTTPException(status_code=404, detail="not found")
@@ -348,6 +415,18 @@ async def get_video(case_id: str, filename: str):
     return FileResponse(path, media_type="video/webm")
 
 
+@router.get("/feedback/{case_id}/clip/{filename}")
+async def get_review_clip(case_id: str, filename: str):
+    """The server-cut short clip around this capture's moment in the full
+    session recording (see review_clips.py), if one has been generated.
+    404 until then -- the caller falls back to the plain-text offset label."""
+    base = filename.rsplit(".", 1)[0]
+    path = _clip_path(case_id, base)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="clip not generated (yet)")
+    return FileResponse(path, media_type="video/mp4", content_disposition_type="inline")
+
+
 @router.delete("/feedback/{case_id}/{filename}")
 async def delete_capture(case_id: str, filename: str):
     _check_id(case_id, "case_id")
@@ -361,6 +440,7 @@ async def delete_capture(case_id: str, filename: str):
     images_dir = CASES_DIR / case_id / "images"
     (images_dir / filename).unlink(missing_ok=True)
     (images_dir / f"{base}.webm").unlink(missing_ok=True)
+    _clip_path(case_id, base).unlink(missing_ok=True)
     return {"deleted": filename}
 
 

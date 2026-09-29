@@ -20,6 +20,10 @@ interface Entry {
   bbox_y2?: string;
   recording_id?: string;
   video_offset_ms?: string;
+  /** "" until the recording covering this capture finishes and a clip-cut is
+   *  attempted, "ready" once servable, "failed" if ffmpeg couldn't produce
+   *  one -- either way offsetLabel() below is still shown as a fallback. */
+  review_clip_status?: string;
 }
 
 /** Position of this frame inside the session recording, as mm:ss. Captures no
@@ -184,22 +188,20 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
     });
   }
 
-  async function submitReview(entry: Entry, correct: boolean, box: UserBox | null, corrected: boolean) {
+  // noticedFirst defaults to "ai" for the auto-capture flow; dr_found review
+  // passes "dr" explicitly -- same verdict, same endpoint, just recording who
+  // actually spotted it first, which is the whole reason noticed_first exists.
+  async function submitReview(entry: Entry, correct: boolean, box: UserBox | null, corrected: boolean,
+                              morphology?: "flat", noticedFirst: "ai" | "dr" = "ai") {
     const fd = new FormData();
     fd.append("correct", String(correct));
-    fd.append("noticed_first", "ai");
+    fd.append("noticed_first", noticedFirst);
     fd.append("box_corrected", String(corrected));
     if (box) fd.append("bbox", JSON.stringify(box.map((n) => Math.round(n))));
+    if (morphology) fd.append("morphology", morphology);
     await fetch(`${API}/api/feedback/${entry.case_id}/${entry.filename}/review`, { method: "POST", body: fd });
     // The server changes its status, so it leaves the queue on its own.
     await advance(entry, false);
-  }
-
-  async function saveDrFoundBox(entry: Entry, box: UserBox | null) {
-    const fd = new FormData();
-    if (box) fd.append("bbox", JSON.stringify(box.map((n) => Math.round(n))));
-    await fetch(`${API}/api/feedback/${entry.case_id}/${entry.filename}`, { method: "PATCH", body: fd });
-    await advance(entry, true);
   }
 
   /** Records what the frame is, rather than whether its box was a polyp. */
@@ -246,21 +248,43 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
       renderActions={(entry, box, corrected) => (
         <div className="space-y-2">
         {entry.status === "dr_found" ? (
-          <div className="grid grid-cols-2 gap-2">
-            <button onClick={() => saveDrFoundBox(entry, box)} className="py-2.5 bg-sky-600 hover:bg-sky-500 rounded-xl text-white font-medium text-sm transition-colors">
-              {t("💾 Save")}
-            </button>
-            <button onClick={() => deleteCapture(entry)} className="py-2.5 bg-gray-800 hover:bg-gray-700 rounded-xl text-red-400 font-medium text-sm transition-colors">
-              {t("🗑 Discard")}
-            </button>
+          // Same verdict options as an auto-capture review -- a dr_found
+          // capture still needs someone to confirm it's genuinely a polyp
+          // (and note morphology) before it means anything for reporting;
+          // noticed_first="dr" is the only thing that differs from the AI
+          // flow below. Discard stays as the "I flagged this by mistake" exit.
+          <div className="space-y-2">
+            <div className="grid grid-cols-2 gap-2">
+              <button onClick={() => submitReview(entry, true, box, corrected, undefined, "dr")} className="py-2.5 bg-emerald-600 hover:bg-emerald-500 rounded-xl text-white font-medium text-sm transition-colors">
+                {t("✓ Confirm polyp")}
+              </button>
+              <button onClick={() => submitReview(entry, false, box, corrected, undefined, "dr")} className="py-2.5 bg-amber-600 hover:bg-amber-500 rounded-xl text-white font-medium text-sm transition-colors">
+                {t("✗ Not a polyp")}
+              </button>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <button onClick={() => submitReview(entry, true, box, corrected, "flat", "dr")} className="py-2 bg-gray-800 hover:bg-gray-700 rounded-xl text-sky-300 font-medium text-xs transition-colors">
+                {t("▭ Flat lesion")}
+              </button>
+              <button onClick={() => deleteCapture(entry)} className="py-2 bg-gray-800 hover:bg-gray-700 rounded-xl text-red-400 font-medium text-xs transition-colors">
+                {t("🗑 Discard")}
+              </button>
+            </div>
           </div>
         ) : noiseMode ? null : (
-          <div className="grid grid-cols-2 gap-2">
-            <button onClick={() => submitReview(entry, true, box, corrected)} className="py-2.5 bg-emerald-600 hover:bg-emerald-500 rounded-xl text-white font-medium text-sm transition-colors">
-              {t("✓ Confirm polyp")}
-            </button>
-            <button onClick={() => submitReview(entry, false, box, corrected)} className="py-2.5 bg-amber-600 hover:bg-amber-500 rounded-xl text-white font-medium text-sm transition-colors">
-              {t("✗ Not a polyp")}
+          <div className="space-y-2">
+            <div className="grid grid-cols-2 gap-2">
+              <button onClick={() => submitReview(entry, true, box, corrected)} className="py-2.5 bg-emerald-600 hover:bg-emerald-500 rounded-xl text-white font-medium text-sm transition-colors">
+                {t("✓ Confirm polyp")}
+              </button>
+              <button onClick={() => submitReview(entry, false, box, corrected)} className="py-2.5 bg-amber-600 hover:bg-amber-500 rounded-xl text-white font-medium text-sm transition-colors">
+                {t("✗ Not a polyp")}
+              </button>
+            </div>
+            {/* Still a confirmed polyp -- just morphology, not a third verdict --
+                so this stays visually secondary to the two buttons above it. */}
+            <button onClick={() => submitReview(entry, true, box, corrected, "flat")} className="w-full py-2 bg-gray-800 hover:bg-gray-700 rounded-xl text-sky-300 font-medium text-xs transition-colors">
+              {t("▭ Flat lesion")}
             </button>
           </div>
         )}
@@ -406,11 +430,18 @@ function ReviewCard({ entry, onSkip, renderActions }: {
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between gap-2">
-        {offsetLabel(entry)
-          ? <span className="text-xs text-gray-500 font-mono" title={t("Position in the session recording")}>
-              🎞 {offsetLabel(entry)}
-            </span>
-          : <span />}
+        {entry.review_clip_status === "ready" ? (
+          <video
+            src={`${API}/api/feedback/${entry.case_id}/clip/${entry.filename}`}
+            controls muted playsInline
+            title={t("A few seconds of the session recording around this capture")}
+            className="h-14 w-24 rounded-lg border border-gray-800 bg-black object-cover"
+          />
+        ) : offsetLabel(entry) ? (
+          <span className="text-xs text-gray-500 font-mono" title={t("Position in the session recording")}>
+            🎞 {offsetLabel(entry)}
+          </span>
+        ) : <span />}
         <button onClick={onSkip} className="text-xs text-gray-500 hover:text-gray-300 transition-colors">{t("Skip → next")}</button>
       </div>
 

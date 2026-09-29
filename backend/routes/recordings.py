@@ -54,10 +54,12 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 
 from backend.routes.auth import require_user
+from backend.routes.feedback import clip_output_path, list_pending_clip_sources, set_review_clip_status
+from backend.services.review_clips import cut_clip
 
 log = logging.getLogger("recordings")
 
@@ -247,10 +249,31 @@ async def append_chunk(
     return {"chunks": meta["chunks"], "bytes": written + size, "status": meta["status"]}
 
 
+def _generate_review_clips(meta: dict) -> None:
+    """Runs after the HTTP response for /stop has already gone out (see
+    BackgroundTasks below). For every feedback capture filed against this
+    recording, cuts a short clip around its offset so a reviewer gets a
+    playable clip instead of a bare timestamp. Best-effort and idempotent:
+    list_pending_clip_sources already excludes rows already marked "ready",
+    so a retried /stop just re-attempts anything that previously failed."""
+    video_path = _video_path(meta)
+    if not video_path.exists() or video_path.stat().st_size == 0:
+        return
+    for row in list_pending_clip_sources(meta["id"]):
+        try:
+            offset_ms = int(row["video_offset_ms"])
+        except (TypeError, ValueError):
+            continue
+        out_path = clip_output_path(row["case_id"], row["filename"])
+        ok = cut_clip(video_path, offset_ms, out_path)
+        set_review_clip_status(row["case_id"], row["filename"], "ready" if ok else "failed")
+
+
 @router.post("/recordings/{case_id}/{recording_id}/stop")
 async def stop_recording(
     case_id: str,
     recording_id: str,
+    background: BackgroundTasks,
     duration_ms: int = Form(default=0),
     user: str = Depends(require_user),
 ):
@@ -270,6 +293,9 @@ async def stop_recording(
     _write_meta(meta)
     log.info("recording %s stopped by %s (%d chunks, %s)",
              recording_id, user, meta["chunks"], meta["status"])
+    # Runs after this response is sent -- cutting clips ffmpeg-at-a-time must
+    # not make the operator wait on Stop before the UI unblocks.
+    background.add_task(_generate_review_clips, meta)
     return _decorate(meta)
 
 

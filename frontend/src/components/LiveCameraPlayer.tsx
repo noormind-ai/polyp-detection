@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import FeedbackPanel from "./FeedbackPanel";
 import RecordingControls from "./RecordingControls";
+import RecordingRecoveryBanner from "./RecordingRecoveryBanner";
 import RecordingsPanel from "./RecordingsPanel";
 import { DEMO_VIDEOS } from "./demos";
 import { useLanguage } from "@/lib/i18n";
@@ -15,6 +16,8 @@ import FilterBankNotice, { type GateState } from "./FilterBankNotice";
 import { useTemporalGate } from "@/lib/useTemporalGate";
 import TemporalGateNotice from "./TemporalGateNotice";
 import { useSessionRecorder } from "@/lib/useSessionRecorder";
+import { useAuth } from "@/lib/auth";
+import { beginLiveInference } from "@/lib/uploadCoordinator";
 import { detectFovRect, unionRect, intersectRect, trimmedFraction, NEGLIGIBLE_TRIM, type Rect } from "@/lib/fov";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "";
@@ -27,6 +30,14 @@ const API_WS = (process.env.NEXT_PUBLIC_API_URL
 const INFER_TIMEOUT_MS = 6000;
 // Resize frames to this width before sending — faster inference, smaller payload
 const INFER_WIDTH = 320;
+// How long out-of-body has to persist before auto-record treats it as the
+// procedure actually ending (finalize + upload) rather than a brief
+// withdrawal (pause, ready to resume the same recording). Confirmed with the
+// user: under 5s is "just a brief withdrawal" -- repositioning, scope
+// wiggling near entry. At or past this, a doctor finishing one patient and
+// starting the next minutes later (nobody touches Start/Stop in between)
+// must not have both patients land in the same recording. See applyAutoRecord.
+const OUT_OF_BODY_STOP_MS = 5000;
 // Same ladder RealtimePlayer offers, so the two players behave alike. Only
 // meaningful for a file-backed source; a camera runs at whatever rate it runs.
 const SPEEDS = [0.1, 0.25, 0.5, 0.7, 1, 1.5, 2];
@@ -129,6 +140,16 @@ interface ServerRecording {
   status: string;
 }
 
+/** m:ss under an hour, h:mm:ss past it -- a raw seconds count (e.g. "973.1s")
+ *  is unreadable for anything longer than a short clip. */
+function formatClock(seconds: number): string {
+  const s = Number.isFinite(seconds) && seconds > 0 ? Math.floor(seconds) : 0;
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = String(s % 60).padStart(2, "0");
+  return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
+}
+
 /** Enough to tell two recordings apart in a dropdown: when it was made, how
  *  long it ran, and what it came from. */
 function describeRecording(r: ServerRecording): string {
@@ -143,7 +164,7 @@ interface Box { bbox: [number, number, number, number]; conf: number; }
 interface Timing { recv_ms: number; modal_ms: number; total_ms: number; }
 
 export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = "/api/ws/infer", initialMode = "camera", backend }: { caseId: string; onStop: () => void; onActivity?: () => void; wsPath?: string; initialMode?: "camera" | "screen" | "demo"; backend?: string }) {
-  const { t } = useLanguage();
+  const { t, lang } = useLanguage();
   // Cheap colour gate in front of the detector: while the camera is outside the
   // patient there is nothing to detect, so the frame is never sent. The operator
   // can switch it off from the panel without restarting the session.
@@ -232,7 +253,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   const [wsStatus, setWsStatus]           = useState<"connecting" | "open" | "error" | "closed">("connecting");
   const [closeCode, setCloseCode]         = useState<number | null>(null);
   const [polyp, setPolyp]                 = useState(false);
-  const [stats, setStats]                 = useState({ sent: 0, received: 0, avgMs: 0 });
+  const [stats, setStats]                 = useState({ sent: 0, received: 0, avgMs: 0, rttMs: 0, netMs: 0 });
   // Whole filter bank as reported by the backend for the last frame that
   // came back, so the panel answers "which paper filter fired on THIS
   // scene" rather than showing one operator's raw numbers.
@@ -292,6 +313,11 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   const [showDetected, setShowDetected]   = useState(true);
   const [showLive, setShowLive]           = useState(true);
   const msHistory = useRef<number[]>([]);
+  // Client-side round trip, so the panel can split what the server spent from
+  // what the wire cost. Safe as a single ref because only one frame is ever in
+  // flight at a time (pendingRef) — see the capture loop.
+  const rttHistory = useRef<number[]>([]);
+  const sentAtRef = useRef<number>(0);
 
   // Only starts recording once there's actually a stream on the element —
   // captureStream() on an empty <video> yields no tracks and MediaRecorder refuses it.
@@ -304,6 +330,126 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // the server only accepts camera|screen as a recording source.
   const recorder = useSessionRecorder(caseId, captureMode === "screen" ? "screen" : "camera", activeStream);
   const [showRecordings, setShowRecordings] = useState(false);
+  // Read through a ref inside applyAutoRecord for the same reason every other
+  // per-frame flag in the capture loop is -- startLoop's closure is captured
+  // once and long-running, so a plain destructured value here would be
+  // whatever it was when the loop started, not the true current sign-in state.
+  const { user: authUser } = useAuth();
+  const authUserRef = useRef(authUser);
+  useEffect(() => { authUserRef.current = authUser; }, [authUser]);
+
+  // Auto on/off recording based on in-body/out-of-body (inBody.shouldInfer's
+  // own verdict, already debounced -- see inBody.ts's InBodyGate.update --
+  // so this does not add a second debounce layer on top of it). A manual
+  // override holds only until the next real transition, then auto-control
+  // resumes: lower risk than "sticks for the rest of the procedure", which
+  // could silently leave the remainder of a long case unrecorded if forgotten.
+  //
+  // Deliberately NOT persisted (localStorage) the way useInBodyGate's own
+  // switch is. That seemed like the right precedent to copy, but it created a
+  // real deadlock: this flag also gates the very first auto-START of a
+  // recording, and its own checkbox only renders once a recording is already
+  // active -- so a browser where it was ever switched off (this one included,
+  // while building/testing this feature) had no way back to on, and every
+  // future session on that browser would silently never auto-record with no
+  // visible reason why. Defaulting fresh to true every mount means every new
+  // procedure starts from the documented "on by default" behavior; the
+  // checkbox (now always visible, not just while recording) is still there to
+  // turn it off for just this session if it's ever misbehaving.
+  const [autoRecordEnabled, setAutoRecordEnabled] = useState(true);
+  const autoRecordEnabledRef = useRef(autoRecordEnabled);
+  useEffect(() => { autoRecordEnabledRef.current = autoRecordEnabled; }, [autoRecordEnabled]);
+  const recordOverrideRef = useRef<"auto" | "on" | "off">("auto");
+  const [recordOverride, setRecordOverrideState] = useState<"auto" | "on" | "off">("auto");
+  const lastInsideRef = useRef<boolean | null>(null);
+  // When the current out-of-body stretch started (null while inside), and
+  // whether it's already been auto-stopped -- see OUT_OF_BODY_STOP_MS above.
+  const outsideStartRef = useRef<number | null>(null);
+  const autoStoppedRef = useRef(false);
+  // Bandwidth-arbitration hold for this session's own frame-sending activity
+  // (see uploadCoordinator.ts) -- acquired/released on insideNow transitions
+  // in applyAutoRecord, not for the whole loop's lifetime. Tracked here (not
+  // just a local var in startLoop) so it can also be released as a safety
+  // net on loop-end/unmount without leaking if the loop stops mid-hold.
+  const liveInferenceReleaseRef = useRef<(() => void) | null>(null);
+  function setRecordOverride(v: "on" | "off") {
+    recordOverrideRef.current = v;
+    setRecordOverrideState(v);
+  }
+  /** Called once per loop iteration with this frame's in-body verdict. Applies
+   *  the auto pause/resume decision to the session recorder, if one is
+   *  running, and clears a manual override the moment a real transition
+   *  happens (see comment above). */
+  // Deliberately reads nothing off `recorder` except the two stable
+  // (useCallback, empty-deps) functions pause/resume -- not recorder.status
+  // or recorder.capturing. This function is called every iteration of
+  // startLoop's long-running while loop, whose closure was captured once
+  // when the loop started; `recorder` there is a snapshot from that moment,
+  // so its React *state* fields (status, capturing) never update for the
+  // life of the loop, while start()/pause()/resume() themselves stay correct
+  // because they read the real MediaRecorder through a ref internally.
+  // Calling start() when a recording already exists (or is already being
+  // created -- see startingRef in useSessionRecorder.ts), resume() when
+  // nothing is recording or already recording, and pause() when already
+  // paused are all safe no-ops.
+  //
+  // "On by default inside the body" means auto-record has to be able to
+  // START the recording itself, not just pause/resume one the operator
+  // already started by hand -- a session that begins already inside the body
+  // (the normal case: insertion happens before Start is ever clicked) would
+  // otherwise never record anything until someone remembers to press Record.
+  function applyAutoRecord(insideNow: boolean) {
+    // Bandwidth-arbitration signal: tracks whether THIS session is actually
+    // sending frames right now, not just "a live session is open" -- runs
+    // unconditionally, even if autoRecordEnabled is off, because it answers
+    // "is the link busy", which matters regardless of whether auto-record
+    // itself is in use. Out of body, the branch below never calls ws.send, so
+    // the link is genuinely free; marking it idle here is what lets a
+    // still-uploading recording (this session's own paused one, or a
+    // leftover from the previous patient) use that window instead of purely
+    // waiting for Stop. See uploadCoordinator.ts.
+    if (insideNow && !liveInferenceReleaseRef.current) {
+      liveInferenceReleaseRef.current = beginLiveInference();
+    } else if (!insideNow && liveInferenceReleaseRef.current) {
+      liveInferenceReleaseRef.current();
+      liveInferenceReleaseRef.current = null;
+    }
+
+    if (!autoRecordEnabledRef.current) { lastInsideRef.current = insideNow; return; }
+    const prevInside = lastInsideRef.current;
+    lastInsideRef.current = insideNow;
+    if (prevInside === true && !insideNow) { outsideStartRef.current = Date.now(); autoStoppedRef.current = false; }
+    if (prevInside === false && insideNow) { outsideStartRef.current = null; autoStoppedRef.current = false; }
+    if (prevInside !== null && insideNow !== prevInside && recordOverrideRef.current !== "auto") {
+      recordOverrideRef.current = "auto";
+      setRecordOverrideState("auto");
+    }
+    const want = recordOverrideRef.current === "auto" ? insideNow : recordOverrideRef.current === "on";
+
+    // Distinguish a brief withdrawal (pause, ready to resume the SAME
+    // recording -- the normal case below) from the procedure actually ending
+    // (a doctor finishing one patient and starting the next some minutes
+    // later, with nobody touching Start/Stop in between). Past the
+    // threshold, finalize this recording instead of leaving it paused; a
+    // fresh one auto-starts the instant the scope goes back in, via the
+    // ordinary `want` branch below -- no separate code path needed for that.
+    if (!want && !autoStoppedRef.current && outsideStartRef.current !== null
+        && Date.now() - outsideStartRef.current >= OUT_OF_BODY_STOP_MS) {
+      autoStoppedRef.current = true;
+      recorder.stop();
+      return;
+    }
+
+    if (want) {
+      // Recording needs an account (see RecordingControls.tsx) -- without
+      // this check a signed-out operator would see a failed /start POST
+      // retried every frame for as long as the scope stays inside the body.
+      if (authUserRef.current) void recorder.start();
+      recorder.resume();
+    } else {
+      recorder.pause();
+    }
+  }
 
   // Surface the list the moment a recording finishes — the operator has just
   // saved something and the next thing they want is to confirm it is there.
@@ -464,7 +610,23 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       msHistory.current.push(timing.modal_ms);
       if (msHistory.current.length > 10) msHistory.current.shift();
       const avg = Math.round(msHistory.current.reduce((a, b) => a + b, 0) / msHistory.current.length);
-      setStats((s) => ({ sent: s.sent, received: s.received + 1, avgMs: avg }));
+      // Round trip as the operator actually experiences it: stamped just before
+      // ws.send, read here. timing.modal_ms is server-side only (the name is a
+      // misnomer kept for UI compatibility — on this box there is no Modal, it
+      // is CPU time), so the difference is everything the wire and the browser
+      // cost on top. Clamped at 0: a sub-millisecond LAN can round negative.
+      const rtt = sentAtRef.current ? performance.now() - sentAtRef.current : 0;
+      if (rtt > 0) {
+        rttHistory.current.push(rtt);
+        if (rttHistory.current.length > 10) rttHistory.current.shift();
+      }
+      const avgRtt = rttHistory.current.length
+        ? Math.round(rttHistory.current.reduce((a, b) => a + b, 0) / rttHistory.current.length)
+        : 0;
+      setStats((s) => ({
+        sent: s.sent, received: s.received + 1, avgMs: avg,
+        rttMs: avgRtt, netMs: avgRtt ? Math.max(0, avgRtt - avg) : 0,
+      }));
 
       pendingRef.current?.({ boxes, timing });
       pendingRef.current = null;
@@ -478,6 +640,13 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     return () => {
       scanRef.current = false;
       streamRef.current?.getTracks().forEach((track) => track.stop());
+      // Second safety net (startLoop's own try/finally is the first) for the
+      // bandwidth-arbitration hold -- unmounting while still marked "inside"
+      // must not leak it, or every future upload in this tab stays blocked.
+      if (liveInferenceReleaseRef.current) {
+        liveInferenceReleaseRef.current();
+        liveInferenceReleaseRef.current = null;
+      }
     };
   }, []);
 
@@ -959,7 +1128,16 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   async function startLoop() {
     if (scanRef.current) return;
     scanRef.current = true;
+    // The bandwidth-arbitration hold (see uploadCoordinator.ts) is acquired
+    // and released per in-body/out-of-body transition inside applyAutoRecord,
+    // not for this whole loop's lifetime -- so a still-uploading recording
+    // can use an out-of-body window instead of waiting for the loop to end
+    // entirely. The try/finally here is only a safety net in case the loop
+    // exits while still holding it (e.g. the operator leaves Live Camera
+    // mid-procedure, still inside the body) -- leaking that hold would
+    // permanently block all future uploads in this tab.
 
+    try {
     while (scanRef.current) {
       const ws = wsRef.current;
       const video = videoRef.current;
@@ -1003,7 +1181,9 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       // showing the real frame with no boxes, so it stays obvious that the feed is
       // live and the detector is simply not being asked. Paced at roughly the
       // inference cadence rather than spinning a tight while loop.
-      if (!inBody.shouldInfer(cap)) {
+      const insideNow = inBody.shouldInfer(cap);
+      applyAutoRecord(insideNow);
+      if (!insideNow) {
         updateBoxes([]);
         drawAnalyzedFrame(cap, []);
         // Let the appearance state machine see the quiet frame — see the else
@@ -1031,6 +1211,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
 
       const result = await new Promise<{ boxes: Box[]; timing: Timing } | null>((resolve) => {
         pendingRef.current = resolve;
+        sentAtRef.current = performance.now();
         ws.send(buf);
         setStats((s) => ({ ...s, sent: s.sent + 1 }));
         setTimeout(() => {
@@ -1053,6 +1234,12 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         // state machine mid-appearance and throttle the NEXT lesion against a
         // stale timestamp. Feeding the quiet frame through lets it close.
         maybeAutoCapture([], null, null);
+      }
+    }
+    } finally {
+      if (liveInferenceReleaseRef.current) {
+        liveInferenceReleaseRef.current();
+        liveInferenceReleaseRef.current = null;
       }
     }
   }
@@ -1387,6 +1574,91 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     : undefined;
   const toggleBtn = "text-xs px-2 py-0.5 rounded-md border border-gray-800 text-gray-500 hover:text-gray-300 hover:border-gray-600 transition-colors flex-shrink-0";
   const transportBtn = "px-2.5 py-1 rounded-md bg-gray-800 hover:bg-gray-700 text-gray-300 font-mono transition-colors";
+
+  // Pulled out to plain JSX values (not a component) so the exact same markup
+  // -- refs, overlays, toggle buttons and all -- can sit inside a fixed-shape
+  // wrapper whose only variable is column count (see the Detected+Live grid
+  // below), without ever changing where the <video>/<canvas> live in the tree.
+  // Reparenting a ref'd element between renders makes React remount it,
+  // destroying its attached MediaStream/src -- that already happened once
+  // this session with an earlier "side by side" toggle that nested livePanel
+  // differently depending on its state, and hung the capture loop.
+  //
+  // The panel grid below is pinned dir="ltr" so Review/Detected/Live keep a
+  // fixed physical left-to-right order regardless of the app's language --
+  // otherwise Farsi's dir="rtl" (the default; see lib/i18n.tsx) flips which
+  // physical side is "column 1" for both this pair and the outer Review vs.
+  // video-area placement, scrambling the intended layout. Each panel's own
+  // dir is reasserted here to the real page direction so its own label text
+  // still reads correctly -- only the grids' column-assignment math is pinned.
+  const pageDir = lang === "fa" ? "rtl" : "ltr";
+  const detectedPanel = (
+    <div dir={pageDir} className="space-y-1">
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-xs text-gray-500 uppercase tracking-wide truncate">
+          {t("Detected · ~{avgMs}ms behind live", { avgMs: stats.avgMs || 250 })}
+        </p>
+        <button onClick={() => setShowDetected(!showDetected)} className={toggleBtn}>
+          {showDetected ? t("Hide") : t("Show")}
+        </button>
+      </div>
+      <div className={showDetected ? "" : "h-0 overflow-hidden opacity-0"}>
+        <div className={panelBox} style={{ aspectRatio: aspect }}>
+          <canvas ref={analyzedRef} className="absolute inset-0 w-full h-full object-contain" />
+        </div>
+      </div>
+    </div>
+  );
+
+  const livePanel = (
+    <div dir={pageDir} className="space-y-1">
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-xs text-gray-500 uppercase tracking-wide truncate">{t("Live · no lag")}</p>
+        <button onClick={() => setShowLive(!showLive)} className={toggleBtn}>
+          {showLive ? t("Hide") : t("Show")}
+        </button>
+      </div>
+      <div className={showLive ? "" : "h-0 overflow-hidden opacity-0"}>
+        <div className={panelBox} style={{ aspectRatio: liveAspect }}>
+          <video
+            ref={videoRef}
+            muted
+            playsInline
+            loop={captureMode === "demo" || captureMode === "recording"}
+            onTimeUpdate={handleTimeUpdate}
+            onSeeked={handleSeeked}
+            onPlay={() => setPaused(false)}
+            onPause={() => setPaused(true)}
+            onLoadedMetadata={handleLoadedMetadata}
+            onDurationChange={handleLoadedMetadata}
+            className={liveStyle ? "absolute object-contain" : "absolute inset-0 w-full h-full object-contain"}
+            style={liveStyle}
+          />
+          {/* What the crop discards. The panel is showing the whole
+              frame right now (liveCrop is forced to null above), so the
+              kept region is outlined and everything outside it is
+              washed red by an outsized ring shadow the panel clips. */}
+          {showFovOverlay && fovNorm && (
+            <div className="absolute inset-0 pointer-events-none">
+              <div
+                className="absolute border-2 border-[#39ff14]"
+                style={{
+                  left:   `${fovNorm.x * 100}%`,
+                  top:    `${fovNorm.y * 100}%`,
+                  width:  `${fovNorm.w * 100}%`,
+                  height: `${fovNorm.h * 100}%`,
+                  boxShadow: "0 0 0 9999px rgba(239,68,68,0.5)",
+                }}
+              />
+              <p className="absolute bottom-1 inset-x-1 text-center text-[11px] leading-tight text-white bg-black/75 rounded px-1 py-0.5">
+                {t("Red is dropped before inference — {pct}% of the frame", { pct: Math.round(fovTrim * 100) })}
+              </p>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
   const wsStatusText =
     wsStatus === "open" ? t("connected") :
     wsStatus === "closed" ? t("closed ({code})", { code: closeCode ?? "" }) :
@@ -1507,10 +1779,17 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         <span className="text-white">{stats.sent}</span>
         <span className="text-gray-500">{t("Responses back")}</span>
         <span className="text-white">{stats.received}</span>
-        <span className="text-gray-500">{backend && backend !== "modal" ? t("Inference latency (avg)") : t("Modal latency (avg)")}</span>
-        <span className={stats.avgMs > 800 ? "text-red-400" : "text-green-400"}>
-          {stats.avgMs > 0 ? t("{avgMs} ms", { avgMs: stats.avgMs }) : "—"}
+        {/* Round trip split into the half we control and the half we do not. */}
+        <span className="text-gray-500">{t("Round trip (avg)")}</span>
+        <span className={stats.rttMs > 800 ? "text-red-400" : "text-green-400"}>
+          {stats.rttMs > 0 ? t("{ms} ms", { ms: stats.rttMs }) : "—"}
         </span>
+        <span className="text-gray-500">{t("— of which server")}</span>
+        <span className="text-white">{stats.avgMs > 0 ? t("{ms} ms", { ms: stats.avgMs }) : "—"}</span>
+        <span className="text-gray-500">{t("— of which network")}</span>
+        <span className="text-white">{stats.rttMs > 0 ? t("{ms} ms", { ms: stats.netMs }) : "—"}</span>
+        <span className="text-gray-500">{t("Analysed")}</span>
+        <span className="text-white">{stats.rttMs > 0 ? t("{fps} fps", { fps: (1000 / stats.rttMs).toFixed(1) }) : "—"}</span>
         {lastError && <>
           <span className="text-gray-500">{t("Error")}</span>
           <span className="text-red-400 truncate">{lastError}</span>
@@ -1616,13 +1895,19 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
             taking the other two. Same structure (and same card chrome) as the
             real-time player, so the live panels and the captured feedback
             frames render at identical size. Stacks on narrow screens. */}
-        <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 items-start">
+        {/* dir="ltr" pins Review/Detected/Live to a fixed physical left-to-right
+            order (see the long comment above detectedPanel/livePanel) -- Farsi's
+            dir="rtl" would otherwise flip which side "column 1" lands on. Only
+            three columns while Live is shown; two equal ones once it's hidden,
+            so Review and Detected end up the same width either way rather than
+            Detected staying stuck at 2/3 width with a dead third of a track. */}
+        <div dir="ltr" className={showLive ? "grid grid-cols-1 xl:grid-cols-3 gap-4 items-start" : "grid grid-cols-1 xl:grid-cols-2 gap-4 items-start"}>
           {/* Session controls. Pressed between moments rather than read during
               one, so they span the top of the grid instead of sitting on the
               video column -- which is what lets the Detected panel and the
               review lane start at the same height. */}
-          <div className="xl:col-span-2 min-w-0 bg-gray-900/50 border border-gray-800 rounded-xl p-3
-                          flex flex-col md:flex-row md:flex-wrap md:items-center gap-3 [&>*]:min-w-0">
+          <div dir={pageDir} className={`${showLive ? "xl:col-span-3" : "xl:col-span-2"} min-w-0 bg-gray-900/50 border border-gray-800 rounded-xl p-3
+                          flex flex-col md:flex-row md:flex-wrap md:items-center gap-3 [&>*]:min-w-0`}>
             {/* Right at the top of the column — it's pressed mid-procedure, so it
                 should never be somewhere you have to look for or scroll to. */}
             <button
@@ -1684,28 +1969,90 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
 
             {/* Recording is opt-in: nothing is written to the server until this
                 is pressed, so a session that nobody wants archived leaves nothing. */}
-            <RecordingControls recorder={recorder} ready={streaming} />
+            <RecordingRecoveryBanner />
+            <RecordingControls recorder={recorder} ready={streaming}
+              autoRecordEnabled={autoRecordEnabled} onAutoRecordEnabledChange={setAutoRecordEnabled}
+              recordOverride={recordOverride} onRecordOverrideChange={setRecordOverride} />
           </div>
-          <div className="space-y-2 min-w-0 bg-gray-900/50 border border-gray-800 rounded-xl p-3">
-            {/* Detected next — it's the panel being read during the procedure */}
-            <div className="space-y-1">
-              <div className="flex items-center justify-between gap-2">
-                <p className="text-xs text-gray-500 uppercase tracking-wide truncate">
-                  {t("Detected · ~{avgMs}ms behind live", { avgMs: stats.avgMs || 250 })}
-                </p>
-                <button onClick={() => setShowDetected(!showDetected)} className={toggleBtn}>
-                  {showDetected ? t("Hide") : t("Show")}
-                </button>
-              </div>
-              <div className={showDetected ? "" : "h-0 overflow-hidden opacity-0"}>
-                <div className={panelBox} style={{ aspectRatio: aspect }}>
-                  <canvas ref={analyzedRef} className="absolute inset-0 w-full h-full object-contain" />
-                </div>
-              </div>
+          <div dir={pageDir} className={`space-y-2 min-w-0 bg-gray-900/50 border border-gray-800 rounded-xl p-3 xl:order-2 ${showLive ? "xl:col-span-2" : ""}`}>
+            {/* Detected and Live, always rendered as this exact pair in this exact
+                order -- only the column count changes (2 when Live is shown, 1 when
+                hidden, and it drops into the second row rather than vanishing). The
+                <video>/<canvas> refs inside detectedPanel/livePanel never move to a
+                different parent, so neither ever remounts. */}
+            <div dir="ltr" className={showLive ? "grid grid-cols-1 xl:grid-cols-2 gap-2" : "grid grid-cols-1 gap-2"}>
+              {detectedPanel}
+              {livePanel}
             </div>
 
-            {/* The gate sits directly above Detected: when it fires, this is the
-                explanation for why that panel has stopped updating. */}
+            {/* Scrub — lets staff line up an exact moment in a clip instead of
+                waiting for the loop to come back around to it. Hidden for camera
+                and screen share, which have no timeline. Sits directly under the
+                pair above since it's one shared timeline for both. */}
+            {seekable && (
+              <div className="space-y-1">
+                {duration > 0 ? (
+                  <input
+                    type="range" min={0} max={duration} step={0.1}
+                    value={scrubbing ? scrubValue : curTime}
+                    onPointerDown={() => { setScrubbing(true); setScrubValue(curTime); }}
+                    onPointerUp={() => setScrubbing(false)}
+                    onPointerCancel={() => setScrubbing(false)}
+                    onChange={(e) => {
+                      const v = parseFloat(e.target.value);
+                      setScrubValue(v);
+                      seekTo(v);
+                    }}
+                    className="w-full accent-blue-500 cursor-pointer"
+                  />
+                ) : (
+                  <p className="text-xs text-gray-600">{t("Measuring clip length…")}</p>
+                )}
+                {/* dir=ltr because a transport is read the same way everywhere: the
+                    signs carry the direction, so nothing here depends on the page
+                    being LTR or on arrow glyphs being flipped for RTL. */}
+                <div dir="ltr" className="flex flex-wrap items-center gap-x-2 gap-y-1.5 text-xs">
+                  <button onClick={togglePlay} className={transportBtn}>{paused ? "▶" : "⏸"}</button>
+                  <button onClick={() => seekTo(curTime - 3)} className={transportBtn}>{"−3s"}</button>
+                  <button onClick={() => seekTo(curTime - 1)} className={transportBtn}>{"−1s"}</button>
+                  <button onClick={() => seekTo(curTime + 1)} className={transportBtn}>{"+1s"}</button>
+                  <button onClick={() => seekTo(curTime + 3)} className={transportBtn}>{"+3s"}</button>
+                  <button onClick={() => seekTo(0)} className={transportBtn}>{t("↺ Restart")}</button>
+                  <span className="text-gray-500 font-mono">
+                    {formatClock(curTime)}{duration > 0 ? ` / ${formatClock(duration)}` : ""}
+                  </span>
+                </div>
+
+                {/* Speed sits on its own row: the label is translated, so unlike the
+                    transport above it should follow the page direction. */}
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 text-xs">
+                  <span
+                    className="text-gray-500"
+                    title={t("slower playback = less motion between frames = the two panels drift apart less")}
+                  >
+                    {t("Playback speed")}
+                  </span>
+                  {SPEEDS.map((s) => (
+                    <button
+                      key={s}
+                      onClick={() => changeSpeed(s)}
+                      className={`px-2.5 py-1 rounded-md font-mono transition-colors ${
+                        speed === s ? "bg-green-600 text-white" : "bg-gray-800 text-gray-400 hover:bg-gray-700"
+                      }`}
+                    >
+                      {s}x
+                    </button>
+                  ))}
+                </div>
+                <p className="text-xs text-gray-500">
+                  {t("Scrub the clip — detection keeps running from wherever you land.")}
+                </p>
+              </div>
+            )}
+
+            {/* The gate sits directly below the Detected+Live pair (and the scrub
+                bar): when it fires, this is the explanation for why those panels
+                have stopped updating. */}
             <InBodyGateNotice gate={inBody} />
 
             <QualityGateNotice gate={quality} />
@@ -1751,120 +2098,6 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
             <TemporalGateNotice gate={temporal} />
 
             <FilterBankNotice gate={gate} temporal={temporal} show={showBank} onToggle={() => setShowBank(!showBank)} />
-
-            {/* Live source underneath, as the reference feed. Never unmounted —
-                the <video> is where startStream() attaches the MediaStream. */}
-            <div className="space-y-1">
-              <div className="flex items-center justify-between gap-2">
-                <p className="text-xs text-gray-500 uppercase tracking-wide truncate">{t("Live · no lag")}</p>
-                <button onClick={() => setShowLive(!showLive)} className={toggleBtn}>
-                  {showLive ? t("Hide") : t("Show")}
-                </button>
-              </div>
-              <div className={showLive ? "" : "h-0 overflow-hidden opacity-0"}>
-                <div className={panelBox} style={{ aspectRatio: liveAspect }}>
-                  <video
-                    ref={videoRef}
-                    muted
-                    playsInline
-                    loop={captureMode === "demo" || captureMode === "recording"}
-                    onTimeUpdate={handleTimeUpdate}
-                    onSeeked={handleSeeked}
-                    onPlay={() => setPaused(false)}
-                    onPause={() => setPaused(true)}
-                    onLoadedMetadata={handleLoadedMetadata}
-                    onDurationChange={handleLoadedMetadata}
-                    className={liveStyle ? "absolute object-contain" : "absolute inset-0 w-full h-full object-contain"}
-                    style={liveStyle}
-                  />
-                  {/* What the crop discards. The panel is showing the whole
-                      frame right now (liveCrop is forced to null above), so the
-                      kept region is outlined and everything outside it is
-                      washed red by an outsized ring shadow the panel clips. */}
-                  {showFovOverlay && fovNorm && (
-                    <div className="absolute inset-0 pointer-events-none">
-                      <div
-                        className="absolute border-2 border-[#39ff14]"
-                        style={{
-                          left:   `${fovNorm.x * 100}%`,
-                          top:    `${fovNorm.y * 100}%`,
-                          width:  `${fovNorm.w * 100}%`,
-                          height: `${fovNorm.h * 100}%`,
-                          boxShadow: "0 0 0 9999px rgba(239,68,68,0.5)",
-                        }}
-                      />
-                      <p className="absolute bottom-1 inset-x-1 text-center text-[11px] leading-tight text-white bg-black/75 rounded px-1 py-0.5">
-                        {t("Red is dropped before inference — {pct}% of the frame", { pct: Math.round(fovTrim * 100) })}
-                      </p>
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-
-            {/* Scrub — lets staff line up an exact moment in a clip instead of
-                waiting for the loop to come back around to it. Hidden for camera
-                and screen share, which have no timeline. */}
-            {seekable && (
-              <div className="space-y-1">
-                {duration > 0 ? (
-                  <input
-                    type="range" min={0} max={duration} step={0.1}
-                    value={scrubbing ? scrubValue : curTime}
-                    onPointerDown={() => { setScrubbing(true); setScrubValue(curTime); }}
-                    onPointerUp={() => setScrubbing(false)}
-                    onPointerCancel={() => setScrubbing(false)}
-                    onChange={(e) => {
-                      const v = parseFloat(e.target.value);
-                      setScrubValue(v);
-                      seekTo(v);
-                    }}
-                    className="w-full accent-blue-500 cursor-pointer"
-                  />
-                ) : (
-                  <p className="text-xs text-gray-600">{t("Measuring clip length…")}</p>
-                )}
-                {/* dir=ltr because a transport is read the same way everywhere: the
-                    signs carry the direction, so nothing here depends on the page
-                    being LTR or on arrow glyphs being flipped for RTL. */}
-                <div dir="ltr" className="flex flex-wrap items-center gap-x-2 gap-y-1.5 text-xs">
-                  <button onClick={togglePlay} className={transportBtn}>{paused ? "▶" : "⏸"}</button>
-                  <button onClick={() => seekTo(curTime - 3)} className={transportBtn}>{"−3s"}</button>
-                  <button onClick={() => seekTo(curTime - 1)} className={transportBtn}>{"−1s"}</button>
-                  <button onClick={() => seekTo(curTime + 1)} className={transportBtn}>{"+1s"}</button>
-                  <button onClick={() => seekTo(curTime + 3)} className={transportBtn}>{"+3s"}</button>
-                  <button onClick={() => seekTo(0)} className={transportBtn}>{t("↺ Restart")}</button>
-                  <span className="text-gray-500 font-mono">
-                    {curTime.toFixed(1)}s{duration > 0 ? ` / ${duration.toFixed(1)}s` : ""}
-                  </span>
-                </div>
-
-                {/* Speed sits on its own row: the label is translated, so unlike the
-                    transport above it should follow the page direction. */}
-                <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 text-xs">
-                  <span
-                    className="text-gray-500"
-                    title={t("slower playback = less motion between frames = the two panels drift apart less")}
-                  >
-                    {t("Playback speed")}
-                  </span>
-                  {SPEEDS.map((s) => (
-                    <button
-                      key={s}
-                      onClick={() => changeSpeed(s)}
-                      className={`px-2.5 py-1 rounded-md font-mono transition-colors ${
-                        speed === s ? "bg-green-600 text-white" : "bg-gray-800 text-gray-400 hover:bg-gray-700"
-                      }`}
-                    >
-                      {s}x
-                    </button>
-                  ))}
-                </div>
-                <p className="text-xs text-gray-500">
-                  {t("Scrub the clip — detection keeps running from wherever you land.")}
-                </p>
-              </div>
-            )}
 
             {/* Field of view. The signal is wider than the picture: there is a
                 black border around it, and averaging quality statistics over
@@ -1926,11 +2159,16 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
             </button>
           </div>
 
-          {/* Feedback box — spans the remaining two tracks (one per lane) and
-              scrolls internally so it never lengthens the page. Mounted only
+          {/* Review, leftmost of the three columns. Placed via xl:order-1 rather
+              than moved earlier in the JSX -- its own conditional (streaming)
+              flips independently of the video column, and reordering the JSX
+              itself would shift the video column's sibling index every time
+              this toggles, which is the same remount hazard as the Detected+Live
+              grid above. order is pure CSS and never touches sibling identity.
+              Scrolls internally so it never lengthens the page. Mounted only
               while streaming so it isn't polling behind the setup screen. */}
           {streaming && (
-            <div className="min-w-0 xl:sticky xl:top-4 xl:max-h-[calc(100vh-2rem)] xl:overflow-y-auto">
+            <div dir={pageDir} className="min-w-0 xl:order-1 xl:sticky xl:top-4 xl:max-h-[calc(100vh-2rem)] xl:overflow-y-auto">
               <FeedbackPanel caseId={caseId} refreshSignal={feedbackRefreshKey} />
             </div>
           )}
@@ -1981,7 +2219,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       </div>
 
       <p className="text-xs text-gray-600">
-        {t("Frames scaled to {width}px before sending · one frame in flight at a time · ~{avgMs}ms round trip per frame", { width: INFER_WIDTH, avgMs: stats.avgMs || 250 })}
+        {t("Frames scaled to {width}px before sending · one frame in flight at a time · ~{rtt}ms round trip ({server}ms of it server-side)", { width: INFER_WIDTH, rtt: stats.rttMs || 0, server: stats.avgMs || 0 })}
       </p>
     </div>
   );

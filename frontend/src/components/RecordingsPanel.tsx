@@ -210,6 +210,12 @@ export default function RecordingsPanel({
                         duration: r.duration_ms ? formatDuration(r.duration_ms) : "—",
                         size: formatBytes(r.bytes),
                       })}
+                      {/* Server doesn't know the eventual total until Stop, so
+                          this is "how far it's gotten", not "N of M" -- still
+                          the thing that tells you an open recording is
+                          actually still uploading and not just stuck. */}
+                      {r.status === "recording" && r.chunks > 0 &&
+                        ` · ${t("{n} pieces uploaded so far", { n: r.chunks })}`}
                       {!caseId && ` · ${t("case {case}", { case: r.case_id })}`}
                       {r.user && ` · ${r.user}`}
                     </div>
