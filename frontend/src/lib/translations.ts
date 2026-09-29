@@ -185,8 +185,8 @@ export const FA: Record<string, string> = {
   "False alarms": "هشدارهای کاذب",
   "Sound on": "صدا روشن",
   "Sound off": "صدا خاموش",
-  "Sound a short alert once a detection has held for {sec}s — the loudest signal gets the strictest bar.":
-    "پس از آنکه یک تشخیص {sec} ثانیه پایدار ماند، هشدار کوتاه صوتی پخش می‌شود — بلندترین سیگنال، سخت‌گیرانه‌ترین شرط را دارد.",
+  "Sound a short alert whenever a detection is captured — the same trigger as the capture itself.":
+    "هرگاه یک تصویر ضبط شود، هشدار کوتاه صوتی نیز پخش می‌شود — با همان شرطی که ضبط را فعال می‌کند.",
   "Dr. found, AI missed": "پزشک یافت، هوش مصنوعی تشخیص نداد",
   "Dr. noticed first": "پزشک ابتدا متوجه شد",
   "AI caught it first": "هوش مصنوعی ابتدا تشخیص داد",

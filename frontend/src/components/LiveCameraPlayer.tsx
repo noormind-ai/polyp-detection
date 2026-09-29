@@ -60,35 +60,37 @@ const AUTO_CAPTURE_REFRESH_MS = 8000;
 const DETECTION_GAP_MS = 1000;
 
 // ---------------------------------------------------------------------------
-// Three tiers of response, each with a harder bar than the last.
+// Two tiers gate what appears; a third rides on the second.
 //
 //   tier 1  box on screen   temporal gate, 2-of-3 (~0.5 s)   lib/temporal.ts
 //   tier 2  filed capture   FILE_MIN_MS  + FILE_MIN_HITS
-//   tier 3  audible alert   ALERT_MIN_MS + ALERT_MIN_CONF
+//   tier 3  audible alert   fires whenever tier 2 files a capture
 //
-// Cheapest signal, loosest bar; loudest signal, tightest bar. The thresholds
-// are the operating points Holzwanger et al. (Endoscopy 2021) measured for how
-// long a CADe detection has to last before it carries information -- CADe
-// specificity/accuracy 93.2%/97.8% at >=0.5 s, 98.6%/99.5% at >=1 s, and
-// 99.8%/99.9% at >=2 s. The same work found that over 95% of per-frame false
-// positives are ignored by endoscopists outright, which is why a single frame
-// triggers nothing here but a box.
+// Cheapest signal, loosest bar; loudest signal, same bar as the capture it
+// announces. The tier 1/2 thresholds are the operating points Holzwanger et
+// al. (Endoscopy 2021) measured for how long a CADe detection has to last
+// before it carries information -- CADe specificity/accuracy 93.2%/97.8% at
+// >=0.5 s, 98.6%/99.5% at >=1 s, and 99.8%/99.9% at >=2 s. The same work
+// found that over 95% of per-frame false positives are ignored by
+// endoscopists outright, which is why a single frame triggers nothing here
+// but a box.
 //
-// The bar rises with the cost of being wrong. A spurious box is glanced at and
-// dismissed; a spurious capture wastes a reviewer's time; a spurious beep is
-// the one that does damage -- CADe alert fatigue tracks with adenoma detection
-// falling from 49.9% to 39.9% across a list.
+// Tier 3 used to sit behind its own, stricter bar -- twice tier 2's patience
+// plus a confidence floor -- on the reasoning that a spurious beep is the one
+// failure mode that does real damage. With capture volume already low on the
+// current model, that meant the room rarely heard about a capture even when
+// one was filed. The alert now tracks the capture instead of gating
+// separately -- see documents/adr/0002-capture-also-alerts.md. Re-split the
+// tiers if a future model raises capture frequency back to where an
+// independent, stricter alert bar earns its keep again.
 // ---------------------------------------------------------------------------
 
 // Tier 2 -- file a capture. Both bars must be cleared: an appearance has to
 // have lasted this long AND been seen on this many inferred frames, so neither
-// a slow frame rate nor a burst of frames on its own can carry it.
+// a slow frame rate nor a burst of frames on its own can carry it. Tier 3 (the
+// alert) fires alongside every capture this produces -- see flushBest.
 const FILE_MIN_MS   = 1000;
 const FILE_MIN_HITS = 2;
-// Tier 3 -- sound the alert. Twice tier 2's patience, plus a confidence floor,
-// because this is the tier that interrupts the room. Fires once per appearance.
-const ALERT_MIN_MS   = 2000;
-const ALERT_MIN_CONF = 0.5;
 
 // FILE_MIN_MS is also the window over which the best frame of an appearance is
 // chosen, which is not a coincidence: the delay spent making sure is the same
@@ -210,11 +212,11 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
 
   // One appearance of a lesion, as a small state machine. `hits` and `start`
   // decide which tier has been earned; `best` holds the best frame seen so far,
-  // and `filed`/`alerted` make each tier fire once rather than once per frame.
+  // and `filed` makes tier 2 (and, with it, tier 3 -- see flushBest) fire once
+  // rather than once per frame.
   const episodeStartRef   = useRef(0);
   const episodeHitsRef    = useRef(0);
   const episodeFiledRef   = useRef(false);
-  const episodeAlertedRef = useRef(false);
   const bestRef = useRef<{ score: number; boxes: Box[] } | null>(null);
   // Two scratch canvases, reused for the life of the session: the frame being
   // considered, and the best one held so far. A fresh 960px canvas per inferred
@@ -830,7 +832,6 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     inEpisodeRef.current = false;
     episodeHitsRef.current = 0;
     episodeFiledRef.current = false;
-    episodeAlertedRef.current = false;
     bestRef.current = null;
   }
 
@@ -895,7 +896,6 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       episodeStartRef.current = now;
       episodeHitsRef.current = 0;
       episodeFiledRef.current = false;
-      episodeAlertedRef.current = false;
       bestRef.current = null;
     }
     episodeHitsRef.current += 1;
@@ -903,19 +903,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
 
     const age = now - episodeStartRef.current;
 
-    // Tier 3 — the alert. Deliberately independent of the capture path: a
-    // capture can sit behind a slow uplink, and telling the room about a lesion
-    // must never wait on an upload queue.
-    if (!episodeAlertedRef.current && age >= ALERT_MIN_MS
-        && episodeHitsRef.current >= FILE_MIN_HITS
-        && boxes.some((b) => b.conf >= ALERT_MIN_CONF)) {
-      episodeAlertedRef.current = true;
-      alertSound();
-    }
-
     // Tier 2 — the capture. First filing waits for the window to close; after
     // that a lesion still on screen is refreshed occasionally, so a long look is
-    // not represented by one frame.
+    // not represented by one frame. Tier 3 (the alert) rides along with every
+    // capture this produces -- see flushBest.
     if (episodeHitsRef.current < FILE_MIN_HITS) return;
     const due = episodeFiledRef.current
       ? now - lastAutoCaptureRef.current >= AUTO_CAPTURE_REFRESH_MS
@@ -923,13 +914,16 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     if (due) flushBest(now);
   }
 
-  /** Tier 2. Hand the best frame of this appearance to the uploader. */
+  /** Tiers 2 and 3. Hand the best frame of this appearance to the uploader,
+   *  and sound the alert alongside it -- every captured image gets a beep,
+   *  see documents/adr/0002-capture-also-alerts.md. */
   function flushBest(now: number) {
     const best = bestRef.current;
     const canvas = bestCanvasRef.current;
     if (!best || !canvas) return;
     episodeFiledRef.current = true;
     lastAutoCaptureRef.current = now;
+    alertSound();
     const boxes = best.boxes;
     bestRef.current = null;  // a refresh picks a fresh best, not this one again
     canvas.toBlob((blob) => { if (blob) sendCapture(blob, boxes); }, "image/jpeg", 0.82);
@@ -1753,8 +1747,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
               is the operator's call, not a default. */}
           <button
             onClick={() => setAlertEnabled(!alertEnabled)}
-            title={t("Sound a short alert once a detection has held for {sec}s — the loudest signal gets the strictest bar.",
-                     { sec: ALERT_MIN_MS / 1000 })}
+            title={t("Sound a short alert whenever a detection is captured — the same trigger as the capture itself.")}
             className={`text-xs px-2 py-0.5 rounded-md border transition-colors ${
               alertEnabled
                 ? "border-emerald-700 bg-emerald-950/40 text-emerald-300"
