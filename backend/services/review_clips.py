@@ -28,6 +28,26 @@ FFMPEG = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
 
 PAD_BEFORE_S = 5.0
 PAD_AFTER_S = 5.0
+
+# Review clips are for human eyes, so they get a real motion-adaptive
+# deinterlace rather than the cheap single-field extract the live path uses.
+#
+# The source is analog SD over composite and is interlaced throughout --
+# ffmpeg's idet reports 679/679 frames top-field-first on our own clinic
+# recordings. WebM/VP9 cannot signal interlace at all (`field_order=unknown`),
+# so no player will ever deinterlace these on its own: without this, every
+# review clip shows comb teeth on anything that moved. Unlike the live path,
+# nothing here downscales, so there is no incidental averaging to soften it.
+#
+# The crop handles recordings made before lib/cameraMode.ts started choosing
+# the capture mode properly. Those opened the card in PAL 720x576 while the
+# processor was sending 480-line NTSC, leaving 96 lines the card was never
+# given anything to put in -- an untouched YUV buffer, which renders green.
+# Expressed as a filter expression rather than probed with ffprobe so this
+# stays one subprocess; `ih` is the real height, so newer 720x480 recordings
+# match the else-branch and are passed through untouched. Commas inside the
+# expression are escaped because a bare comma separates filters.
+VIDEO_FILTER = r"crop=iw:if(eq(ih\,576)\,480\,ih):0:0,yadif"
 # Generous but bounded -- a hung/runaway ffmpeg process must not pile up
 # behind a live procedure's background task queue.
 TIMEOUT_S = 60
@@ -63,6 +83,7 @@ def cut_clip(source: Path, offset_ms: int, out_path: Path,
         "-i", str(source),
         "-ss", f"{fine:.3f}",
         "-t", f"{duration:.3f}",
+        "-vf", VIDEO_FILTER,
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
         "-an",
         "-movflags", "+faststart",

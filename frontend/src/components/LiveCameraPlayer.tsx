@@ -20,6 +20,7 @@ import { useAuth } from "@/lib/auth";
 import { beginLiveInference } from "@/lib/uploadCoordinator";
 import { detectFovRect, unionRect, intersectRect, trimmedFraction, NEGLIGIBLE_TRIM, type Rect } from "@/lib/fov";
 import { negotiateCameraMode, describeMode, type ModeAttempt } from "@/lib/cameraMode";
+import { combRatio, looksInterlaced, createDeinterlacer } from "@/lib/interlace";
 import { drawBoxes, type Box } from "@/lib/drawBoxes";
 import { useFullscreen, fsWrapClass, fsExitBtnClass, fsBoxStyle } from "@/lib/useFullscreen";
 import { useAlertSound } from "@/lib/useAlertSound";
@@ -66,6 +67,31 @@ const DEMO_SPEED = 0.7;
 // per-frame one. Several rather than one because the union of several frames
 // cannot be fooled by a single dark frame — see lib/fov.ts.
 const FOV_SAMPLE_FRAMES = 8;
+// How many frames to spend deciding whether the source is interlaced before
+// concluding it is not. Far more generous than the FOV budget above, and for a
+// different reason: a border shows up in any frame, but comb only appears where
+// something MOVED. A scope sitting still at the start of a session is not
+// evidence of a progressive source, so this has to outlast a quiet opening —
+// roughly two seconds at inference rate. A single moving frame settles it;
+// see sampleInterlace.
+const INTERLACE_SAMPLE_FRAMES = 60;
+// How many frames may be awaiting a reply at once.
+//
+// At 1, the loop is strictly send -> wait -> send, so every millisecond the
+// network costs is a millisecond no frame is being inferred. Measured against
+// the clinic link that is not a rounding error: round trip is a median 9ms but
+// a p90 of 27ms and a p99 of 44ms, so at the tail the wire was costing about a
+// third of the frame budget -- and because the loop is serialised, each stall
+// drops frames directly rather than being absorbed.
+//
+// At 1 frame in flight the next frame is encoded and sent while the previous
+// one is still being inferred, which hides the wire behind the model instead of
+// adding to it. Deliberately not higher: every extra frame in flight is one
+// more frame of staleness between the picture and its boxes, and for a CADe
+// overlay that is a clinical cost, not just a latency figure.
+const MAX_IN_FLIGHT = 1;
+// One slot for the frame being prepared, plus one per frame awaiting a reply.
+const HI_RING_SLOTS = MAX_IN_FLIGHT + 1;
 // A polyp that is STILL on screen is re-filed at most this often, so a long
 // look is not represented in the queue by a single frame.
 const AUTO_CAPTURE_REFRESH_MS = 8000;
@@ -262,7 +288,14 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // Two scratch canvases, reused for the life of the session: the frame being
   // considered, and the best one held so far. A fresh 960px canvas per inferred
   // frame would be megabytes a second of garbage on a clinic PC.
-  const hiScratchRef  = useRef<HTMLCanvasElement | null>(null);
+  // A ring, not one canvas. With a frame in flight while the next is being
+  // prepared, a single scratch would be overwritten by frame N+1 before frame
+  // N's boxes came back -- and those boxes would then be drawn over, and filed
+  // against, the wrong picture. That is exactly the guarantee grabCapture
+  // exists to provide. Two slots is the minimum for MAX_IN_FLIGHT = 1 and must
+  // grow with it: a slot has to survive from its grab until its reply settles.
+  const hiRingRef = useRef<HTMLCanvasElement[]>([]);
+  const hiSlotRef = useRef(0);
   const bestCanvasRef = useRef<HTMLCanvasElement | null>(null);
   // At most one capture may wait behind an in-flight upload. More than one and
   // we are back to queueing POSTs against the same upstream the frame stream
@@ -277,8 +310,52 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // draws.
   const alert = useAlertSound();
 
-  // Pending response promise resolver — one in-flight request at a time
-  const pendingRef = useRef<((v: { boxes: Box[]; timing: Timing } | null) => void) | null>(null);
+  /** One entry per frame handed to the socket and not yet answered.
+   *
+   *  A FIFO rather than a single resolver, because more than one frame is now
+   *  in flight (see MAX_IN_FLIGHT). Nothing correlates a reply to its request
+   *  explicitly and nothing needs to: _stream_frames receives, infers and
+   *  replies strictly one frame at a time, and the socket preserves order, so
+   *  the Nth reply always belongs to the Nth request. Shifting off the front
+   *  is the correlation.
+   *
+   *  `done` is what keeps that true across a timeout. A frame we gave up on
+   *  stays in the queue as a tombstone, because the server has not given up
+   *  and its reply is still coming; dropping the entry outright would make
+   *  every later reply answer the wrong frame. */
+  interface Pending {
+    resolve: (v: { boxes: Box[]; timing: Timing } | null) => void;
+    sentAt: number;
+    done: boolean;
+  }
+  const pendingQueueRef = useRef<Pending[]>([]);
+
+  /** Hand one frame to the socket and return a promise for its boxes. Does NOT
+   *  wait: the caller decides when to settle it, which is what lets the next
+   *  frame be prepared and sent while this one is still being inferred. */
+  function sendForInference(ws: WebSocket, buf: ArrayBuffer) {
+    return new Promise<{ boxes: Box[]; timing: Timing } | null>((resolve) => {
+      const entry: Pending = { resolve, sentAt: performance.now(), done: false };
+      pendingQueueRef.current.push(entry);
+      ws.send(buf);
+      sentCountRef.current += 1;
+      setStats((st) => ({ ...st, sent: st.sent + 1 }));
+      setTimeout(() => {
+        // Leave the entry in the queue as a tombstone -- the server has not
+        // given up and its reply still has to consume a slot. See Pending.
+        if (!entry.done) { entry.done = true; resolve(null); }
+      }, INFER_TIMEOUT_MS);
+    });
+  }
+
+  /** Fail every outstanding frame — on socket close, or when the loop stops.
+   *  Without this a caller stays awaited forever on a socket that will never
+   *  answer. */
+  function flushPending() {
+    const q = pendingQueueRef.current;
+    pendingQueueRef.current = [];
+    for (const e of q) if (!e.done) { e.done = true; e.resolve(null); }
+  }
 
   const [devices, setDevices]             = useState<MediaDeviceInfo[]>([]);
   const [selectedDeviceId, setSelectedId] = useState("");
@@ -302,7 +379,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   const [wsStatus, setWsStatus]           = useState<"connecting" | "open" | "error" | "closed">("connecting");
   const [closeCode, setCloseCode]         = useState<number | null>(null);
   const [polyp, setPolyp]                 = useState(false);
-  const [stats, setStats]                 = useState({ sent: 0, received: 0, avgMs: 0, rttMs: 0, netMs: 0 });
+  const [stats, setStats]                 = useState({ sent: 0, received: 0, avgMs: 0, rttMs: 0, netMs: 0, fps: 0 });
   // Whole filter bank as reported by the backend for the last frame that
   // came back, so the panel answers "which paper filter fired on THIS
   // scene" rather than showing one operator's raw numbers.
@@ -363,10 +440,18 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   const [showLive, setShowLive]           = useState(true);
   const msHistory = useRef<number[]>([]);
   // Client-side round trip, so the panel can split what the server spent from
-  // what the wire cost. Safe as a single ref because only one frame is ever in
-  // flight at a time (pendingRef) — see the capture loop.
+  // what the wire cost. The send timestamp lives on each queue entry rather
+  // than in one ref: with several frames in flight a single ref would be
+  // overwritten by the next send before the previous reply arrived, and every
+  // round trip would read as far shorter than it was.
   const rttHistory = useRef<number[]>([]);
-  const sentAtRef = useRef<number>(0);
+  // Gaps between arriving results. This is THROUGHPUT, and it is deliberately
+  // not derived from the round trip: pipelining works by overlapping frames,
+  // not by shortening any one of them, so 1000/rtt cannot show its effect at
+  // all -- it reported the same number before and after the change while the
+  // real frame rate had risen by half. Measure the thing being claimed.
+  const arrivalHistory = useRef<number[]>([]);
+  const lastArrivalRef = useRef(0);
   // Mirrors of stats.sent/received kept outside React state purely so the
   // throttled report to spectator mode (below) always reads the current
   // count synchronously, instead of racing a stale closure over state.
@@ -583,6 +668,22 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   const [fovRect, setFovRectState] = useState<Rect | null>(null);
   const fovRectRef  = useRef<Rect | null>(null);
   const fovSamplesRef = useRef(0);
+  // Whether this source is interlaced, and how far we have got towards knowing.
+  // Null means "not decided yet", and while it is null nothing is deinterlaced
+  // -- the safe default, since treating a progressive source as interlaced
+  // throws away half its vertical resolution. See sampleInterlace.
+  const interlacedRef = useRef<boolean | null>(null);
+  // Owns the frame history the motion test needs, so it is per-component and
+  // reset whenever the source changes. See lib/interlace.ts.
+  const deintRef = useRef(createDeinterlacer());
+  // The Live panel paints through this canvas rather than showing the <video>
+  // directly -- see the effect below. Null until the element mounts.
+  const liveCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  // Set false if the canvas path ever fails, which un-hides the <video> again.
+  // A combed picture is bad; a black panel mid-procedure is worse.
+  const [liveCanvasOk, setLiveCanvasOk] = useState(true);
+  const interlaceSamplesRef = useRef(0);
+  const combPeakRef = useRef(0);
   // The region the FOV was measured INSIDE, in native frame pixels. With a
   // screen-share crop active that is the crop, not the frame — and "how much
   // does this trim" only means anything relative to it.
@@ -610,6 +711,47 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
 
   // Forget the measurement so the next session measures again. The border
   // belongs to the source, so anything that changes the source invalidates it.
+  /** Decide, once per source, whether frames are interlaced.
+   *
+   *  Latches on the FIRST frame that clears the threshold and stops looking:
+   *  comb is proof of interlacing, but its absence proves nothing while the
+   *  picture is still, so "no comb yet" must never be allowed to overwrite a
+   *  "yes" seen earlier. Only running out of frames concludes "progressive".
+   *
+   *  Measured on the WHOLE frame rather than inside the crop. Interlacing is a
+   *  property of the signal, not of the region we happen to be sending, and
+   *  the full frame gives the measure more lines and more chance of catching
+   *  something in motion. */
+  function sampleInterlace(video: HTMLVideoElement) {
+    if (interlacedRef.current !== null) return;
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw || !vh) return;
+
+    const ratio = combRatio(video, vw, vh);
+    if (ratio !== null && ratio > combPeakRef.current) combPeakRef.current = ratio;
+
+    if (looksInterlaced(ratio)) {
+      interlacedRef.current = true;
+      console.info(`[interlace] source is interlaced (comb ratio ${ratio!.toFixed(2)}) — deinterlacing`);
+      return;
+    }
+    // A frame we could not read at all (tainted canvas, flat picture) is not
+    // evidence either way, so it must not burn budget.
+    if (ratio === null) return;
+    if (++interlaceSamplesRef.current >= INTERLACE_SAMPLE_FRAMES) {
+      interlacedRef.current = false;
+      console.info(`[interlace] source looks progressive (peak comb ratio ${combPeakRef.current.toFixed(2)}) — drawing frames whole`);
+    }
+  }
+
+  function resetInterlaceDetection() {
+    interlacedRef.current = null;
+    interlaceSamplesRef.current = 0;
+    combPeakRef.current = 0;
+    // Motion measured against a different video means nothing.
+    deintRef.current.reset();
+  }
+
   function resetFovDetection() {
     fovRectRef.current = null;
     fovSamplesRef.current = 0;
@@ -682,6 +824,67 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // first, which is what removes the access step from the clinic's workflow.
   useEffect(() => { void listDevicesQuietly(); }, []);   // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Paint the Live panel through the deinterlacer instead of letting the browser
+  // show the <video> directly.
+  //
+  // The <video> element STAYS in the DOM and keeps playing -- it holds the
+  // MediaStream and is what the capture loop grabs frames from. Only its
+  // pixels are hidden (opacity, never display:none, which would stop it
+  // producing frames at all). This just draws the same frames, deinterlaced.
+  //
+  // Driven by requestVideoFrameCallback, so it runs once per decoded video
+  // frame rather than once per display refresh -- no wasted work repainting a
+  // frame that has not changed, and no fixed 60fps cost. At ~0.1ms a frame
+  // (see lib/interlace.ts) this is cheap enough to sit alongside inference.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !showLive || !liveCanvasOk) return;
+    // Older Safari has no rVFC. Nothing breaks: the canvas simply never paints,
+    // and the fallback below reveals the <video> as it was before.
+    const anyVid = video as HTMLVideoElement & {
+      requestVideoFrameCallback?: (cb: () => void) => number;
+      cancelVideoFrameCallback?: (h: number) => void;
+    };
+    if (typeof anyVid.requestVideoFrameCallback !== "function") {
+      setLiveCanvasOk(false);
+      return;
+    }
+    let handle = 0, cancelled = false;
+    const paint = () => {
+      if (cancelled) return;
+      const canvas = liveCanvasRef.current;
+      const vw = video.videoWidth, vh = video.videoHeight;
+      if (canvas && vw && vh) {
+        try {
+          // Whole frame, not sourceRect: the panel's crop is applied in CSS
+          // (liveStyle) exactly as it was for the <video>, so the canvas must
+          // carry the same full-frame geometry for that crop to still line up.
+          // Even dimensions keep field parity stable -- see evenScanlines.
+          const w = vw & ~1, h = vh & ~1;
+          if (canvas.width !== w) canvas.width = w;
+          if (canvas.height !== h) canvas.height = h;
+          if (interlacedRef.current === true) {
+            deintRef.current.draw(video, 0, 0, w, h, canvas, w, h, video.currentTime);
+          } else {
+            const ctx = canvas.getContext("2d")!;
+            ctx.imageSmoothingEnabled = true;
+            ctx.drawImage(video, 0, 0, w, h, 0, 0, w, h);
+          }
+        } catch (err) {
+          console.error("[live] canvas paint failed, falling back to the raw video", err);
+          setLiveCanvasOk(false);
+          return;
+        }
+      }
+      handle = anyVid.requestVideoFrameCallback!(paint);
+    };
+    handle = anyVid.requestVideoFrameCallback(paint);
+    return () => {
+      cancelled = true;
+      try { anyVid.cancelVideoFrameCallback?.(handle); } catch { /* already gone */ }
+    };
+  }, [showLive, liveCanvasOk, streaming, captureMode]);
+
   const insecure = typeof window !== "undefined" && !window.isSecureContext;
 
   // Maps raw getUserMedia() failures to messages a non-technical user can act on.
@@ -708,19 +911,25 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
 
     ws.onopen  = () => setWsStatus("open");
     ws.onerror = () => setWsStatus("error");
-    ws.onclose = (e) => { setWsStatus("closed"); setCloseCode(e.code); pendingRef.current?.(null); };
+    ws.onclose = (e) => { setWsStatus("closed"); setCloseCode(e.code); flushPending(); };
 
     ws.onmessage = (e) => {
       let data: unknown;
       try { data = JSON.parse(e.data); } catch { return; }
 
+      // An error reply still answers exactly one request, so it must consume
+      // exactly one queue slot -- otherwise every later reply is off by one.
       if (data && typeof data === "object" && "error" in data) {
         const err = (data as { error: string }).error;
         setLastError(err);
-        pendingRef.current?.(null);
-        pendingRef.current = null;
+        const failed = pendingQueueRef.current.shift();
+        if (failed && !failed.done) { failed.done = true; failed.resolve(null); }
         return;
       }
+
+      // Front of the queue is this reply's request -- see Pending. Taken before
+      // anything else so an early return cannot leave the queue misaligned.
+      const entry = pendingQueueRef.current.shift();
 
       const { boxes, timing } = data as { boxes: Box[]; timing: Timing };
       const g = (data as { timing?: { gate?: GateState } }).timing?.gate;
@@ -734,7 +943,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       // misnomer kept for UI compatibility — on this box there is no Modal, it
       // is CPU time), so the difference is everything the wire and the browser
       // cost on top. Clamped at 0: a sub-millisecond LAN can round negative.
-      const rtt = sentAtRef.current ? performance.now() - sentAtRef.current : 0;
+      const rtt = entry ? performance.now() - entry.sentAt : 0;
       if (rtt > 0) {
         rttHistory.current.push(rtt);
         if (rttHistory.current.length > 10) rttHistory.current.shift();
@@ -743,9 +952,19 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         ? Math.round(rttHistory.current.reduce((a, b) => a + b, 0) / rttHistory.current.length)
         : 0;
       receivedCountRef.current += 1;
+      const nowMs = performance.now();
+      if (lastArrivalRef.current) {
+        arrivalHistory.current.push(nowMs - lastArrivalRef.current);
+        if (arrivalHistory.current.length > 20) arrivalHistory.current.shift();
+      }
+      lastArrivalRef.current = nowMs;
+      const avgGap = arrivalHistory.current.length
+        ? arrivalHistory.current.reduce((a, b) => a + b, 0) / arrivalHistory.current.length
+        : 0;
+      const liveFps = avgGap > 0 ? Math.round((1000 / avgGap) * 10) / 10 : 0;
       setStats((s) => ({
         sent: s.sent, received: s.received + 1, avgMs: avg,
-        rttMs: avgRtt, netMs: avgRtt ? Math.max(0, avgRtt - avg) : 0,
+        rttMs: avgRtt, netMs: avgRtt ? Math.max(0, avgRtt - avg) : 0, fps: liveFps,
       }));
 
       // Best-effort, throttled report so spectator mode can show these same
@@ -758,7 +977,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         if (now - roomStatsLastPostRef.current > 2000) {
           roomStatsLastPostRef.current = now;
           const netMs = avgRtt ? Math.max(0, avgRtt - avg) : 0;
-          const fps = avgRtt ? Math.round((1000 / avgRtt) * 10) / 10 : 0;
+          const fps = liveFps;
           void fetch(`${API}/api/spectate/${encodeURIComponent(caseId)}/room-stats`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -770,8 +989,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         }
       }
 
-      pendingRef.current?.({ boxes, timing });
-      pendingRef.current = null;
+      // A frame we already timed out on still gets its reply eventually. The
+      // loop has long moved past it, so the data is dropped -- the tombstone's
+      // only job was to keep the queue aligned, and the shift above did that.
+      if (entry && !entry.done) { entry.done = true; entry.resolve({ boxes, timing }); }
     };
 
     return () => { ws.close(); scanRef.current = false; };
@@ -792,13 +1013,32 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     };
   }, []);
 
-  // Draws the exact frame that was sent to the model, with boxes at native (capture)
-  // resolution — pixel-accurate for that frame, unlike overlaying on the live video
-  // (which has moved on by the time the result comes back).
-  function drawAnalyzedFrame(source: HTMLCanvasElement, boxes: Box[]) {
+  // Draws the frame that was sent to the model, with its boxes — pixel-accurate
+  // for that frame, unlike overlaying on the live video (which has moved on by
+  // the time the result comes back).
+  //
+  // Draws `hi`, not `cap`. Both are the same region of the same video frame, so
+  // the boxes describe both equally; `cap` is just 320px wide because that is
+  // all the model needs, and drawBoxes sizes the canvas from its source, so
+  // passing `cap` meant the panel was a 320px thumbnail that CSS then stretched
+  // to full width. `hi` is already grabbed every frame for filed captures and
+  // costs nothing extra here. Boxes come back in cap space, so they are scaled
+  // by the ratio between the two -- the same transform considerBest already
+  // applies for the same reason.
+  //
+  // Only correct because `hi` is deinterlaced (see grabCapture): at native
+  // resolution the comb is NOT averaged away by any downscale, so drawing it
+  // raw would have shown the doctor more combing than the 320px panel did.
+  function drawAnalyzedFrame(cap: HTMLCanvasElement, hi: HTMLCanvasElement | null, boxes: Box[]) {
     const canvas = analyzedRef.current;
     if (!canvas) return;
-    drawBoxes(canvas, source, boxes, (det) => t("polyp  {conf}%", { conf: Math.round(det.conf * 100) }));
+    const source = hi ?? cap;
+    const k = cap.width > 0 ? source.width / cap.width : 1;
+    const scaled = k === 1 ? boxes : boxes.map((b) => ({
+      ...b,
+      bbox: [b.bbox[0] * k, b.bbox[1] * k, b.bbox[2] * k, b.bbox[3] * k] as [number, number, number, number],
+    }));
+    drawBoxes(canvas, source, scaled, (det) => t("polyp  {conf}%", { conf: Math.round(det.conf * 100) }));
   }
 
   // The single writer of "what is on screen right now" -- the indicator, the
@@ -820,7 +1060,28 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // capture card has a border/band an operator can't fix by re-aiming a lens
   // the way they could a real camera, so the same manual crop this app
   // already offered for screen-share is the right tool there too.
+  /** Snap a rect to even scanlines.
+   *
+   *  Field parity is defined by the ABSOLUTE scanline number, so a rect
+   *  starting on an odd line extracts the opposite field from one starting on
+   *  an even line. Both inputs to sourceRect can land anywhere: the crop is
+   *  hand-drawn, and the FOV rect is auto-detected from the first frames. Both
+   *  can also change mid-session. A parity flip mid-procedure shows up as a
+   *  half-scanline jump, or -- if it keeps flipping -- as alternating fields,
+   *  which is bob judder: the exact artifact field extraction exists to remove.
+   *
+   *  Which field we land on is arbitrary. That it never changes is the point.
+   *  Snapping DOWN only ever shrinks the rect, so it stays inside whatever the
+   *  crop and FOV already clipped it to. */
+  function evenScanlines(r: Rect): Rect {
+    return { ...r, y: r.y & ~1, h: r.h & ~1 };
+  }
+
   function sourceRect(video: HTMLVideoElement) {
+    return evenScanlines(sourceRectRaw(video));
+  }
+
+  function sourceRectRaw(video: HTMLVideoElement): Rect {
     const vw = video.videoWidth, vh = video.videoHeight;
     // Any source that plays a picture can carry an edge worth trimming:
     // browser chrome around a shared window, a capture-card border or sync
@@ -923,17 +1184,52 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     return BEST_W_SHARP * sharp + BEST_W_CONF * conf + BEST_W_SIZE * size;
   }
 
+  /** Draw a region of `video` into `dst`, progressive.
+   *
+   *  Deinterlacing is motion-adaptive (lib/interlace.ts): still areas keep all
+   *  their real scanlines, only moving ones are rebuilt. An earlier version
+   *  discarded a whole field ("bob") -- measurably clean, but it halves the
+   *  vertical resolution of the entire picture, and once the panel started
+   *  showing frames at native size the doubling that leaves behind was plainly
+   *  visible as horizontal banding.
+   *
+   *  No-ops into a plain draw on a progressive source: the same capture loop
+   *  also serves screen share, the demo clips, and files off the operator's
+   *  disk, and deinterlacing any of those would only destroy detail. */
+  function drawDeinterlaced(
+    video: HTMLVideoElement, sx: number, sy: number, sw: number, sh: number,
+    dst: HTMLCanvasElement, dw: number, dh: number,
+  ) {
+    if (interlacedRef.current !== true) {
+      const ctx = dst.getContext("2d")!;
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
+      ctx.drawImage(video, sx, sy, sw, sh, 0, 0, dw, dh);
+      return;
+    }
+    deintRef.current.draw(video, sx, sy, sw, sh, dst, dw, dh, video.currentTime);
+  }
+
   /** Grab the frame a reviewer will look at, from the SAME video frame the
    *  model was given. Re-grabbing after the inference round trip would file an
    *  image the boxes no longer describe -- on CPU that trip is a couple of
-   *  hundred milliseconds, and the scope moves in that time. */
+   *  hundred milliseconds, and the scope moves in that time.
+   *
+   *  This is where deinterlacing matters most. CAPTURE_EDGE is 960 and the
+   *  source is 720 wide, so `scale` is 1 and nothing is downsized: unlike the
+   *  inference canvas, there is no shrink here to incidentally average the
+   *  comb away. These frames are what doctors review and what future training
+   *  data is built from, so they are kept progressive. */
   function grabCapture(video: HTMLVideoElement, sx: number, sy: number, sw: number, sh: number) {
     const scale = Math.min(1, CAPTURE_EDGE / Math.max(sw, sh));
     const w = Math.max(1, Math.round(sw * scale)), h = Math.max(1, Math.round(sh * scale));
-    const c = hiScratchRef.current ?? (hiScratchRef.current = document.createElement("canvas"));
+    const slot = hiSlotRef.current;
+    hiSlotRef.current = (slot + 1) % HI_RING_SLOTS;
+    const ring = hiRingRef.current;
+    const c = ring[slot] ?? (ring[slot] = document.createElement("canvas"));
     if (c.width !== w) c.width = w;
     if (c.height !== h) c.height = h;
-    c.getContext("2d")!.drawImage(video, sx, sy, sw, sh, 0, 0, w, h);
+    drawDeinterlaced(video, sx, sy, sw, sh, c, w, h);
     return c;
   }
 
@@ -1079,12 +1375,15 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // A review still does not need more than this.
   const CAPTURE_MAX_EDGE = 960;
 
+  // Deinterlaced for the same reason grabCapture is: at 960 against a 720-wide
+  // source `scale` is 1, so nothing is downsized and there is no incidental
+  // averaging to hide the comb. Callers pass a sourceRect(), so sy/sh are even.
   function captureCanvas(video: HTMLVideoElement, src: { x: number; y: number; w: number; h: number }) {
     const scale = Math.min(1, CAPTURE_MAX_EDGE / Math.max(src.w, src.h));
     const cap = document.createElement("canvas");
     cap.width = Math.round(src.w * scale);
     cap.height = Math.round(src.h * scale);
-    cap.getContext("2d")!.drawImage(video, src.x, src.y, src.w, src.h, 0, 0, cap.width, cap.height);
+    drawDeinterlaced(video, src.x, src.y, src.w, src.h, cap, cap.width, cap.height);
     return cap;
   }
 
@@ -1231,6 +1530,49 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     // mid-procedure, still inside the body) -- leaking that hold would
     // permanently block all future uploads in this tab.
 
+    // The frame handed to the socket but not yet drawn. Carries its own cap and
+    // hi so the boxes are always applied to the picture they describe, even
+    // though the loop has moved on to preparing the next one.
+    type InFlight = {
+      result: Promise<{ boxes: Box[]; timing: Timing } | null>;
+      cap: HTMLCanvasElement;
+      hi: HTMLCanvasElement;
+    };
+    let inFlight: InFlight | null = null;
+
+    // Everything that reacts to a result lives here, so it happens in frame
+    // order whichever path got us here. updateBoxes, the temporal gate and
+    // maybeAutoCapture are all state machines keyed on sequence -- settling
+    // out of order would corrupt all three.
+    const settle = async (f: InFlight) => {
+      const result = await f.result;
+      if (result) {
+        // One gate for both what is shown and what is kept.
+        const shown = temporal.filter(
+          result.boxes.filter((b) => b.conf >= confMinRef.current));
+        updateBoxes(shown);
+        drawAnalyzedFrame(f.cap, f.hi, shown);
+        maybeAutoCapture(shown, f.cap, f.hi);
+      } else {
+        // A timed-out frame is not evidence the lesion left, but it is not
+        // evidence it is still there either. maybeAutoCapture is the only writer
+        // of the gap timer, so a stretch of skipped frames used to freeze the
+        // state machine mid-appearance and throttle the NEXT lesion against a
+        // stale timestamp. Feeding the quiet frame through lets it close.
+        maybeAutoCapture([], null, null);
+      }
+    };
+
+    /** Nothing may overtake a frame already sent. Both skip paths below draw
+     *  and advance the capture state machine immediately, so they have to let
+     *  the older frame land first or the panel would jump backwards. */
+    const drainInFlight = async () => {
+      if (!inFlight) return;
+      const f = inFlight;
+      inFlight = null;
+      await settle(f);
+    };
+
     try {
     while (scanRef.current) {
       const ws = wsRef.current;
@@ -1254,6 +1596,9 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       // Before choosing the region, not after — the first frames of a session
       // are exactly the ones that decide it.
       sampleFov(video);
+      // Both of the draws below ask whether this source is interlaced, so the
+      // answer has to be as up to date as it can be before either runs.
+      sampleInterlace(video);
 
       const { x: srcX, y: srcY, w: srcW, h: srcH } = sourceRect(video);
       // Size the panels to the region actually being analyzed, so the two live
@@ -1266,7 +1611,19 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       const cap   = document.createElement("canvas");
       cap.width   = capW;
       cap.height  = capH;
-      cap.getContext("2d")!.drawImage(video, srcX, srcY, srcW, srcH, 0, 0, capW, capH);
+      // NOT deinterlaced, on purpose. Squashing 480 lines into ~213 averages
+      // neighbouring lines, and that averaging cancels the comb by itself --
+      // this shrink IS a blend deinterlace. Measured on clinic footage at the
+      // 320px size the model actually sees: comb ratio 0.60-0.65 drawn straight
+      // (anything under 1.0 is clean) against 0.55-0.56 with a field discarded
+      // first, for identical retained detail (3.34 vs 3.17, 6.24 vs 6.08).
+      // Deinterlacing here was pure cost in the hot loop for no measurable
+      // gain. The full-size paths are different -- nothing downsizes them, so
+      // they get the real treatment; see grabCapture.
+      const capCtx = cap.getContext("2d")!;
+      capCtx.imageSmoothingEnabled = true;
+      capCtx.imageSmoothingQuality = "high";
+      capCtx.drawImage(video, srcX, srcY, srcW, srcH, 0, 0, capW, capH);
       // Grabbed now, from this same video frame, so a filed capture and the boxes
       // drawn on it describe the same instant. See grabCapture.
       const hi = grabCapture(video, srcX, srcY, srcW, srcH);
@@ -1278,8 +1635,9 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       const insideNow = inBody.shouldInfer(cap);
       applyAutoRecord(insideNow);
       if (!insideNow) {
+        await drainInFlight();
         updateBoxes([]);
-        drawAnalyzedFrame(cap, []);
+        drawAnalyzedFrame(cap, hi, []);
         // Let the appearance state machine see the quiet frame — see the else
         // branch below the inference call for why this matters.
         maybeAutoCapture([], null, null);
@@ -1293,8 +1651,9 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       // in lib/frameQuality also rejects ~3.5% of frames a doctor labelled as
       // containing a polyp. That is a real cost, paid before inference runs.
       if (!quality.shouldInfer(cap)) {
+        await drainInFlight();
         updateBoxes([]);
-        drawAnalyzedFrame(cap, []);
+        drawAnalyzedFrame(cap, hi, []);
         maybeAutoCapture([], null, null);
         await new Promise<void>((res) => setTimeout(res, 100));
         continue;
@@ -1303,34 +1662,22 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       const blob: Blob = await new Promise((res) => cap.toBlob((b) => res(b!), "image/jpeg", 0.85));
       const buf = await blob.arrayBuffer();
 
-      const result = await new Promise<{ boxes: Box[]; timing: Timing } | null>((resolve) => {
-        pendingRef.current = resolve;
-        sentAtRef.current = performance.now();
-        ws.send(buf);
-        sentCountRef.current += 1;
-        setStats((s) => ({ ...s, sent: s.sent + 1 }));
-        setTimeout(() => {
-          if (pendingRef.current === resolve) { pendingRef.current = null; resolve(null); }
-        }, INFER_TIMEOUT_MS);
-      });
+      // Sent, not awaited. This is the whole point of the pipeline: the wire
+      // time for THIS frame now overlaps the settle of the previous one and
+      // the preparation of the next, instead of being dead time in which
+      // nothing is inferred. See MAX_IN_FLIGHT.
+      const sent = sendForInference(ws, buf);
 
-      // Draw the frame + its boxes together, win or lose (a timeout leaves the last good frame up)
-      if (result) {
-        // One gate for both what is shown and what is kept.
-        const shown = temporal.filter(
-          result.boxes.filter((b) => b.conf >= confMinRef.current));
-        updateBoxes(shown);
-        drawAnalyzedFrame(cap, shown);
-        maybeAutoCapture(shown, cap, hi);
-      } else {
-        // A timed-out frame is not evidence the lesion left, but it is not
-        // evidence it is still there either. maybeAutoCapture is the only writer
-        // of the gap timer, so a stretch of skipped frames used to freeze the
-        // state machine mid-appearance and throttle the NEXT lesion against a
-        // stale timestamp. Feeding the quiet frame through lets it close.
-        maybeAutoCapture([], null, null);
-      }
+      // Now -- and only now -- wait for the PREVIOUS frame and draw it. One
+      // frame of extra latency between picture and boxes, in exchange for the
+      // round trip no longer being serialised against inference.
+      const prev = inFlight;
+      inFlight = { result: sent, cap, hi };
+      if (prev) await settle(prev);
     }
+
+    // The loop has stopped, but the last frame sent is still owed a draw.
+    await drainInFlight();
     } finally {
       if (liveInferenceReleaseRef.current) {
         liveInferenceReleaseRef.current();
@@ -1463,6 +1810,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       const prev = lastFrameSizeRef.current;
       if (!prev || prev.w !== (got?.width ?? 0) || prev.h !== (got?.height ?? 0)) {
         resetFovDetection();
+        // A different mode can also be a different scan type -- the card's PAL
+        // and NTSC modes are both interlaced, but 720p from another device is
+        // not. Re-measure rather than carry the old answer over.
+        resetInterlaceDetection();
         lastFrameSizeRef.current = { w: got?.width ?? 0, h: got?.height ?? 0 };
       }
       setSourceMode({ text: describeMode(got, negotiated.padFraction), padded: negotiated.padded });
@@ -1768,6 +2119,9 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     // The picture area belongs to the source. Whatever comes next gets measured
     // on its own frames rather than inheriting this one's border.
     resetFovDetection();
+    // So does the scan type: a progressive demo clip must not inherit
+    // "interlaced" from the capture card that was selected a moment ago.
+    resetInterlaceDetection();
   }
 
   const wsOk = wsStatus === "open";
@@ -1929,8 +2283,21 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
             onLoadedMetadata={handleLoadedMetadata}
             onDurationChange={handleLoadedMetadata}
             className={liveStyle ? "absolute object-contain" : "absolute inset-0 w-full h-full object-contain"}
-            style={liveStyle}
+            // Hidden, not removed: opacity only. display:none or visibility
+            // would stop the element producing frames, and the capture loop
+            // reads from it. Revealed again if the canvas path ever fails.
+            style={{ ...(liveStyle ?? {}), opacity: liveCanvasOk ? 0 : 1 }}
           />
+          {/* The Live picture the operator actually sees: the same frames,
+              deinterlaced. Same classes and same CSS crop as the <video> above,
+              so the panel composition is unchanged. */}
+          {liveCanvasOk && (
+            <canvas
+              ref={liveCanvasRef}
+              className={liveStyle ? "absolute object-contain" : "absolute inset-0 w-full h-full object-contain"}
+              style={liveStyle}
+            />
+          )}
           {/* What the crop discards. The panel is showing the whole
               frame right now (liveCrop is forced to null above), so the
               kept region is outlined and everything outside it is
@@ -2150,7 +2517,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         <span className="text-gray-500">{t("— of which network")}</span>
         <span className="text-white">{stats.rttMs > 0 ? t("{ms} ms", { ms: stats.netMs }) : "—"}</span>
         <span className="text-gray-500">{t("Analysed")}</span>
-        <span className="text-white">{stats.rttMs > 0 ? t("{fps} fps", { fps: (1000 / stats.rttMs).toFixed(1) }) : "—"}</span>
+        <span className="text-white">{stats.fps > 0 ? t("{fps} fps", { fps: stats.fps.toFixed(1) }) : "—"}</span>
         {lastError && <>
           <span className="text-gray-500">{t("Error")}</span>
           <span className="text-red-400 truncate">{lastError}</span>

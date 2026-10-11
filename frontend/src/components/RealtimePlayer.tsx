@@ -17,6 +17,7 @@ import TemporalGateNotice from "./TemporalGateNotice";
 import { useAlertSound } from "@/lib/useAlertSound";
 import { detectFovRect, unionRect, trimmedFraction, NEGLIGIBLE_TRIM, type Rect } from "@/lib/fov";
 import { useFullscreen, fsWrapClass, fsExitBtnClass, fsBoxStyle } from "@/lib/useFullscreen";
+import { combRatio, looksInterlaced, createDeinterlacer } from "@/lib/interlace";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "";
 // Resolve the socket origin explicitly rather than leaning on a relative
@@ -33,6 +34,10 @@ const INFER_WIDTH = 320;
 // Frames measured at the start of a clip to find its picture area. See
 // lib/fov.ts — the union of several beats one, and the border does not move.
 const FOV_SAMPLE_FRAMES = 8;
+// Comb only shows where something moved, so deciding the scan type needs a
+// far longer run of frames than finding a static border does. See
+// sampleInterlace, and lib/interlace.ts for the measure itself.
+const INTERLACE_SAMPLE_FRAMES = 60;
 const SPEEDS = [0.1, 0.25, 0.5, 0.7, 1, 1.5, 2];
 // A polyp that is STILL on screen is re-filed, but the wait between
 // refreshes doubles each time (8s, 16s, 32s, ...) up to this ceiling -- a
@@ -309,6 +314,12 @@ export default function RealtimePlayer({
   const [fovRect, setFovRectState] = useState<Rect | null>(null);
   const fovRectRef = useRef<Rect | null>(null);
   const fovSamplesRef = useRef(0);
+  // Null until decided; nothing is deinterlaced while it is null, because
+  // dropping a field from a progressive clip is pure loss. See lib/interlace.ts.
+  const interlacedRef = useRef<boolean | null>(null);
+  const deintRef = useRef(createDeinterlacer());
+  const interlaceSamplesRef = useRef(0);
+  const combPeakRef = useRef(0);
   const [fovFrame, setFovFrame] = useState<{ w: number; h: number } | null>(null);
   const [fovEnabled, setFovEnabledState] = useState(true);
   const fovEnabledRef = useRef(true);
@@ -335,14 +346,48 @@ export default function RealtimePlayer({
     setFovRectState(null);
     setFovFrame(null);
     setShowFovOverlay(false);
+    // And a new clip can be a different scan type: the bundled demos are
+    // progressive, an uploaded clinic recording is interlaced.
+    interlacedRef.current = null;
+    interlaceSamplesRef.current = 0;
+    combPeakRef.current = 0;
+    deintRef.current.reset();
   }, [videoUrl]);
 
-  function sourceRect(video: HTMLVideoElement) {
+  /** Snap to even scanlines so field parity cannot change. The FOV rect is
+   *  auto-detected and can land on an odd line, and a parity flip mid-clip is
+   *  a half-scanline jump -- or, if it keeps flipping, bob judder. Snapping
+   *  down only ever shrinks the rect. See LiveCameraPlayer for the long form. */
+  function evenScanlines(r: Rect): Rect {
+    return { ...r, y: r.y & ~1, h: r.h & ~1 };
+  }
+
+  function sourceRect(video: HTMLVideoElement): Rect {
     const vw = video.videoWidth, vh = video.videoHeight;
     const full = { x: 0, y: 0, w: vw, h: vh };
     const fov = fovEnabledRef.current ? fovRectRef.current : null;
-    if (!fov || trimmedFraction(fov, vw, vh) < NEGLIGIBLE_TRIM) return full;
-    return fov.w > 0 && fov.h > 0 ? fov : full;
+    if (!fov || trimmedFraction(fov, vw, vh) < NEGLIGIBLE_TRIM) return evenScanlines(full);
+    return evenScanlines(fov.w > 0 && fov.h > 0 ? fov : full);
+  }
+
+  /** Latches on the first frame showing comb and stops looking; only running
+   *  out of frames concludes "progressive". See LiveCameraPlayer.sampleInterlace. */
+  function sampleInterlace(video: HTMLVideoElement) {
+    if (interlacedRef.current !== null) return;
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw || !vh) return;
+    const ratio = combRatio(video, vw, vh);
+    if (ratio !== null && ratio > combPeakRef.current) combPeakRef.current = ratio;
+    if (looksInterlaced(ratio)) {
+      interlacedRef.current = true;
+      console.info(`[interlace] clip is interlaced (comb ratio ${ratio!.toFixed(2)}) — deinterlacing`);
+      return;
+    }
+    if (ratio === null) return;
+    if (++interlaceSamplesRef.current >= INTERLACE_SAMPLE_FRAMES) {
+      interlacedRef.current = false;
+      console.info(`[interlace] clip looks progressive (peak ${combPeakRef.current.toFixed(2)}) — drawing frames whole`);
+    }
   }
 
   function sampleFov(video: HTMLVideoElement) {
@@ -362,9 +407,16 @@ export default function RealtimePlayer({
   // Draws the exact frame that was sent to the model, with boxes at native (capture)
   // resolution — pixel-accurate for that frame, unlike overlaying on the live video
   // (which has moved on by the time the result comes back).
-  function drawAnalyzedFrame(source: HTMLCanvasElement, boxes: Box[]) {
+  // Draws `hi` when there is one. Both canvases are the same region of the same
+  // video frame, so the boxes describe either equally; `cap` is only 320px wide
+  // because that is all the model needs, and sizing this canvas from it made the
+  // panel a thumbnail that CSS then stretched to full width. Boxes arrive in cap
+  // space, so they are scaled by the ratio between the two.
+  function drawAnalyzedFrame(cap: HTMLCanvasElement, hi: HTMLCanvasElement | null, boxes: Box[]) {
     const canvas = analyzedRef.current;
     if (!canvas) return;
+    const source = hi ?? cap;
+    const k = cap.width > 0 ? source.width / cap.width : 1;
     if (canvas.width !== source.width)   canvas.width  = source.width;
     if (canvas.height !== source.height) canvas.height = source.height;
 
@@ -372,7 +424,7 @@ export default function RealtimePlayer({
     ctx.drawImage(source, 0, 0);
 
     for (const det of boxes) {
-      const [x1, y1, x2, y2] = det.bbox;
+      const [x1, y1, x2, y2] = det.bbox.map((v) => v * k) as [number, number, number, number];
       ctx.shadowColor = "#39ff14";
       ctx.shadowBlur  = 10;
       ctx.strokeStyle = "#39ff14";
@@ -413,7 +465,7 @@ export default function RealtimePlayer({
     const cap = document.createElement("canvas");
     cap.width = Math.round(video.videoWidth * scale);
     cap.height = Math.round(video.videoHeight * scale);
-    cap.getContext("2d")!.drawImage(video, 0, 0, cap.width, cap.height);
+    drawDeinterlaced(video, 0, 0, video.videoWidth & ~1, video.videoHeight & ~1, cap, cap.width, cap.height);
     cap.toBlob(async (blob) => {
       if (!blob) return;
       const fd = new FormData();
@@ -448,6 +500,24 @@ export default function RealtimePlayer({
     return BEST_W_SHARP * sharp + BEST_W_CONF * conf + BEST_W_SIZE * size;
   }
 
+  /** Draw a region of `video` into `dst`, progressive. Motion-adaptive, so
+   *  still areas keep every real scanline; no-ops into a plain draw when the
+   *  clip is progressive. See lib/interlace.ts for why the motion test is
+   *  temporal rather than spatial. */
+  function drawDeinterlaced(
+    video: HTMLVideoElement, sx: number, sy: number, sw: number, sh: number,
+    dst: HTMLCanvasElement, dw: number, dh: number,
+  ) {
+    if (interlacedRef.current !== true) {
+      const ctx = dst.getContext("2d")!;
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
+      ctx.drawImage(video, sx, sy, sw, sh, 0, 0, dw, dh);
+      return;
+    }
+    deintRef.current.draw(video, sx, sy, sw, sh, dst, dw, dh, video.currentTime);
+  }
+
   /** Grab the frame a reviewer will look at, from the SAME video frame the
    *  model was given. Re-grabbing after the inference round trip would file an
    *  image the boxes no longer describe -- on CPU that trip is a couple of
@@ -458,7 +528,7 @@ export default function RealtimePlayer({
     const c = hiScratchRef.current ?? (hiScratchRef.current = document.createElement("canvas"));
     if (c.width !== w) c.width = w;
     if (c.height !== h) c.height = h;
-    c.getContext("2d")!.drawImage(video, sx, sy, sw, sh, 0, 0, w, h);
+    drawDeinterlaced(video, sx, sy, sw, sh, c, w, h);
     return c;
   }
 
@@ -630,6 +700,8 @@ export default function RealtimePlayer({
       }
 
       sampleFov(video);
+      // Both draws below ask whether this clip is interlaced, so answer first.
+      sampleInterlace(video);
       const { x: srcX, y: srcY, w: srcW, h: srcH } = sourceRect(video);
       setAspect(`${srcW}/${srcH}`);
 
@@ -639,7 +711,13 @@ export default function RealtimePlayer({
       const cap   = document.createElement("canvas");
       cap.width   = capW;
       cap.height  = capH;
-      cap.getContext("2d")!.drawImage(video, srcX, srcY, srcW, srcH, 0, 0, capW, capH);
+      // Not deinterlaced: the shrink to ~213 lines averages neighbouring lines
+      // and cancels the comb on its own. Measured clean (0.60-0.65) drawn
+      // straight. Full-size paths are handled properly -- see grabCapture.
+      const capCtx = cap.getContext("2d")!;
+      capCtx.imageSmoothingEnabled = true;
+      capCtx.imageSmoothingQuality = "high";
+      capCtx.drawImage(video, srcX, srcY, srcW, srcH, 0, 0, capW, capH);
       // Grabbed now, from this same video frame, so a filed capture and the boxes
       // drawn on it describe the same instant. See grabCapture.
       const hi = grabCapture(video, srcX, srcY, srcW, srcH);
@@ -650,7 +728,7 @@ export default function RealtimePlayer({
       // inference cadence rather than spinning a tight while loop.
       if (!inBody.shouldInfer(cap)) {
         updateBoxes([]);
-        drawAnalyzedFrame(cap, []);
+        drawAnalyzedFrame(cap, hi, []);
         // Let the appearance state machine see the quiet frame — see the else
         // branch below the inference call for why this matters.
         maybeAutoCapture([], null, null);
@@ -665,7 +743,7 @@ export default function RealtimePlayer({
       // containing a polyp. That is a real cost, paid before inference runs.
       if (!quality.shouldInfer(cap)) {
         updateBoxes([]);
-        drawAnalyzedFrame(cap, []);
+        drawAnalyzedFrame(cap, hi, []);
         maybeAutoCapture([], null, null);
         await new Promise<void>((res) => setTimeout(res, 100));
         continue;
@@ -690,7 +768,7 @@ export default function RealtimePlayer({
         const shown = temporal.filter(
           result.boxes.filter((b) => b.conf >= confMinRef.current));
         updateBoxes(shown);
-        drawAnalyzedFrame(cap, shown);
+        drawAnalyzedFrame(cap, hi, shown);
         maybeAutoCapture(shown, cap, hi);
       } else {
         // A timed-out frame is not evidence the lesion left, but it is not
@@ -741,8 +819,11 @@ export default function RealtimePlayer({
       const boxes = data.frames[idx] ?? [];
       ctx.drawImage(video, 0, 0, cap.width, cap.height);
       updateBoxes(boxes);
-      drawAnalyzedFrame(cap, boxes);
-      maybeAutoCapture(boxes, cap, grabCapture(video, 0, 0, video.videoWidth, video.videoHeight));
+      // Hoisted out of the maybeAutoCapture call below so the panel and the
+      // filed frame are the same canvas, grabbed once from this video frame.
+      const hi = grabCapture(video, 0, 0, video.videoWidth & ~1, video.videoHeight & ~1);
+      drawAnalyzedFrame(cap, hi, boxes);
+      maybeAutoCapture(boxes, cap, hi);
       // Replay has no socket: nothing is sent, so there is no round trip to split.
       setStats((s) => ({ sent: s.sent + 1, received: s.received + 1, avgMs: 0, rttMs: 0, netMs: 0 }));
     }
