@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import logging
 import secrets
 from pathlib import Path
@@ -172,16 +171,29 @@ async def _stream_inference(websocket: WebSocket, label: str):
     if is_room:
         spectate_bus.mark_room_active(case_id, engine_name)
 
-    # Real ByteTrack, run unconditionally alongside the existing client-side
-    # heuristic in lib/temporal.ts (see backend/services/tracker.py for what's
-    # actually different between the two). Deliberately NOT gated by a query
-    # param: the frontend's Off/Heuristic/ByteTrack switch needs to flip
-    # instantly on the same live stream for a fair side-by-side, and a param
-    # baked into the socket URL would force a reconnect (and silently drop
-    # the capture loop) on every switch. Cost is negligible either way — a
-    # numpy/scipy pass over at most a couple of boxes next to a ~40ms detector
-    # call — so there's nothing to save by making this optional.
-    tracker = PersistenceTracker()
+    # ByteTrack is NOT run on the live stream as of 2026-10-11 -- see
+    # documents/adr/0005-detection-gates-off-by-default.md.
+    #
+    # It used to run unconditionally here, and the comment at the send site
+    # claimed it only tagged boxes and dropped nothing. That was wrong, in two
+    # ways that both cost exactly the detection this product exists to surface:
+    #
+    #   1. BYTETracker sets det_thresh = track_thresh + 0.1 = 0.40
+    #      (bytetrack/byte_tracker.py:143) and skips any unmatched detection
+    #      below it when initialising new tracks (step 4, ~line 258). So a
+    #      NEWLY appearing lesion needed conf >= 0.40 even though the model is
+    #      served at 0.30 -- a 0.1 confidence gate nobody chose.
+    #   2. STrack.activate() only sets is_activated when frame_id == 1 (~line
+    #      49), and update() returns only activated tracks (~line 277). So a
+    #      lesion first seen on any later frame was withheld until it was
+    #      matched a second time -- a hidden, always-on, non-switchable 2-frame
+    #      persistence rule, duplicating the client gate it was meant to be an
+    #      alternative to.
+    #
+    # Boxes were also taken from the Kalman state (t.tlbr), not the model's
+    # output. tracker.py and bytetrack/ stay in the tree for offline replay
+    # work; this is the only live call site.
+    tracker = None
 
     log.info("WS session opened (%s) | engine=%s", label, engine_name)
     try:
@@ -224,9 +236,11 @@ async def _stream_frames(websocket: WebSocket, label: str, engine_name: str, eng
         t_total = time.perf_counter()
         try:
             detections, timing = await eng.infer_frame(frame_bytes)
-            # Tags each box with track_id/persistent; does not drop or reorder
-            # anything, so a client that ignores these two keys sees no change.
-            detections = tracker.update(detections)
+            # Raw model output, straight to the browser. `tracker` is None on
+            # the live path (see above); the guard keeps the offline/experiment
+            # path working if one is wired back in.
+            if tracker is not None:
+                detections = tracker.update(detections)
             timing["recv_ms"] = recv_ms
             timing["total_ms"] = int((time.perf_counter() - t_total) * 1000)
             latencies.append(timing["modal_ms"])
@@ -242,10 +256,13 @@ async def _stream_frames(websocket: WebSocket, label: str, engine_name: str, eng
             # just got above. Cheapest possible no-op when nobody is
             # watching — has_subscribers is one dict lookup.
             if case_id and spectate_bus.has_subscribers(case_id):
+                # The JPEG travels as raw bytes framed alongside the JSON in one
+                # binary message (see spectate_bus.pack), not base64 inside it:
+                # encoding it cost a flat 33% on much the largest part of every
+                # message, for every spectator, every frame.
                 task = asyncio.create_task(spectate_bus.broadcast(case_id, {
                     "boxes": detections,
                     "timing": timing,
-                    "jpeg_b64": base64.b64encode(frame_bytes).decode("ascii"),
                     # Lets a spectator measure its own true delivery lag
                     # (Date.now() - sent_at_ms on arrival) instead of guessing
                     # — it never sends a frame of its own to time a round trip
@@ -256,7 +273,7 @@ async def _stream_frames(websocket: WebSocket, label: str, engine_name: str, eng
                     # None until its first report lands. Just a cached-value
                     # lookup, no extra cost when no report has arrived yet.
                     "room_stats": spectate_bus.get_room_stats(case_id),
-                }))
+                }, frame_bytes))
                 _spectate_tasks.add(task)
                 task.add_done_callback(_spectate_tasks.discard)
         except Exception as e:

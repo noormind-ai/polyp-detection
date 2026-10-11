@@ -87,9 +87,9 @@ def has_subscribers(case_id: str) -> bool:
     return bool(_subscribers.get(case_id))
 
 
-async def _safe_send(ws: WebSocket, case_id: str, text: str) -> None:
+async def _safe_send(ws: WebSocket, case_id: str, frame: bytes) -> None:
     try:
-        await asyncio.wait_for(ws.send_text(text), timeout=SEND_TIMEOUT_S)
+        await asyncio.wait_for(ws.send_bytes(frame), timeout=SEND_TIMEOUT_S)
     except Exception:
         # Dead or stalled — drop them. They'll notice on their own socket and
         # can reconnect; this function's only job is to never let that block
@@ -97,19 +97,36 @@ async def _safe_send(ws: WebSocket, case_id: str, text: str) -> None:
         unsubscribe(case_id, ws)
 
 
-async def broadcast(case_id: str, payload: dict) -> None:
+def pack(payload: dict, jpeg: bytes) -> bytes:
+    """One binary message: a 4-byte big-endian length, that many bytes of JSON,
+    then the JPEG verbatim.
+
+    The JPEG used to travel base64-encoded inside the JSON, which costs a flat
+    33% on much the largest part of every message -- about 11 KB of JPEG became
+    close to 15 KB on the wire, every frame, for every spectator.
+
+    Framed into ONE message rather than sending the JSON and the JPEG as two,
+    so there is no pairing to get wrong: a spectator cannot receive metadata
+    whose picture never arrives, and there is no state to keep between
+    messages. WebSocket would preserve the order of two messages, but it would
+    not make a half-delivered pair impossible the way a single message does."""
+    meta = json.dumps(payload).encode("utf-8")
+    return len(meta).to_bytes(4, "big") + meta + jpeg
+
+
+async def broadcast(case_id: str, payload: dict, jpeg: bytes) -> None:
     """Best-effort fan-out. Never raises — every failure mode ends up as a
     dropped subscriber, not an exception the caller has to handle."""
     subs = _subscribers.get(case_id)
     if not subs:
         return
     try:
-        text = json.dumps(payload)
+        frame = pack(payload, jpeg)
         # Snapshot before iterating: unsubscribe() can mutate the live set
         # concurrently (a spectator disconnecting mid-broadcast).
         targets = list(subs)
         await asyncio.gather(
-            *(_safe_send(ws, case_id, text) for ws in targets),
+            *(_safe_send(ws, case_id, frame) for ws in targets),
             return_exceptions=True,
         )
     except Exception:

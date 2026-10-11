@@ -67,8 +67,10 @@ interface Timing { recv_ms: number; modal_ms: number; total_ms: number; }
 // and spectate_bus.py's _room_stats. null until the room's first report
 // arrives after this page connects.
 interface RoomStats { sent: number; received: number; avg_ms: number; rtt_ms: number; net_ms: number; fps: number; }
+// The JPEG is no longer part of this: it arrives as raw bytes in the same
+// binary message, after the JSON. See unpackFrame and spectate_bus.pack.
 interface SpectateMsg {
-  boxes: Box[]; timing: Timing; jpeg_b64: string; sent_at_ms?: number; room_stats?: RoomStats | null;
+  boxes: Box[]; timing: Timing; sent_at_ms?: number; room_stats?: RoomStats | null;
 }
 interface Recording {
   id: string;
@@ -82,13 +84,31 @@ interface Recording {
 
 type ConnState = "connecting" | "open" | "closed" | "rejected";
 
-function decodeJpegB64(b64: string): Blob {
-  // Direct decode instead of fetch(`data:...`) -> .blob(): the fetch path
-  // goes through the whole Response/Blob machinery for what is, in this
-  // process, just a base64 string -- measurably slower per frame for no
-  // benefit, and per-frame cost is exactly what compounds into visible lag.
-  const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-  return new Blob([bytes], { type: "image/jpeg" });
+/** Split one broadcast message into its JSON half and its JPEG half.
+ *
+ *  Wire format, written by spectate_bus.pack: a 4-byte big-endian length, that
+ *  many bytes of UTF-8 JSON, then the JPEG verbatim to the end of the message.
+ *
+ *  The JPEG used to come base64-encoded inside the JSON, which cost a flat 33%
+ *  on much the largest part of every frame -- ~11 KB of picture arriving as
+ *  ~15 KB -- plus an atob() and a byte-by-byte copy per frame on this side.
+ *  Raw bytes need neither.
+ *
+ *  Returns null on anything malformed rather than throwing: a corrupt frame
+ *  should cost one dropped picture, not the whole socket. */
+function unpackFrame(buf: ArrayBuffer): { meta: SpectateMsg; jpeg: Blob } | null {
+  if (buf.byteLength < 4) return null;
+  const metaLen = new DataView(buf).getUint32(0, false);
+  if (metaLen <= 0 || 4 + metaLen > buf.byteLength) return null;
+  try {
+    const meta = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 4, metaLen)));
+    if (!meta || typeof meta !== "object" || "error" in meta) return null;
+    // Subarray, not slice: a view over the same buffer, no copy. Blob then
+    // takes its own reference to those bytes.
+    return { meta: meta as SpectateMsg, jpeg: new Blob([new Uint8Array(buf, 4 + metaLen)], { type: "image/jpeg" }) };
+  } catch {
+    return null;
+  }
 }
 
 export default function SpectatorPage({ params }: { params: { caseId: string } }) {
@@ -105,12 +125,14 @@ export default function SpectatorPage({ params }: { params: { caseId: string } }
   // viewer's call, not the room's. The timing is the room's, though -- same hook,
   // same rule, same shared duration setting.
   const alert = useAlertSound(SPECTATOR_ALERT_KEY);
-  const lastFrameB64Ref = useRef<string | null>(null);
+  // The most recent picture, kept as a ready-to-use Blob so "flag this
+  // moment" can upload it without re-decoding anything.
+  const lastFrameRef = useRef<Blob | null>(null);
   const lastBoxesRef = useRef<Box[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
 
   // Coalescing state for the image decode -- see file header.
-  const pendingFrameRef = useRef<{ jpeg_b64: string; boxes: Box[] } | null>(null);
+  const pendingFrameRef = useRef<{ jpeg: Blob; boxes: Box[] } | null>(null);
   const decodingRef = useRef(false);
 
   // Rolling windows for the stats panel.
@@ -158,6 +180,10 @@ export default function SpectatorPage({ params }: { params: { caseId: string } }
     if (!user || !caseId) return;
     let cancelled = false;
     const ws = new WebSocket(`${API_WS}/api/ws/spectate/${encodeURIComponent(caseId)}`);
+    // Default is "blob", which would leave every message an async
+    // .arrayBuffer() away from being readable -- and the ArrayBuffer check in
+    // onmessage would simply never pass. Set before the socket can deliver.
+    ws.binaryType = "arraybuffer";
     wsRef.current = ws;
     setConnState("connecting");
 
@@ -173,7 +199,7 @@ export default function SpectatorPage({ params }: { params: { caseId: string } }
           const canvas = canvasRef.current;
           if (!canvas) break;
           try {
-            const bitmap = await createImageBitmap(decodeJpegB64(frame.jpeg_b64));
+            const bitmap = await createImageBitmap(frame.jpeg);
             drawBoxes(canvas, bitmap, frame.boxes, (det) => t("polyp  {conf}%", { conf: Math.round(det.conf * 100) }));
             bitmap.close();
           } catch { /* a dropped frame is not worth surfacing as an error */ }
@@ -194,17 +220,21 @@ export default function SpectatorPage({ params }: { params: { caseId: string } }
     ws.onerror = () => { if (!cancelled) setConnState("closed"); };
 
     ws.onmessage = (ev) => {
-      let data: unknown;
-      try { data = JSON.parse(ev.data); } catch { return; }
-      if (!data || typeof data !== "object" || "error" in data) return;
-      const { boxes, timing: tm, jpeg_b64, sent_at_ms, room_stats } = data as SpectateMsg;
+      // Binary now, not text -- see unpackFrame. Anything else (a stray text
+      // frame from an older server, a malformed message) is dropped rather
+      // than half-handled.
+      if (!(ev.data instanceof ArrayBuffer)) return;
+      const unpacked = unpackFrame(ev.data);
+      if (!unpacked) return;
+      const { meta, jpeg } = unpacked;
+      const { boxes, timing: tm, sent_at_ms, room_stats } = meta;
       const now = Date.now();
 
       if (room_stats) setRoomStats(room_stats);
 
       // Cheap, synchronous bookkeeping — happens for every message, whether
       // or not this particular frame ends up drawn.
-      lastFrameB64Ref.current = jpeg_b64;
+      lastFrameRef.current = jpeg;
       lastBoxesRef.current = boxes;
       setBoxCount(boxes.length);
       setLastUpdate(now);
@@ -243,7 +273,7 @@ export default function SpectatorPage({ params }: { params: { caseId: string } }
       alert.onBoxState(boxes.length > 0);
 
       // The potentially-slow part: deferred and coalesced, see drawLoop.
-      pendingFrameRef.current = { jpeg_b64, boxes };
+      pendingFrameRef.current = { jpeg, boxes };
       void drawLoop();
     };
 
@@ -251,10 +281,10 @@ export default function SpectatorPage({ params }: { params: { caseId: string } }
   }, [user, caseId, t]);
 
   async function flagThisMoment() {
-    if (!lastFrameB64Ref.current || flagState === "sending") return;
+    if (!lastFrameRef.current || flagState === "sending") return;
     setFlagState("sending");
     try {
-      const blob = decodeJpegB64(lastFrameB64Ref.current);
+      const blob = lastFrameRef.current;
       const fd = new FormData();
       fd.append("file", blob, "frame.jpg");
       fd.append("ai_detections", JSON.stringify(lastBoxesRef.current));
@@ -427,7 +457,7 @@ export default function SpectatorPage({ params }: { params: { caseId: string } }
             <div className="flex items-center justify-end gap-3">
               <button
                 onClick={flagThisMoment}
-                disabled={!lastFrameB64Ref.current || flagState === "sending"}
+                disabled={!lastFrameRef.current || flagState === "sending"}
                 className="text-sm px-4 py-2 rounded-lg border border-amber-700 bg-amber-950/40 text-amber-300 hover:border-amber-500 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
               >
                 {flagState === "sent" ? t("Flagged for review") :
