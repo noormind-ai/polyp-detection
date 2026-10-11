@@ -79,6 +79,14 @@ MODELS = {
 }
 DEFAULT_MODEL = os.getenv("POLYP_CPU_DEFAULT", "rtdetr")
 
+# Models that try CUDAExecutionProvider before falling back to CPU. GPU joined
+# this box 2026-09-27 (NVIDIA RTX A2000 12GB) -- no system CUDA toolkit, just
+# onnxruntime-gpu's own CUDA 13 / cuDNN 9 pip wheels (see systemd unit's
+# LD_LIBRARY_PATH). Defaults to every model MODELS knows about, not just
+# RT-DETR: onnxruntime falls back to CPU per-model if the GPU session fails
+# to build, so listing a model here that's missing or CPU-fine is harmless.
+GPU_MODELS = {m.strip() for m in os.getenv("POLYP_GPU_MODELS", ",".join(MODELS)).split(",") if m.strip()}
+
 # Exported at 320, matching the resolution the frontend already sends. The
 # 640 export is 2.2x slower (251 ms vs 116 ms at 14 threads) for no gain:
 # measured on 400 in-house frames it found 45 polyp frames against 44, and
@@ -119,9 +127,14 @@ def _session(name: str):
         opts.inter_op_num_threads = 1
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
-        sess = ort.InferenceSession(str(path), opts, providers=["CPUExecutionProvider"])
+        providers = ["CPUExecutionProvider"]
+        if name in GPU_MODELS and "CUDAExecutionProvider" in ort.get_available_providers():
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+        sess = ort.InferenceSession(str(path), opts, providers=providers)
         _sessions[name] = sess
-        log.info("CPU model ready | %s | %s | threads=%d", name, path.name, THREADS)
+        log.info("model ready | %s | %s | providers=%s | threads=%d",
+                  name, path.name, sess.get_providers(), THREADS)
         return sess
 
 
@@ -135,24 +148,59 @@ def available() -> bool:
 
 def available_models() -> list[dict]:
     """What the UI can actually offer, with labels that say which are real."""
+    try:
+        import onnxruntime as ort
+        cuda_ok = "CUDAExecutionProvider" in ort.get_available_providers()
+    except ImportError:
+        cuda_ok = False
+
     return [
         {"name": n, "label": label, "polyp_trained": trained,
-         "conf": conf, "backend": f"cpu:{n}"}
+         "conf": conf, "backend": f"cpu:{n}", "gpu": cuda_ok and n in GPU_MODELS}
         for n, (_, label, trained, conf) in MODELS.items()
         if model_path(n).exists()
     ]
 
 
+def _gpu_name() -> str | None:
+    """Best-effort GPU label for the UI. Never raises -- a box with no GPU, no
+    driver, or no CUDA EP just gets None and device_name() falls back to CPU-only."""
+    try:
+        import onnxruntime as ort
+        if "CUDAExecutionProvider" not in ort.get_available_providers():
+            return None
+    except ImportError:
+        return None
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=2,
+        )
+        return out.stdout.strip().splitlines()[0] if out.returncode == 0 and out.stdout.strip() else None
+    except Exception:
+        return None
+
+
 def device_name() -> str | None:
+    cpu = None
     try:
         with open("/proc/cpuinfo") as fh:
             for line in fh:
                 if line.startswith("model name"):
-                    return f"{line.split(':', 1)[1].strip()} ({THREADS} threads)"
+                    cpu = line.split(':', 1)[1].strip()
+                    break
     except OSError:
         pass
-    import platform
-    return f"{platform.processor() or 'CPU'} ({THREADS} threads)"
+    if cpu is None:
+        import platform
+        cpu = platform.processor() or "CPU"
+    label = f"{cpu} ({THREADS} threads)"
+
+    gpu = _gpu_name()
+    if gpu and GPU_MODELS:
+        label += f" + {gpu} (CUDA: {', '.join(sorted(GPU_MODELS))})"
+    return label
 
 
 # ---------------------------------------------------------------------------

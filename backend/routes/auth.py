@@ -157,4 +157,8 @@ def whoami(user: str | None = Depends(current_user)):
         # gains nothing by lying about this.
         "reviewer": auth.is_panel_user(user) if user else False,
         "review_role": auth.panel_role(user) if user else None,
+        # Whether to offer the spectator lobby link. Display only, same as
+        # reviewer/review_role above -- the websocket and /api/spectate/rooms
+        # both re-check the allowlist themselves on every request.
+        "spectator": auth.is_spectator_user(user) if user else False,
     }

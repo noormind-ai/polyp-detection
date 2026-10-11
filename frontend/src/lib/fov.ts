@@ -70,6 +70,11 @@ const LUMA_THRESHOLD = 18;
  * with a real circular FOV would want this lower, and the overlay is how you
  * would notice.
  */
+// Since the pad colour is now excluded outright in the loop below, the band
+// no longer contributes to any column and this threshold is not what defends
+// against it. It stays at 0.30 because the reasoning above still holds for
+// genuinely partly-lit columns, and because the measurements quoted here were
+// taken at this value.
 const LINE_COVERAGE = 0.30;
 /** Refuse to believe a detection that would throw away most of the frame. If we
  *  land here the frame was probably just dark, and cropping to it would be
@@ -128,8 +133,18 @@ export function detectFovRect(source: CanvasImageSource, vw: number, vh: number)
     for (let x = 0; x < sw; x++) {
       const i = (y * sw + x) * 4;
       // Rec.601 luma, in integers — this runs over every pixel of the probe.
-      const lum = (data[i] * 299 + data[i + 1] * 587 + data[i + 2] * 114) / 1000;
-      if (lum > LUMA_THRESHOLD) { colLit[x]++; rowLit[y]++; }
+      const r = data[i], g = data[i + 1], b = data[i + 2];
+      const lum = (r * 299 + g * 587 + b * 114) / 1000;
+      // Padding is not picture, however bright it is. An unwritten video
+      // buffer renders pure green rather than black, so a padded band clears
+      // any luma threshold and spans every row it occupies -- which is
+      // precisely why the span used to run straight through it and the band
+      // was never cropped. Excluding that one colour costs nothing anywhere
+      // else: mucosa is red, orange or pink and is never green with no red
+      // in it at all. lib/cameraMode.ts removes the padding at source; this
+      // is the backstop for a device that offers no unpadded mode.
+      const isPad = r < 40 && b < 40 && g >= 50 && g <= 160;
+      if (lum > LUMA_THRESHOLD && !isPad) { colLit[x]++; rowLit[y]++; }
     }
   }
 

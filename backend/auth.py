@@ -344,6 +344,23 @@ def check_panel_login(username: str, password: str) -> bool:
     return panel_login_status(username, password) == OK
 
 
+# ---------------------------------------------------------------------------
+# Spectator mode
+# ---------------------------------------------------------------------------
+# Watching a live session remotely is a step up from "signed in" — it's
+# someone outside the procedure room seeing the feed and boxes in real time —
+# so it gets its own explicit allowlist rather than opening to every account
+# this app or the review panel happens to recognise. Empty by default: no one
+# may spectate until this is set.
+_SPECTATOR_USERS = {
+    u.strip() for u in os.environ.get("POLYP_SPECTATOR_USERS", "").split(",") if u.strip()
+}
+
+
+def is_spectator_user(username: str) -> bool:
+    return bool(username) and username in _SPECTATOR_USERS
+
+
 def panel_role(username: str) -> str | None:
     """'admin' / 'reader' for a live panel account, else None.
 

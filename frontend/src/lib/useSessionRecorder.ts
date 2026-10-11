@@ -39,6 +39,11 @@ const API = process.env.NEXT_PUBLIC_API_URL || "";
 /** How much video each upload carries. Short enough that a crash loses little,
  *  long enough that a 40-minute procedure is ~800 requests, not ~24,000. */
 const CHUNK_MS = 3000;
+/** After a failed start() (auth gone stale, network blip, whatever), wait
+ *  this long before trying again -- a caller that calls start() every frame
+ *  regardless of outcome must not turn one failure into a request fired many
+ *  times per second forever. See startCooldownUntilRef. */
+const START_RETRY_COOLDOWN_MS = 30_000;
 /** ~9 MB/minute. Chunks are now held until the session ends, so this is what
  *  the browser buffers in memory as well as what lands on disk. 720p endoscopy
  *  still reads clearly at this rate. */
@@ -104,6 +109,41 @@ export interface SessionRecorder {
   localBytes: number;
 }
 
+/** All the state that belongs to ONE recording.
+ *
+ * This used to be one ref per field, shared by every recording the hook ever
+ * made -- which is only safe while recordings never overlap. They do: auto
+ * record finalizes a recording once out-of-body persists past its threshold
+ * and opens a fresh one the moment the scope is back inside, often seconds
+ * later and always while the outgoing recording's finalize() is still
+ * awaiting its uploads. start() would then reset the store, the sequence
+ * counters and the aborted flag that outgoing finalize() was still using, so
+ * its buffered chunks were never sent -- and its store.clear() could delete
+ * the NEXT recording's chunks instead of its own. Four of the 2026-09-30
+ * clinic recordings are marked complete with a real duration and zero bytes
+ * on disk, 200s of one procedure among them. Per-recording state means a
+ * finalize can only ever touch its own chunks.
+ */
+interface RecSession {
+  id: string;
+  caseId: string;
+  mime: string;
+  store: ChunkStore | null;
+  /** Index of the next chunk MediaRecorder will hand over. */
+  seq: number;
+  /** How many chunks the server has acknowledged, in order. */
+  nextUploadSeq: number;
+  /** Serializes this recording's own uploadPending() calls. */
+  uploadChain: Promise<void>;
+  /** Local-store writes in flight; awaited before the store is read back. */
+  pendingWrites: Promise<void>[];
+  /** Chunks kept in RAM so downloadLocal() still works after finalize. */
+  saved: Blob[];
+  aborted: boolean;
+  finalized: boolean;
+  startedAt: number;
+}
+
 function pickMimeType(): string | null {
   if (typeof MediaRecorder === "undefined") return null;
   return MIME_CANDIDATES.find((m) => MediaRecorder.isTypeSupported(m)) ?? null;
@@ -146,62 +186,52 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen",
   useEffect(() => { streamRef.current = stream; }, [stream]);
 
   const recorderRef  = useRef<MediaRecorder | null>(null);
-  const idRef        = useRef<string | null>(null);
-  const seqRef       = useRef(0);
+  // The recording being written to right now, and the most recent one whether
+  // or not it has finished -- downloadLocal() has to keep working after a
+  // recording ends, and after a failed upload especially. Per-recording state
+  // lives on these objects rather than in a ref each; see RecSession.
+  const activeRef    = useRef<RecSession | null>(null);
+  const lastRef      = useRef<RecSession | null>(null);
   const startedAtRef = useRef(0);
   // Sum of every "capturing" segment closed so far by a pause(); the current
   // open segment (if any) is added on top of this when read. Lets mark() and
   // the recordedMs readout reflect actually-captured time, excluding any
-  // out-of-body stretches, without recomputing history on every read.
+  // out-of-body stretches, without recomputing history on every read. Only
+  // ever describes the active recording -- the only one still capturing.
   const recordedMsRef   = useRef(0);
   const segmentStartRef = useRef(0);
   const capturingRef    = useRef(false);
   // Synchronous re-entrancy guard for start(), set at the very top before any
-  // await. recorderRef.current alone isn't enough: it's only assigned near
-  // the END of start(), after the /start POST round-trips, so two calls fired
+  // await. activeRef.current alone isn't enough: it's only assigned near the
+  // END of start(), after the /start POST round-trips, so two calls fired
   // close together (e.g. the auto-record loop calling start() every frame
   // while it's still inside the body and nothing has been created yet) would
-  // both pass the recorderRef check and race two separate recordings into
-  // existence server-side. This closes that window; recorderRef.current
-  // takes back over as the guard once a recording actually exists.
+  // both pass that check and race two separate recordings into existence
+  // server-side. This closes that window.
   const startingRef  = useRef(false);
-  // Durable local store for this recording's chunks — see chunkStore.ts.
-  // Replaces a plain in-memory array so a crash loses at most the last
-  // unflushed chunk instead of the whole procedure.
-  const storeRef     = useRef<ChunkStore | null>(null);
-  // Every append() promise, so finalize() can wait for all of them before
-  // reading the store back. ondataavailable fires-and-forgets its write (it
-  // must not block MediaRecorder's own callback), but `stop()`'s onstop fires
-  // right after the LAST ondataavailable -- without this, finalize() could
-  // call store.readAll() before that last write (or even an earlier one) has
-  // actually landed, silently uploading a truncated or empty recording.
-  const pendingWritesRef = useRef<Promise<void>[]>([]);
-  // Survives finalize() so the operator can still save a local copy after the
-  // upload has run — or after it has failed. Kept in RAM deliberately: by the
-  // time finalize() reads these out of the durable store, holding them in
-  // memory too costs nothing extra and keeps downloadLocal() synchronous.
-  const savedRef     = useRef<Blob[]>([]);
-  // How many chunks (by count, since uploadPending always sends them in
-  // order) the server has already acknowledged -- shared between the
-  // trickle-upload triggered by pause() and the final drain in finalize(), so
-  // neither re-sends what the other already delivered.
-  const nextUploadSeqRef = useRef(0);
-  // Every uploadPending() call is chained onto this so overlapping calls
-  // (a trickle still running when Stop is pressed, or two pauses close
-  // together) queue instead of racing the same store/sequence counter.
-  const uploadChainRef = useRef<Promise<void>>(Promise.resolve());
-  const mimeRef      = useRef<string>("video/webm");
+  // Backoff after a failed start() -- without this, a caller that retries
+  // start() every frame regardless of outcome (LiveCameraPlayer.tsx's
+  // auto-record loop does exactly this whenever the scope is inside the
+  // body) turns a single persistent failure -- most concretely, a session
+  // that's gone stale so every /start POST 401s -- into a request fired many
+  // times per second, forever, with a re-render on every single one. That is
+  // a real incident, not a hypothetical: it manifested as constant visible
+  // "shaking" in a tab whose sign-in had expired while still open.
+  const startCooldownUntilRef = useRef(0);
   const [localBytes, setLocalBytes] = useState(0);
-  const abortedRef   = useRef(false);
-  const finalizedRef = useRef(false);
-  // The stop POST needs the case the recording was OPENED under. Reading state
-  // at stop time would use whatever case the page has moved on to.
-  const caseRef      = useRef(caseId);
 
   const supported = typeof window !== "undefined" && "MediaRecorder" in window;
 
-  const putChunk = useCallback(async (blob: Blob, seq: number, recId: string) => {
-    if (abortedRef.current || !recId) return;
+  /** Whether the readouts (status, progress, error) should follow this
+   *  recording. They describe the recording in progress, so a previous one
+   *  still draining its uploads must not write to them -- it would report
+   *  "idle" while the next procedure is already recording. Its own progress
+   *  stays visible through waitingForLink. */
+  const owns = useCallback((sess: RecSession) =>
+    activeRef.current === null || activeRef.current === sess, []);
+
+  const putChunk = useCallback(async (sess: RecSession, blob: Blob, seq: number) => {
+    if (sess.aborted) return;
     // Yield the link to any live-inference loop running in this tab (e.g. the
     // next procedure already started while this recording was still
     // uploading) before sending. Resolves immediately if nothing is live.
@@ -210,108 +240,120 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen",
     if (isLiveInferenceActive()) setWaitingForLink(true);
     await waitUntilInferenceIdle();
     setWaitingForLink(false);
-    if (abortedRef.current) return;
-    const url = `${API}/api/recordings/${caseRef.current}/${recId}/chunk?seq=${seq}`;
+    if (sess.aborted) return;
+    const url = `${API}/api/recordings/${sess.caseId}/${sess.id}/chunk?seq=${seq}`;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const res = await fetch(url, { method: "PUT", body: blob, credentials: "include" });
         if (res.ok) {
           const data = await res.json();
-          setUploaded(data.bytes ?? 0);
-          setUploadedChunks(seq + 1);
+          if (owns(sess)) {
+            setUploaded(data.bytes ?? 0);
+            setUploadedChunks(seq + 1);
+          }
           // The server closes a recording that hits its size cap; keep
           // uploading into it and every later chunk 409s.
           if (data.status && data.status !== "recording") {
-            abortedRef.current = true;
-            setError("recording reached the server's size limit and was closed");
+            sess.aborted = true;
+            if (owns(sess)) setError("recording reached the server's size limit and was closed");
+            // Only the recording still being captured has a MediaRecorder to
+            // stop -- stopping it on behalf of an older session would cut the
+            // procedure that is actually running.
+            if (activeRef.current === sess) {
+              try { recorderRef.current?.stop(); } catch { /* already stopped */ }
+            }
+          }
+          return;
+        }
+        // A 4xx is a decision, not a hiccup -- retrying it just loses time.
+        if (res.status < 500) throw new Error(await detail(res, `upload failed (${res.status})`));
+      } catch (err) {
+        if (attempt === 1) {
+          sess.aborted = true;
+          if (owns(sess)) {
+            setError(err instanceof Error ? err.message : String(err));
+            setStatus("error");
+          }
+          if (activeRef.current === sess) {
             try { recorderRef.current?.stop(); } catch { /* already stopped */ }
           }
           return;
         }
-        // A 4xx is a decision, not a hiccup — retrying it just loses time.
-        if (res.status < 500) throw new Error(await detail(res, `upload failed (${res.status})`));
-      } catch (err) {
-        if (attempt === 1) {
-          abortedRef.current = true;
-          setError(err instanceof Error ? err.message : String(err));
-          setStatus("error");
-          try { recorderRef.current?.stop(); } catch { /* already stopped */ }
-          return;
-        }
       }
     }
-  }, []);
+  }, [owns]);
 
-  /** Uploads whatever's currently in durable storage that hasn't been sent
-   *  yet, advancing nextUploadSeqRef as it goes. Called both by pause() (an
-   *  opportunistic trickle -- the out-of-body stretch that just started is
-   *  probably a genuinely free link, see LiveCameraPlayer.tsx) and by
-   *  finalize() (drain whatever's left at Stop). Safe to call either way,
+  /** Uploads whatever of THIS recording is in durable storage and hasn't been
+   *  sent yet, advancing sess.nextUploadSeq as it goes. Called both by
+   *  pause() (an opportunistic trickle -- the out-of-body stretch that just
+   *  started is probably a genuinely free link, see LiveCameraPlayer.tsx) and
+   *  by finalize() (drain whatever's left at Stop). Safe to call either way,
    *  any number of times, since it always resumes from where the last call
    *  actually got to -- putChunk's own waitUntilInferenceIdle gate is what
    *  decides whether a given chunk can send right now, not this function. */
-  const uploadPending = useCallback((id: string): Promise<void> => {
+  const uploadPending = useCallback((sess: RecSession): Promise<void> => {
     const run = async () => {
-      if (abortedRef.current) return;
-      const store = storeRef.current;
-      if (!store) return;
-      // Same ordering requirement as finalize() used to enforce alone: the
-      // last chunk's local write may still be settling when a pause fires
-      // right after it.
-      await Promise.all(pendingWritesRef.current);
-      const buffered = await store.readAll();
-      setTotalChunks(buffered.length);
-      for (let i = nextUploadSeqRef.current; i < buffered.length && !abortedRef.current; i++) {
-        await putChunk(buffered[i], i, id);
-        nextUploadSeqRef.current = i + 1;
+      if (sess.aborted || !sess.store) return;
+      // Ordering requirement: the last chunk's local write may still be
+      // settling when a pause fires right after it.
+      await Promise.all(sess.pendingWrites);
+      const buffered = await sess.store.readAll();
+      if (owns(sess)) setTotalChunks(buffered.length);
+      for (let i = sess.nextUploadSeq; i < buffered.length && !sess.aborted; i++) {
+        await putChunk(sess, buffered[i], i);
+        sess.nextUploadSeq = i + 1;
       }
     };
     // .then(run, run): keep the chain alive even if a previous link somehow
     // rejected, rather than every later call silently never running.
-    uploadChainRef.current = uploadChainRef.current.then(run, run);
-    return uploadChainRef.current;
-  }, [putChunk]);
+    sess.uploadChain = sess.uploadChain.then(run, run);
+    return sess.uploadChain;
+  }, [putChunk, owns]);
 
-  /** Runs on MediaRecorder's onstop — however that came about. The tracks
+  /** Runs on MediaRecorder's onstop -- however that came about. The tracks
    *  ending (camera unplugged, screen share revoked) stops the recorder
    *  without anyone calling stop(), and that recording still has to be closed
    *  on the server or it sits in the list marked "recording" forever. */
-  const finalize = useCallback(async (durationMs: number) => {
-    if (finalizedRef.current) return;
-    finalizedRef.current = true;
-    const id = idRef.current;
-    idRef.current = null;
-    recorderRef.current = null;
-    if (!id) { setStatus("idle"); return; }
+  const finalize = useCallback(async (sess: RecSession, durationMs: number) => {
+    if (sess.finalized) return;
+    sess.finalized = true;
+    // Released before the awaits below: this recording is no longer the one
+    // being captured, so a start() firing while it drains is legitimate and
+    // must not be blocked -- it just gets its own RecSession.
+    if (activeRef.current === sess) {
+      activeRef.current = null;
+      recorderRef.current = null;
+    }
 
-    setStatus("stopping");
+    if (owns(sess)) setStatus("stopping");
     // Most of this recording may already be on the server -- pause() fires an
     // opportunistic trickle upload during every out-of-body stretch (see
     // LiveCameraPlayer.tsx), so this just drains whatever's left, resuming
-    // from nextUploadSeqRef rather than re-sending from the start. Each chunk
-    // itself still waits its own turn behind any live inference the NEXT
-    // procedure has already started -- see putChunk.
-    const store = storeRef.current;
-    await uploadPending(id);
-    // savedRef needs the full list (for downloadLocal), not just whatever
+    // from sess.nextUploadSeq rather than re-sending from the start. Each
+    // chunk itself still waits its own turn behind any live inference the
+    // NEXT procedure has already started -- see putChunk.
+    await uploadPending(sess);
+    // saved needs the full list (for downloadLocal), not just whatever
     // uploadPending's own internal read happened to see -- read it again
     // here; cheap, and guarantees completeness regardless of trickle timing.
-    savedRef.current = store ? await store.readAll() : [];
+    sess.saved = sess.store ? await sess.store.readAll() : [];
     try {
       const body = new FormData();
       body.append("duration_ms", String(Math.round(durationMs)));
-      await fetch(`${API}/api/recordings/${caseRef.current}/${id}/stop`,
+      await fetch(`${API}/api/recordings/${sess.caseId}/${sess.id}/stop`,
                   { method: "POST", body, credentials: "include" });
     } catch { /* the recording is on disk either way; it just shows as interrupted */ }
     // Once every chunk has reached the server, the local durable copy has
-    // done its job — clear it so a normal, successful session doesn't show up
+    // done its job -- clear it so a normal, successful session doesn't show up
     // in the next page load's orphan-recovery scan. A failed/aborted session
     // deliberately keeps its local copy so that scan can offer to recover it.
-    if (!abortedRef.current) { await store?.clear().catch(() => {}); }
-    setStatus(abortedRef.current ? "error" : "idle");
-    setElapsed(0);
+    if (!sess.aborted) { await sess.store?.clear().catch(() => {}); }
+    if (owns(sess)) {
+      setStatus(sess.aborted ? "error" : "idle");
+      setElapsed(0);
+    }
     setFinished((n) => n + 1);
-  }, [uploadPending]);
+  }, [uploadPending, owns]);
 
   const start = useCallback(async () => {
     // Shadows the outer `stream` param on purpose: reading through the ref
@@ -321,13 +363,15 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen",
     // render this particular closure was created from. See streamRef's
     // comment above.
     const stream = streamRef.current;
-    if (!stream || recorderRef.current || startingRef.current) return;
+    if (!stream || activeRef.current || startingRef.current) return;
+    if (Date.now() < startCooldownUntilRef.current) return;
     startingRef.current = true;
     try {
     const mimeType = pickMimeType();
     if (!mimeType) {
       setError("This browser cannot record video (MediaRecorder is unavailable).");
       setStatus("error");
+      startCooldownUntilRef.current = Date.now() + START_RETRY_COOLDOWN_MS;
       return;
     }
 
@@ -337,17 +381,8 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen",
     setUploadedChunks(0);
     setTotalChunks(0);
     setWaitingForLink(false);
-    abortedRef.current = false;
-    finalizedRef.current = false;
-    pendingWritesRef.current = [];
-    seqRef.current = 0;
-    nextUploadSeqRef.current = 0;
-    uploadChainRef.current = Promise.resolve();
-    savedRef.current = [];
-    storeRef.current = null;
     setStorageKind(null);
     setLocalBytes(0);
-    caseRef.current = caseId;
 
     const track = stream.getVideoTracks()[0];
     const settings = track?.getSettings?.() ?? {};
@@ -363,38 +398,61 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen",
                               { method: "POST", body, credentials: "include" });
       if (!res.ok) throw new Error(await detail(res, `could not start recording (${res.status})`));
       recordingId = (await res.json()).recording_id;
-      idRef.current = recordingId;
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setStatus("error");
+      // This is the path a stale/expired sign-in takes (the server 401s the
+      // POST) -- without a cooldown, a caller that retries every frame (the
+      // auto-record loop does) turns that into a request fired many times a
+      // second, forever, with a re-render on every one. Real incident, not
+      // hypothetical: this is what caused the "constant shaking" report.
+      startCooldownUntilRef.current = Date.now() + START_RETRY_COOLDOWN_MS;
       return;
     }
 
-    // Never rejects — falls back OPFS -> IndexedDB -> memory on its own.
-    const store = await openChunkStore(caseId, recordingId);
-    storeRef.current = store;
-    setStorageKind(store.kind);
+    // Everything this recording owns, created before anything can write to it
+    // and never shared with the next one -- see RecSession. The case is
+    // captured here too: the stop POST needs the case the recording was
+    // OPENED under, not whatever the page has moved on to by then.
+    const sess: RecSession = {
+      id: recordingId,
+      caseId,
+      mime: mimeType,
+      store: null,
+      seq: 0,
+      nextUploadSeq: 0,
+      uploadChain: Promise.resolve(),
+      pendingWrites: [],
+      saved: [],
+      aborted: false,
+      finalized: false,
+      startedAt: 0,
+    };
+    lastRef.current = sess;
+
+    // Never rejects -- falls back OPFS -> IndexedDB -> memory on its own.
+    sess.store = await openChunkStore(caseId, recordingId);
+    setStorageKind(sess.store.kind);
 
     try {
-      mimeRef.current = mimeType;
       const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: VIDEO_BITS_PER_SECOND });
       recorder.ondataavailable = (e) => {
-        if (e.data.size === 0 || abortedRef.current) return;
-        const seq = seqRef.current++;
-        const store = storeRef.current;
-        const write = store
-          ? store.append(e.data, seq).catch((err) => {
-              // A single failed local write must not stop the recording — it's
+        if (e.data.size === 0 || sess.aborted) return;
+        const seq = sess.seq++;
+        const write = sess.store
+          ? sess.store.append(e.data, seq).catch((err) => {
+              // A single failed local write must not stop the recording -- it's
               // tracked below regardless, so finalize() still waits for this
               // attempt to settle before deciding what actually landed.
               console.error("[recorder] failed to persist chunk locally", err);
             })
           : Promise.resolve();
-        pendingWritesRef.current.push(write);
+        sess.pendingWrites.push(write);
         setLocalBytes((n) => n + e.data.size);
       };
-      recorder.onstop = () => { void finalize(Date.now() - startedAtRef.current); };
+      recorder.onstop = () => { void finalize(sess, Date.now() - sess.startedAt); };
       const now = Date.now();
+      sess.startedAt = now;
       startedAtRef.current = now;
       segmentStartRef.current = now;
       recordedMsRef.current = 0;
@@ -403,17 +461,19 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen",
       setRecordedMs(0);
       recorder.start(CHUNK_MS);
       recorderRef.current = recorder;
+      activeRef.current = sess;
       setElapsed(0);
       setStatus("recording");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setStatus("error");
-      void finalize(0);
+      startCooldownUntilRef.current = Date.now() + START_RETRY_COOLDOWN_MS;
+      void finalize(sess, 0);
     }
     } finally {
       startingRef.current = false;
     }
-  }, [caseId, source, stream, putChunk, finalize]);
+  }, [caseId, source, finalize]);
 
   const pause = useCallback(() => {
     const rec = recorderRef.current;
@@ -428,8 +488,8 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen",
     // genuinely free right now, not just "eventually, at Stop". Fire-and-
     // forget: if frames resume before this gets far, putChunk's own
     // waitUntilInferenceIdle gate holds the next chunk rather than competing.
-    const id = idRef.current;
-    if (id) void uploadPending(id);
+    const sess = activeRef.current;
+    if (sess) void uploadPending(sess);
   }, [uploadPending]);
 
   const resume = useCallback(() => {
@@ -442,13 +502,14 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen",
   }, []);
 
   const downloadLocal = useCallback(() => {
-    const chunks = savedRef.current;
-    if (chunks.length === 0) return;
-    const blob = new Blob(chunks, { type: mimeRef.current });
+    const sess = lastRef.current;
+    const chunks = sess?.saved ?? [];
+    if (!sess || chunks.length === 0) return;
+    const blob = new Blob(chunks, { type: sess.mime });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `noormind-${caseRef.current}-${idRef.current ?? "session"}.webm`;
+    a.download = `noormind-${sess.caseId}-${sess.id}.webm`;
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -457,24 +518,26 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen",
   }, []);
 
   const mark = useCallback(() => {
-    if (!idRef.current || !startedAtRef.current) return null;
+    const sess = activeRef.current;
+    if (!sess || !startedAtRef.current) return null;
     // Actually-recorded time, not wall clock: if any out-of-body pause has
     // happened, the recorded video is shorter than elapsed time, and an
     // offset computed from the wall clock would point at the wrong moment.
     const openSegment = capturingRef.current ? Date.now() - segmentStartRef.current : 0;
-    return { recordingId: idRef.current, offsetMs: recordedMsRef.current + openSegment };
+    return { recordingId: sess.id, offsetMs: recordedMsRef.current + openSegment };
   }, []);
 
   const stop = useCallback(() => {
     const recorder = recorderRef.current;
-    if (!recorder) return;
+    const sess = activeRef.current;
+    if (!recorder || !sess) return;
     setStatus("stopping");
     try {
       // Flushes the partial slice as one last ondataavailable, then fires onstop.
       if (recorder.state !== "inactive") recorder.stop();
-      else void finalize(Date.now() - startedAtRef.current);
+      else void finalize(sess, Date.now() - sess.startedAt);
     } catch {
-      void finalize(Date.now() - startedAtRef.current);
+      void finalize(sess, Date.now() - sess.startedAt);
     }
   }, [finalize]);
 

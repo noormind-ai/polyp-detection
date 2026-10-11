@@ -44,6 +44,10 @@ interface CpuModel {
   polyp_trained: boolean;
   conf?: number;
   backend: string;
+  // True when this model's onnx session is bound to CUDAExecutionProvider on
+  // this box, not just present. A GPU joined noormind-iran 2026-09-27 -- only
+  // RT-DETR runs on it so far, so this is per-model, not a deployment-wide flag.
+  gpu?: boolean;
 }
 
 interface BackendInfo {
@@ -67,6 +71,12 @@ interface EngineOption {
 
 const isCpuEngine = (b: string) => b.startsWith("cpu");
 
+/** Whether `backend` is a local engine actually bound to this box's GPU
+ *  right now, per the server's per-model `gpu` flag -- not every `cpu:`
+ *  engine qualifies (only rtdetr does, at time of writing). */
+const usesLocalGpu = (d: BackendInfo | null, b: string) =>
+  !!d?.cpu_models?.find((m) => m.backend === b)?.gpu;
+
 /** Modal is always offered; the CPU entries come from whatever the server has
  *  deployed, so a box with no onnx models simply shows the one option. */
 function engineOptions(d: BackendInfo | null, t: (s: string) => string): EngineOption[] {
@@ -80,9 +90,11 @@ function engineOptions(d: BackendInfo | null, t: (s: string) => string): EngineO
       icon: m.polyp_trained ? "🖥️" : "⏱️",
       title: m.label,
       detail: d.cpu ?? t("This server's CPU"),
-      note: m.polyp_trained
-        ? t("Runs on this server's CPU · no GPU, no cloud")
-        : t("Speed test only · will NOT detect polyps"),
+      note: !m.polyp_trained
+        ? t("Speed test only · will NOT detect polyps")
+        : m.gpu
+          ? t("Runs on this server's GPU · no cloud")
+          : t("Runs on this server's CPU · no GPU, no cloud"),
       usable: !!d.available?.cpu,
     });
   }
@@ -112,7 +124,7 @@ const NEEDS_GPU: Mode[] = ["simulation", "camera", "screen"];
 
 export default function Home() {
   const { t, lang, toggleLang } = useLanguage();
-  const { user, loading: authLoading, logout, reviewer } = useAuth();
+  const { user, loading: authLoading, logout, reviewer, spectator } = useAuth();
 
   const [mode, setMode] = useState<Mode | null>(null);
 
@@ -320,12 +332,6 @@ export default function Home() {
       blurb: "Share a window/screen instead of a device",
       hover: "hover:border-purple-500 hover:bg-purple-950/10",
     },
-    {
-      key: "upload", icon: "🎬",
-      title: "Upload Video",
-      blurb: "Analyse a recorded colonoscopy clip",
-      hover: "hover:border-blue-500 hover:bg-blue-950/10",
-    },
   ];
 
   return (
@@ -462,13 +468,49 @@ export default function Home() {
                     )}
                     {startsGpu && (
                       <span className="text-xs text-gray-600">
-                        {isCpuEngine(backend) ? t("🖥️ Runs on this server's CPU") : t("⚡ Starts a GPU session")}
+                        {isCpuEngine(backend)
+                          ? (usesLocalGpu(backends, backend)
+                              ? t("⚡ Runs on this server's GPU")
+                              : t("🖥️ Runs on this server's CPU"))
+                          : t("⚡ Starts a GPU session")}
                       </span>
                     )}
                   </span>
                 </button>
               );
             })}
+            {/* Not a Mode -- this navigates to a real route (/spectator)
+                instead of opening an inline mode, so it renders as a link
+                rather than going through openMode(). Sits in the grid slot
+                "Upload Video" used to occupy; that feature (mode === "upload",
+                UploadPanel, /infer-video) is untouched, just no longer has a
+                homepage entry point -- this replaced it, not deleted it. */}
+            <a
+              href="/spectator"
+              className="flex flex-row sm:flex-col items-center gap-4 sm:gap-3 p-4 sm:p-8 rounded-xl border-2 border-gray-700 transition-colors text-start sm:text-center hover:border-amber-500 hover:bg-amber-950/10"
+            >
+              <span className="text-3xl flex-shrink-0">🔭</span>
+              <span className="flex flex-col gap-1 min-w-0 sm:contents">
+                <span className="text-white font-medium">{t("Spectator view")}</span>
+                <span className="text-gray-500 text-sm">{t("Watch a live session from another computer")}</span>
+                {!spectator && (
+                  <span className="text-xs text-gray-600">{t("🔒 Sign-in required")}</span>
+                )}
+              </span>
+            </a>
+            {/* Write report -- the report-generation side app (/report, its
+                own service on 19070), not a Mode. Open (no sign-in) during
+                the ASR test phase. */}
+            <a
+              href="/report"
+              className="flex flex-row sm:flex-col items-center gap-4 sm:gap-3 p-4 sm:p-8 rounded-xl border-2 border-gray-700 transition-colors text-start sm:text-center hover:border-amber-500 hover:bg-amber-950/10"
+            >
+              <span className="text-3xl flex-shrink-0">📝</span>
+              <span className="flex flex-col gap-1 min-w-0 sm:contents">
+                <span className="text-white font-medium">{t("Write report")}</span>
+                <span className="text-gray-500 text-sm">{t("Dictate a colonoscopy or endoscopy report, section by section")}</span>
+              </span>
+            </a>
           </div>
 
           {/* Playback of sessions already recorded to this server. Deliberately
@@ -505,7 +547,9 @@ export default function Home() {
                   <div className="flex items-center gap-2 text-green-400 text-sm">
                     <span className="w-2 h-2 rounded-full bg-green-400 inline-block animate-pulse" />
                     {isCpuEngine(backend)
-                      ? t("CPU ready · Model loaded · {cpu}", { cpu: backends?.cpu ?? t("this server's CPU") })
+                      ? (usesLocalGpu(backends, backend)
+                          ? t("GPU ready · Model loaded · {cpu}", { cpu: backends?.cpu ?? t("this server's GPU") })
+                          : t("CPU ready · Model loaded · {cpu}", { cpu: backends?.cpu ?? t("this server's CPU") }))
                       : t("GPU ready · Model loaded · T4 active")}
                   </div>
                   <button

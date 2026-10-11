@@ -1,6 +1,16 @@
 // Farsi translations, gettext-style: the English source string is the lookup
 // key (same convention used in OrganAI's translations, kept consistent here).
 export const FA: Record<string, string> = {
+  // --- Save-video prompt when a file is replayed through the live pipeline ---
+  "Save video for this clip?": "ویدیوی این کلیپ ذخیره شود؟",
+  "A replay can be recorded to the server exactly like a live procedure. Frames you capture for feedback are saved either way.": "پخش دوباره می‌تواند دقیقاً مانند یک پروسیجر زنده روی سرور ضبط شود. فریم‌هایی که برای بازخورد ثبت می‌کنید، در هر حال ذخیره می‌شوند.",
+  "Save video": "ذخیرهٔ ویدیو",
+  "Don't save": "ذخیره نکن",
+
+  // --- Write report (report-generation side app) ---
+  "Write report": "نوشتن گزارش",
+  "Dictate a colonoscopy or endoscopy report, section by section":
+    "دیکته گزارش کولونوسکوپی یا آندوسکوپی، بخش به بخش",
   "Saved Video": "ویدیوی ذخیره‌شده",
   "Replay a clip through the live pipeline": "پخش دوباره یک کلیپ از مسیر پردازش زنده",
   "Saved video, live camera and screen share all run the same pipeline — each starts a session when you open it.": "ویدیوی ذخیره‌شده، دوربین زنده و اشتراک صفحه همگی از یک مسیر پردازش عبور می‌کنند — هرکدام با باز شدن، یک نشست آغاز می‌کند.",
@@ -69,6 +79,8 @@ export const FA: Record<string, string> = {
   "Stop": "توقف",
   "Hide": "پنهان کردن",
   "Show": "نمایش",
+  "Full screen": "تمام‌صفحه",
+  "Exit full screen": "خروج از تمام‌صفحه",
   "Frames sent": "فریم‌های ارسال‌شده",
   "Responses back": "پاسخ‌های دریافتی",
   "Modal latency (avg)": "تأخیر Modal (میانگین)",
@@ -85,7 +97,10 @@ export const FA: Record<string, string> = {
   "Error": "خطا",
   "Plays continuously — right panel shows the last analyzed frame": "پخش پیوسته — پنل مقابل، آخرین فریم تحلیل‌شده را نشان می‌دهد",
   "Live · {speed}x · no lag": "زنده · {speed}x · بدون تأخیر",
+  // Kept alongside the {rtt} version below rather than renamed -- RealtimePlayer.tsx
+  // still uses this exact {avgMs} key and shouldn't lose its Farsi translation.
   "Detected · ~{avgMs}ms behind live": "شناسایی‌شده · حدود {avgMs} میلی‌ثانیه عقب‌تر از تصویر زنده",
+  "Detected · ~{rtt}ms behind live": "شناسایی‌شده · حدود {rtt} میلی‌ثانیه عقب‌تر از تصویر زنده",
   "Playback speed": "سرعت پخش",
   "slower playback = less motion between frames = the two panels drift apart less": "پخش آهسته‌تر = حرکت کمتر بین فریم‌ها = فاصله کمتر بین دو پنل",
   "← Load different video": "→ بارگذاری ویدیوی دیگر",
@@ -104,6 +119,14 @@ export const FA: Record<string, string> = {
   "Laptop webcam, phone camera (if this page is opened on the phone itself), or a USB/HDMI capture card — any of them show up below once you grant camera access.": "وب‌کم لپ‌تاپ، دوربین گوشی (اگر این صفحه روی خود گوشی باز شده باشد) یا کارت کپچر USB/HDMI — پس از اعطای دسترسی به دوربین، همه آن‌ها در پایین نمایش داده می‌شوند.",
   "Requesting access...": "در حال درخواست دسترسی...",
   "Choose a camera": "انتخاب دوربین",
+  "Allow camera access": "اجازهٔ دسترسی به دوربین",
+  "Opening camera…": "در حال باز کردن دوربین…",
+  "Start camera": "شروع دوربین",
+  "Checking camera modes…": "در حال بررسی حالت‌های دوربین…",
+  "Checking camera modes… {step} ({i}/{total})": "در حال بررسی حالت‌های دوربین… {step} ({i}/{total})",
+  "Scan all modes": "بررسی همهٔ حالت‌ها",
+  "Scanning…": "در حال بررسی…",
+  "Source {mode}": "منبع {mode}",
   "📺 Tutorials": "📺 آموزش‌ها",
   "Tutorials": "آموزش‌ها",
   "How to use the feedback panels": "راهنمای استفاده از پنل‌های بازخورد",
@@ -185,8 +208,11 @@ export const FA: Record<string, string> = {
   "False alarms": "هشدارهای کاذب",
   "Sound on": "صدا روشن",
   "Sound off": "صدا خاموش",
-  "Sound a short alert whenever a detection is captured — the same trigger as the capture itself.":
-    "هرگاه یک تصویر ضبط شود، هشدار کوتاه صوتی نیز پخش می‌شود — با همان شرطی که ضبط را فعال می‌کند.",
+  "Sound a short alert the moment a detection appears on screen, and stop when it goes — the same trigger as the box itself.":
+    "به‌محض آن‌که تشخیصی روی تصویر ظاهر شود هشدار کوتاه صوتی پخش می‌شود و با محو شدن آن قطع می‌گردد — با همان شرطی که کادر را نمایش می‌دهد.",
+  "for": "به مدت",
+  "How long the alert sounds. It stops early if the detection leaves the screen first.":
+    "مدت پخش هشدار. اگر تشخیص پیش از پایان آن از تصویر خارج شود، هشدار زودتر قطع می‌شود.",
   "Dr. found, AI missed": "پزشک یافت، هوش مصنوعی تشخیص نداد",
   "Dr. noticed first": "پزشک ابتدا متوجه شد",
   "AI caught it first": "هوش مصنوعی ابتدا تشخیص داد",

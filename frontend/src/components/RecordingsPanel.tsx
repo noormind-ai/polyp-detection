@@ -21,7 +21,7 @@ interface Recording {
   id: string;
   case_id: string;
   user: string;
-  source: "camera" | "screen";
+  source: "camera" | "screen" | "joined";
   mime: string;
   ext: string;
   width: number;
@@ -199,7 +199,7 @@ export default function RecordingsPanel({
                     className="flex-1 min-w-0 text-left disabled:cursor-not-allowed"
                   >
                     <div className="flex items-center gap-2">
-                      <span>{r.source === "screen" ? "🖥️" : "📹"}</span>
+                      <span>{r.source === "screen" ? "🖥️" : r.source === "joined" ? "🎬" : "📹"}</span>
                       <span className="text-sm text-gray-200 truncate">{when(r.started_at)}</span>
                       <span className={`text-[10px] px-1.5 py-0.5 rounded border flex-shrink-0 ${badge.cls}`}>
                         {badge.text}

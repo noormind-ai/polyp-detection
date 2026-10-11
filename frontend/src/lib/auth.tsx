@@ -72,6 +72,9 @@ interface AuthContextValue {
   reviewer: boolean;
   /** "admin" | "reader" for a panel account, else null. Display only. */
   reviewRole: string | null;
+  /** signed-in name is on the server's spectator allowlist. Display only --
+   *  the websocket and /api/spectate/rooms both re-check this themselves. */
+  spectator: boolean;
   login: (username: string, password: string) => Promise<LoginResult>;
   register: (username: string, password: string, invite: string) => Promise<LoginResult>;
   /** Replace an admin-issued one-time password, then sign in. */
@@ -115,6 +118,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [inviteRequired, setInviteRequired] = useState(false);
   const [reviewer, setReviewer] = useState(false);
   const [reviewRole, setReviewRole] = useState<string | null>(null);
+  const [spectator, setSpectator] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -126,12 +130,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setInviteRequired(!!data.invite_required);
       setReviewer(!!data.reviewer);
       setReviewRole(data.review_role ?? null);
+      setSpectator(!!data.spectator);
     } catch {
       // Backend down or unreachable — treat as signed out rather than blocking
       // the whole page, since the open modes still work without it.
       setUser(null);
       setReviewer(false);
       setReviewRole(null);
+      setSpectator(false);
     } finally {
       setLoading(false);
     }
@@ -215,12 +221,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setUser(null);
       setReviewer(false);
       setReviewRole(null);
+      setSpectator(false);
     }
   };
 
   return (
     <AuthContext.Provider
-      value={{ user, loading, registrationOpen, inviteRequired, reviewer, reviewRole,
+      value={{ user, loading, registrationOpen, inviteRequired, reviewer, reviewRole, spectator,
                login, register, setNewPassword, logout }}
     >
       {children}

@@ -1,7 +1,9 @@
 # Tier 3 (alert) fires whenever tier 2 (capture) fires, not on its own timer
 
 ## Status
-Resolved 2026-09-29
+Resolved 2026-09-29. **Superseded by [0004](0004-alert-mirrors-box.md)** (2026-10-08): tier 3 no longer
+tracks tier 2 either -- it mirrors tier 1, the drawn box. The factoring-out
+this ADR called for in its last consequence was done at the same time.
 
 ## Problem / Context
 Live inference (`LiveCameraPlayer.tsx`, `RealtimePlayer.tsx`) responds to a

@@ -14,7 +14,9 @@ import QualityGateNotice from "./QualityGateNotice";
 import FilterBankNotice, { type GateState } from "./FilterBankNotice";
 import { useTemporalGate } from "@/lib/useTemporalGate";
 import TemporalGateNotice from "./TemporalGateNotice";
+import { useAlertSound } from "@/lib/useAlertSound";
 import { detectFovRect, unionRect, trimmedFraction, NEGLIGIBLE_TRIM, type Rect } from "@/lib/fov";
+import { useFullscreen, fsWrapClass, fsExitBtnClass, fsBoxStyle } from "@/lib/useFullscreen";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "";
 // Resolve the socket origin explicitly rather than leaning on a relative
@@ -32,44 +34,49 @@ const INFER_WIDTH = 320;
 // lib/fov.ts — the union of several beats one, and the border does not move.
 const FOV_SAMPLE_FRAMES = 8;
 const SPEEDS = [0.1, 0.25, 0.5, 0.7, 1, 1.5, 2];
-// A polyp that is STILL on screen is re-filed at most this often, so a long
-// look is not represented in the queue by a single frame.
+// A polyp that is STILL on screen is re-filed, but the wait between
+// refreshes doubles each time (8s, 16s, 32s, ...) up to this ceiling -- a
+// long look shouldn't flood the queue at a flat rate. See
+// documents/adr/0003-auto-capture-refresh-throttle.md.
 const AUTO_CAPTURE_REFRESH_MS = 8000;
+const AUTO_CAPTURE_REFRESH_MAX_MS = 64000; // 8s doubled 3x
 // A detection gap shorter than this counts as the same episode. The detector
 // drops the odd frame on a lesion that never left the screen, and treating that
 // as "gone" would re-trigger a capture on the very next frame.
 const DETECTION_GAP_MS = 1000;
 
 // ---------------------------------------------------------------------------
-// Two tiers gate what appears; a third rides on the second.
+// Three tiers of response. Two have their own bar; the third has none of its
+// own by design. Kept identical to the tier table in LiveCameraPlayer.tsx --
+// if you change one, change the other.
 //
 //   tier 1  box on screen   temporal gate, 2-of-3 (~0.5 s)   lib/temporal.ts
-//   tier 2  filed capture   FILE_MIN_MS  + FILE_MIN_HITS
-//   tier 3  audible alert   fires whenever tier 2 files a capture
+//   tier 2  filed capture   FILE_MIN_MS + FILE_MIN_HITS
+//   tier 3  audible alert   tier 1's bar exactly -- lib/useAlertSound.ts
 //
-// Cheapest signal, loosest bar; loudest signal, same bar as the capture it
-// announces. The tier 1/2 thresholds are the operating points Holzwanger et
-// al. (Endoscopy 2021) measured for how long a CADe detection has to last
-// before it carries information -- CADe specificity/accuracy 93.2%/97.8% at
-// >=0.5 s, 98.6%/99.5% at >=1 s, and 99.8%/99.9% at >=2 s. The same work
-// found that over 95% of per-frame false positives are ignored by
-// endoscopists outright, which is why a single frame triggers nothing here
-// but a box.
+// Tier 1's threshold is the operating point Holzwanger et al. (Endoscopy 2021)
+// measured for how long a CADe detection has to last before it carries
+// information -- CADe specificity/accuracy 93.2%/97.8% at >=0.5 s, 98.6%/99.5%
+// at >=1 s, 99.8%/99.9% at >=2 s. The same work found over 95% of per-frame
+// false positives are ignored by endoscopists outright, which is why a single
+// frame triggers nothing here. Tier 2 waits longer again before spending a
+// reviewer's time on a frame.
 //
-// Tier 3 used to sit behind its own, stricter bar -- twice tier 2's patience
-// plus a confidence floor -- on the reasoning that a spurious beep is the one
-// failure mode that does real damage. With capture volume already low on the
-// current model, that meant the room rarely heard about a capture even when
-// one was filed. The alert now tracks the capture instead of gating
-// separately -- see documents/adr/0002-capture-also-alerts.md. Re-split the
-// tiers if a future model raises capture frequency back to where an
-// independent, stricter alert bar earns its keep again.
+// Tier 3 announces exactly what tier 1 drew: the alert sounds the moment a box
+// appears on the video and stops when it goes, for at most the operator's
+// chosen duration (default 0.5 s). It has no timing bar, hit count or
+// confidence floor of its own.
+//
+// It used to live inside flushBest(), which meant it beeped once per filed
+// capture -- including every refresh capture while a single lesion stayed on
+// screen, so one long look was announced repeatedly. That was an attempt to
+// define "worth announcing" separately from tier 1, which already defines it.
+// See documents/adr/0004-alert-mirrors-box.md.
 // ---------------------------------------------------------------------------
 
 // Tier 2 -- file a capture. Both bars must be cleared: an appearance has to
 // have lasted this long AND been seen on this many inferred frames, so neither
-// a slow frame rate nor a burst of frames on its own can carry it. Tier 3 (the
-// alert) fires alongside every capture this produces -- see flushBest.
+// a slow frame rate nor a burst of frames on its own can carry it.
 const FILE_MIN_MS   = 1000;
 const FILE_MIN_HITS = 2;
 
@@ -89,9 +96,6 @@ const SHARP_REF = 30;
 // enough for the model, not enough for a human, and the doctor-found path has
 // always saved 960. Both paths now agree.
 const CAPTURE_EDGE = 960;
-// Off unless the operator asks for it: switching on audio in a procedure room
-// is their call, not a default.
-const ALERT_KEY = "polyp_alert_sound";
 
 interface Box { bbox: [number, number, number, number]; conf: number; }
 interface Timing { recv_ms: number; modal_ms: number; total_ms: number; }
@@ -141,6 +145,7 @@ export default function RealtimePlayer({
   const wsRef       = useRef<WebSocket | null>(null);
   const scanRef     = useRef(false); // capture loop running?
   const lastAutoCaptureRef = useRef(0);
+  const refreshMsRef = useRef(AUTO_CAPTURE_REFRESH_MS); // grows each refresh; reset per episode
   const lastDetectionRef   = useRef(0);     // when a box was last seen
   const inEpisodeRef       = useRef(false); // inside one continuous appearance?
   // One capture upload at a time. A rolling clip plus its frame is megabytes and
@@ -164,18 +169,15 @@ export default function RealtimePlayer({
   // frame would be megabytes a second of garbage on a clinic PC.
   const hiScratchRef  = useRef<HTMLCanvasElement | null>(null);
   const bestCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const audioCtxRef   = useRef<AudioContext | null>(null);
   // At most one capture may wait behind an in-flight upload. More than one and
   // we are back to queueing POSTs against the same upstream the frame stream
   // uses; none at all and a capture that merely coincided with a busy uplink is
   // lost outright — which is a lesion the reviewer never sees.
   const deferredRef = useRef<{ blob: Blob; boxes: Box[] } | null>(null);
-  // Tier 3 is configured in the live player; here we only read the setting, so a
-  // demo run behaves like the room it is demonstrating.
-  const alertEnabledRef = useRef(false);
-  useEffect(() => {
-    try { alertEnabledRef.current = localStorage.getItem(ALERT_KEY) === "1"; } catch { /* ignore */ }
-  }, []);
+  // Tier 3. The controls live in the live player and the spectator view; here we
+  // only consume the stored settings — mute and duration both — so a demo
+  // behaves like the room it is demonstrating.
+  const alert = useAlertSound();
   // Replay reuses one scratch canvas instead of allocating per animation frame —
   // the live loop can get away with allocating because it runs at inference
   // speed (a few per second), replay runs at frame rate.
@@ -200,7 +202,7 @@ export default function RealtimePlayer({
   // the CPU (~58ms/frame, ~17fps) keeps up with 25fps footage without skipping
   // much. Must stay a member of SPEEDS or no button renders as selected.
   const [speed, setSpeed]         = useState(0.5);
-  const [stats, setStats]         = useState({ sent: 0, received: 0, avgMs: 0 });
+  const [stats, setStats]         = useState({ sent: 0, received: 0, avgMs: 0, rttMs: 0, netMs: 0 });
   // Whole filter bank as reported by the backend for the last frame that
   // came back, so the panel answers "which paper filter fired on THIS
   // scene" rather than showing one operator's raw numbers.
@@ -224,6 +226,11 @@ export default function RealtimePlayer({
   const [showDetected, setShowDetected] = useState(true);
   const [showLive, setShowLive]         = useState(true);
   const msHistory = useRef<number[]>([]);
+  // Client-side round trip, so the panel can split what the server spent from
+  // what the wire cost. Safe as a single ref because only one frame is ever in
+  // flight at a time (pendingRef) — see the capture loop.
+  const rttHistory = useRef<number[]>([]);
+  const sentAtRef = useRef<number>(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const lastBoxesRef = useRef<Box[]>([]); // AI's most recent detections — attached as context to manual captures
 
@@ -264,7 +271,23 @@ export default function RealtimePlayer({
       msHistory.current.push(timing.modal_ms);
       if (msHistory.current.length > 10) msHistory.current.shift();
       const avg = Math.round(msHistory.current.reduce((a, b) => a + b, 0) / msHistory.current.length);
-      setStats((s) => ({ sent: s.sent, received: s.received + 1, avgMs: avg }));
+      // Round trip as the operator actually experiences it: stamped just before
+      // ws.send, read here. timing.modal_ms is server-side only (the name is a
+      // misnomer kept for UI compatibility — on this box there is no Modal, it
+      // is CPU time), so the difference is everything the wire and the browser
+      // cost on top. Clamped at 0: a sub-millisecond LAN can round negative.
+      const rtt = sentAtRef.current ? performance.now() - sentAtRef.current : 0;
+      if (rtt > 0) {
+        rttHistory.current.push(rtt);
+        if (rttHistory.current.length > 10) rttHistory.current.shift();
+      }
+      const avgRtt = rttHistory.current.length
+        ? Math.round(rttHistory.current.reduce((a, b) => a + b, 0) / rttHistory.current.length)
+        : 0;
+      setStats((s) => ({
+        sent: s.sent, received: s.received + 1, avgMs: avg,
+        rttMs: avgRtt, netMs: avgRtt ? Math.max(0, avgRtt - avg) : 0,
+      }));
 
       pendingRef.current?.({ boxes, timing });
       pendingRef.current = null;
@@ -366,7 +389,15 @@ export default function RealtimePlayer({
     }
   }
 
-  function updateBoxes(b: Box[]) { setPolyp(b.length > 0); lastBoxesRef.current = b; }
+  // The single writer of "what is on screen right now" — the indicator, the
+  // boxes a manual capture attaches, and tier 3. See the identical comment in
+  // LiveCameraPlayer: hanging the alert here rather than off maybeAutoCapture is
+  // what makes it mean "a box is being drawn" and nothing else.
+  function updateBoxes(b: Box[]) {
+    setPolyp(b.length > 0);
+    lastBoxesRef.current = b;
+    alert.onBoxState(b.length > 0);
+  }
 
   // Instant, no-dialog manual capture — grabs whatever frame is on screen
   // right now (staff can scrub the seek bar above first to line up an exact
@@ -459,34 +490,7 @@ export default function RealtimePlayer({
     episodeHitsRef.current = 0;
     episodeFiledRef.current = false;
     bestRef.current = null;
-  }
-
-  /** Tier 3. A short two-tone chirp synthesised on the spot -- no asset to
-   *  ship, no network, and nothing to fail at the one moment it matters. */
-  function alertSound() {
-    if (!alertEnabledRef.current) return;
-    try {
-      const Ctor = window.AudioContext
-        || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-      if (!Ctor) return;
-      const ctx = audioCtxRef.current ?? (audioCtxRef.current = new Ctor());
-      if (ctx.state === "suspended") void ctx.resume();
-      const t0 = ctx.currentTime;
-      [880, 1245].forEach((freq, i) => {
-        const osc = ctx.createOscillator(), gain = ctx.createGain();
-        osc.type = "sine";
-        osc.frequency.value = freq;
-        const s = t0 + i * 0.09;
-        // Ramped rather than switched: a step on a gain node clicks, and a
-        // click in a procedure room reads as equipment trouble.
-        gain.gain.setValueAtTime(0, s);
-        gain.gain.linearRampToValueAtTime(0.18, s + 0.012);
-        gain.gain.linearRampToValueAtTime(0, s + 0.08);
-        osc.connect(gain).connect(ctx.destination);
-        osc.start(s);
-        osc.stop(s + 0.09);
-      });
-    } catch { /* an alert that cannot sound must never break the live loop */ }
+    refreshMsRef.current = AUTO_CAPTURE_REFRESH_MS;
   }
 
   // Auto-capture — one filed frame per appearance, chosen for being the
@@ -515,6 +519,7 @@ export default function RealtimePlayer({
       episodeHitsRef.current = 0;
       episodeFiledRef.current = false;
       bestRef.current = null;
+      refreshMsRef.current = AUTO_CAPTURE_REFRESH_MS;
     }
     episodeHitsRef.current += 1;
     considerBest(cap, hi, boxes);
@@ -526,22 +531,25 @@ export default function RealtimePlayer({
     // not represented by one frame. Tier 3 (the alert) rides along with every
     // capture this produces -- see flushBest.
     if (episodeHitsRef.current < FILE_MIN_HITS) return;
-    const due = episodeFiledRef.current
-      ? now - lastAutoCaptureRef.current >= AUTO_CAPTURE_REFRESH_MS
+    const isRefresh = episodeFiledRef.current;
+    const due = isRefresh
+      ? now - lastAutoCaptureRef.current >= refreshMsRef.current
       : age >= FILE_MIN_MS;
-    if (due) flushBest(now);
+    if (!due) return;
+    if (isRefresh) {
+      refreshMsRef.current = Math.min(refreshMsRef.current * 2, AUTO_CAPTURE_REFRESH_MAX_MS);
+    }
+    flushBest(now);
   }
 
-  /** Tiers 2 and 3. Hand the best frame of this appearance to the uploader,
-   *  and sound the alert alongside it -- every captured image gets a beep,
-   *  see documents/adr/0002-capture-also-alerts.md. */
+  /** Tier 2. Hand the best frame of this appearance to the uploader. Silent --
+   *  tier 3 fires off the drawn box, not off filing. */
   function flushBest(now: number) {
     const best = bestRef.current;
     const canvas = bestCanvasRef.current;
     if (!best || !canvas) return;
     episodeFiledRef.current = true;
     lastAutoCaptureRef.current = now;
-    alertSound();
     const boxes = best.boxes;
     bestRef.current = null;  // a refresh picks a fresh best, not this one again
     canvas.toBlob((blob) => { if (blob) sendCapture(blob, boxes); }, "image/jpeg", 0.82);
@@ -668,6 +676,7 @@ export default function RealtimePlayer({
 
       const result = await new Promise<{ boxes: Box[]; timing: Timing } | null>((resolve) => {
         pendingRef.current = resolve;
+        sentAtRef.current = performance.now();
         ws.send(buf);
         setStats((s) => ({ ...s, sent: s.sent + 1 }));
         setTimeout(() => {
@@ -734,7 +743,8 @@ export default function RealtimePlayer({
       updateBoxes(boxes);
       drawAnalyzedFrame(cap, boxes);
       maybeAutoCapture(boxes, cap, grabCapture(video, 0, 0, video.videoWidth, video.videoHeight));
-      setStats((s) => ({ sent: s.sent + 1, received: s.received + 1, avgMs: 0 }));
+      // Replay has no socket: nothing is sent, so there is no round trip to split.
+      setStats((s) => ({ sent: s.sent + 1, received: s.received + 1, avgMs: 0, rttMs: 0, netMs: 0 }));
     }
   }
 
@@ -777,11 +787,16 @@ export default function RealtimePlayer({
   function resetClipState() {
     setIsDemo(false);
     resetEpisode();
+    // Changing clips bypasses updateBoxes, so tier 3 is told separately —
+    // otherwise an alert from the old clip can outlive it.
+    alert.reset();
     lastDetectionRef.current = 0;
     scanRef.current = false;
     setPolyp(false);
-    setStats({ sent: 0, received: 0, avgMs: 0 });
+    setStats({ sent: 0, received: 0, avgMs: 0, rttMs: 0, netMs: 0 });
     msHistory.current = [];
+    rttHistory.current = [];
+    sentAtRef.current = 0;
     lastBoxesRef.current = [];
     lastReplayIdxRef.current = -1;
     setVideoEnded(false);
@@ -853,6 +868,10 @@ export default function RealtimePlayer({
   // Panels fill their column and take their height from the clip's own ratio —
   // the column is one of three equal thirds, so a video panel and a feedback
   // image (same frame, same ratio) come out exactly the same size.
+  // One per panel: either can take the screen on its own, and coming back
+  // must not disturb the other.
+  const detectedFs = useFullscreen();
+  const liveFs = useFullscreen();
   const panelBox = "relative w-full rounded-xl overflow-hidden border border-gray-800 bg-black";
   const toggleBtn = "text-xs px-2 py-0.5 rounded-md border border-gray-800 text-gray-500 hover:text-gray-300 hover:border-gray-600 transition-colors flex-shrink-0";
   const fovNorm = fovRect && fovFrame
@@ -911,10 +930,30 @@ export default function RealtimePlayer({
         {!replaying && (
           <>
             <span><span className="text-gray-500">{t("Responses back")} </span><span className="text-white">{stats.received}</span></span>
+            {/* Round trip split into the half we control and the half we do not.
+                Server is timing.modal_ms (CPU time on this box, despite the name);
+                network is whatever the round trip costs beyond it. */}
             <span>
-              <span className="text-gray-500">{backend && backend !== "modal" ? t("Inference latency (avg)") : t("Modal latency (avg)")} </span>
-              <span className={stats.avgMs > 800 ? "text-red-400" : "text-green-400"}>
-                {stats.avgMs > 0 ? t("{avgMs} ms", { avgMs: stats.avgMs }) : "—"}
+              <span className="text-gray-500">{t("Round trip (avg)")} </span>
+              <span className={stats.rttMs > 800 ? "text-red-400" : "text-green-400"}>
+                {stats.rttMs > 0 ? t("{ms} ms", { ms: stats.rttMs }) : "—"}
+              </span>
+            </span>
+            <span>
+              <span className="text-gray-500">{t("server")} </span>
+              <span className="text-white">
+                {stats.avgMs > 0 ? t("{ms} ms", { ms: stats.avgMs }) : "—"}
+              </span>
+              <span className="text-gray-600"> + </span>
+              <span className="text-gray-500">{t("network")} </span>
+              <span className="text-white">
+                {stats.rttMs > 0 ? t("{ms} ms", { ms: stats.netMs }) : "—"}
+              </span>
+            </span>
+            <span>
+              <span className="text-gray-500">{t("Analysed")} </span>
+              <span className="text-white">
+                {stats.rttMs > 0 ? t("{fps} fps", { fps: (1000 / stats.rttMs).toFixed(1) }) : "—"}
               </span>
             </span>
           </>
@@ -1032,13 +1071,30 @@ export default function RealtimePlayer({
                     ? t("Detected · saved result, in sync")
                     : t("Detected · ~{avgMs}ms behind live", { avgMs: stats.avgMs || 250 })}
                 </p>
-                <button onClick={() => setShowDetected(!showDetected)} className={toggleBtn}>
-                  {showDetected ? t("Hide") : t("Show")}
-                </button>
+                <div className="flex items-center gap-1.5 flex-shrink-0">
+                  {showDetected && (
+                    <button onClick={detectedFs.toggle} className={toggleBtn}>
+                      {t("Full screen")}
+                    </button>
+                  )}
+                  <button onClick={() => setShowDetected(!showDetected)} className={toggleBtn}>
+                    {showDetected ? t("Hide") : t("Show")}
+                  </button>
+                </div>
               </div>
-              <div className={showDetected ? "" : "h-0 overflow-hidden opacity-0"}>
-                <div className={panelBox} style={{ aspectRatio: aspect }}>
+              {/* The show/hide wrapper doubles as the fullscreen element, so nothing
+                  new is introduced around the ref'd <video>/<canvas>. */}
+              <div
+                ref={detectedFs.ref}
+                className={!showDetected ? "h-0 overflow-hidden opacity-0" : detectedFs.active ? fsWrapClass : ""}
+              >
+                <div className={panelBox} style={detectedFs.active ? fsBoxStyle(aspect) : { aspectRatio: aspect }}>
                   <canvas ref={analyzedRef} className="absolute inset-0 w-full h-full object-contain" />
+                  {detectedFs.active && (
+                    <button onClick={detectedFs.toggle} className={fsExitBtnClass}>
+                      {t("Exit full screen")}
+                    </button>
+                  )}
                 </div>
               </div>
             </div>
@@ -1086,12 +1142,24 @@ export default function RealtimePlayer({
                 <p className="text-xs text-gray-500 uppercase tracking-wide truncate">
                   {videoEnded ? t("Finished · {speed}x", { speed }) : t("Live · {speed}x · no lag", { speed })}
                 </p>
-                <button onClick={() => setShowLive(!showLive)} className={toggleBtn}>
-                  {showLive ? t("Hide") : t("Show")}
-                </button>
+                <div className="flex items-center gap-1.5 flex-shrink-0">
+                  {showLive && (
+                    <button onClick={liveFs.toggle} className={toggleBtn}>
+                      {t("Full screen")}
+                    </button>
+                  )}
+                  <button onClick={() => setShowLive(!showLive)} className={toggleBtn}>
+                    {showLive ? t("Hide") : t("Show")}
+                  </button>
+                </div>
               </div>
-              <div className={showLive ? "" : "h-0 overflow-hidden opacity-0"}>
-                <div className={panelBox} style={{ aspectRatio: liveAspect }}>
+              {/* The show/hide wrapper doubles as the fullscreen element, so nothing
+                  new is introduced around the ref'd <video>/<canvas>. */}
+              <div
+                ref={liveFs.ref}
+                className={!showLive ? "h-0 overflow-hidden opacity-0" : liveFs.active ? fsWrapClass : ""}
+              >
+                <div className={panelBox} style={liveFs.active ? fsBoxStyle(liveAspect) : { aspectRatio: liveAspect }}>
                   <video
                     ref={videoRef}
                     src={videoUrl}
@@ -1118,6 +1186,11 @@ export default function RealtimePlayer({
                         {t("Red is dropped before inference — {pct}% of the frame", { pct: Math.round(fovTrim * 100) })}
                       </p>
                     </div>
+                  )}
+                  {liveFs.active && (
+                    <button onClick={liveFs.toggle} className={fsExitBtnClass}>
+                      {t("Exit full screen")}
+                    </button>
                   )}
                 </div>
               </div>

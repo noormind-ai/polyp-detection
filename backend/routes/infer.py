@@ -1,3 +1,5 @@
+import asyncio
+import base64
 import logging
 import secrets
 from pathlib import Path
@@ -7,12 +9,18 @@ from fastapi.responses import JSONResponse
 
 from backend import auth
 from backend.routes.auth import require_user
-from backend.services import engine
+from backend.services import engine, spectate_bus
 from backend.services.tracker import PersistenceTracker
 
 log = logging.getLogger("infer")
 
 router = APIRouter()
+
+# Keeps references to in-flight spectator broadcasts so asyncio can't garbage
+# collect a task mid-send (an unreferenced task is fair game for collection —
+# see the asyncio docs' own warning about this). Self-cleaning via the
+# done callback; never inspected otherwise.
+_spectate_tasks: set[asyncio.Task] = set()
 
 UPLOAD_DIR = Path("/tmp/polyp-uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -137,9 +145,11 @@ async def infer_video(file: UploadFile = File(...), user: str = Depends(require_
 
 
 async def _stream_inference(websocket: WebSocket, label: str):
-    """Frame-in / boxes-out loop, shared by both websocket routes."""
+    """Frame-in / boxes-out loop, shared by both websocket routes. Owns the
+    room-lobby bookkeeping (mark active/inactive) around the actual frame
+    loop in _stream_frames, so that bookkeeping runs exactly once per
+    connection regardless of how the loop below exits."""
     import json
-    import time
 
     # Engine is fixed for the life of the socket: switching mid-stream would make
     # the latency average a blend of two very different numbers.
@@ -149,6 +159,18 @@ async def _stream_inference(websocket: WebSocket, label: str):
         await websocket.send_text(json.dumps({"error": str(e)}))
         await websocket.close()
         return
+
+    # Optional: lets spectator mode key its broadcasts to this session without
+    # the room client needing to do anything else. Absent entirely for older
+    # clients or the file-replay socket — both fall back to no broadcasting.
+    case_id = websocket.query_params.get("case_id")
+    # Only a real live-camera session is a "room" the spectator lobby lists —
+    # label is "live" only for /ws/infer; a file-replay session (label
+    # "file/{user}") is one person's own test, not something for anyone else
+    # to watch, so it never appears there even if it happens to carry a case_id.
+    is_room = label == "live" and bool(case_id)
+    if is_room:
+        spectate_bus.mark_room_active(case_id, engine_name)
 
     # Real ByteTrack, run unconditionally alongside the existing client-side
     # heuristic in lib/temporal.ts (see backend/services/tracker.py for what's
@@ -161,9 +183,20 @@ async def _stream_inference(websocket: WebSocket, label: str):
     # call — so there's nothing to save by making this optional.
     tracker = PersistenceTracker()
 
+    log.info("WS session opened (%s) | engine=%s", label, engine_name)
+    try:
+        await _stream_frames(websocket, label, engine_name, eng, tracker, case_id)
+    finally:
+        if is_room:
+            spectate_bus.mark_room_inactive(case_id)
+
+
+async def _stream_frames(websocket: WebSocket, label: str, engine_name: str, eng, tracker, case_id: str | None):
+    import json
+    import time
+
     frame_n = 0
     latencies: list[int] = []
-    log.info("WS session opened (%s) | engine=%s", label, engine_name)
     while True:
         try:
             t_recv = time.perf_counter()
@@ -203,6 +236,29 @@ async def _stream_inference(websocket: WebSocket, label: str):
                 timing["total_ms"], len(detections),
             )
             await websocket.send_text(json.dumps({"boxes": detections, "timing": timing}))
+
+            # Fire-and-forget: a spectator problem (slow consumer, dead
+            # socket) must never slow or break the response the room client
+            # just got above. Cheapest possible no-op when nobody is
+            # watching — has_subscribers is one dict lookup.
+            if case_id and spectate_bus.has_subscribers(case_id):
+                task = asyncio.create_task(spectate_bus.broadcast(case_id, {
+                    "boxes": detections,
+                    "timing": timing,
+                    "jpeg_b64": base64.b64encode(frame_bytes).decode("ascii"),
+                    # Lets a spectator measure its own true delivery lag
+                    # (Date.now() - sent_at_ms on arrival) instead of guessing
+                    # — it never sends a frame of its own to time a round trip
+                    # against, unlike the room client.
+                    "sent_at_ms": int(time.time() * 1000),
+                    # Whatever the room last reported about its own
+                    # connection (see /spectate/{case_id}/room-stats) --
+                    # None until its first report lands. Just a cached-value
+                    # lookup, no extra cost when no report has arrived yet.
+                    "room_stats": spectate_bus.get_room_stats(case_id),
+                }))
+                _spectate_tasks.add(task)
+                task.add_done_callback(_spectate_tasks.discard)
         except Exception as e:
             log.error("frame %d inference error: %s", frame_n, e)
             await websocket.send_text(json.dumps({"error": str(e)[:200]}))
