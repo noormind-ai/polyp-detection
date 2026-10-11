@@ -137,6 +137,60 @@ temporal gate and `maybeAutoCapture` still see frames in order; both skip paths
 (out-of-body, quality gate) call `drainInFlight()` before drawing, so nothing
 can overtake a frame already sent.
 
+### How it works
+
+**Before** — the loop could not start frame N+1 until frame N came back, so the
+network sat in the critical path and the model was idle for the whole round trip:
+
+    prepare N ---- send N ----[ wire ][ infer ][ wire ]---- draw N
+                                                            prepare N+1 ---- send N+1 ----[ wire ][ infer ]...
+    |<--------------------- one frame period ---------------------->|
+    period = prepare + network + inference
+
+**After** — frame N+1 is prepared and sent while frame N is still being inferred,
+so the wire overlaps the model instead of adding to it:
+
+    prepare N ---- send N ----[ wire ][ infer ][ wire ]---- draw N
+                   prepare N+1 ---- send N+1 ----[ wire ][ infer ][ wire ]---- draw N+1
+                                  prepare N+2 ---- send N+2 ...
+    period = max(inference, (prepare + network + inference) / 2)
+
+The second term is the pipeline filling; the first is the floor imposed by the
+backend, which infers strictly one frame at a time. On this deployment inference
+is the floor, so the frame rate becomes **flat at the inference limit regardless
+of what the network does** — which is the actual win, more than the raw speedup.
+
+The loop body is three lines:
+
+```js
+const sent = sendForInference(ws, buf);   // NOT awaited
+const prev = inFlight;
+inFlight = { result: sent, cap, hi };
+if (prev) await settle(prev);             // last frame's boxes, drawn now
+```
+
+Three things make that safe:
+
+**Correlation is by order, not by identifier.** `_stream_frames` receives, infers
+and replies strictly one frame at a time, and WebSocket preserves order, so the
+Nth reply always belongs to the Nth request. A FIFO (`pendingQueueRef`) is the
+entire mechanism — no `frame_id` on the wire, no protocol change.
+
+**Timeouts leave tombstones.** A frame we gave up on stays in the queue marked
+`done`, because the *server* has not given up and its reply still has to consume
+a slot. Removing the entry would misalign every later reply by one.
+
+**Each in-flight frame carries its own canvases.** `hi` was a single shared
+scratch; with a frame in flight it would be overwritten by frame N+1 before frame
+N's boxes returned, and those boxes would then be drawn over — and filed against —
+the wrong picture. It is now a ring, sized `MAX_IN_FLIGHT + 1`.
+
+All result handling stays in one place (`settle`), and both skip paths
+(out-of-body, quality gate) call `drainInFlight()` before drawing, so
+`updateBoxes`, the temporal gate and `maybeAutoCapture` still observe frames in
+strict order. Those are sequence-keyed state machines; settling out of order
+would corrupt all three.
+
 ### Alternatives considered
 
 **Do nothing** — pros: zero risk to a working clinical loop. / cons: leaves the

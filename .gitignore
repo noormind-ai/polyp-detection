@@ -53,3 +53,8 @@ frontend/tsconfig.tsbuildinfo
 
 # research drafts -- never committed
 ongoing/
+
+# Generated comparison page for ADR 0006 — real patient frames, deliberately
+# not versioned. Regenerate with the recipe in that ADR; it is served from
+# the box at /interlace/index.html.
+frontend/public/interlace/

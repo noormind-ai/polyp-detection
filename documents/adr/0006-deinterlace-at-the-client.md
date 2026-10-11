@@ -228,6 +228,23 @@ exists, and blend already beats both on the metric the operator cares about.
   -> 60-frame budget, latch on first positive, default to not deinterlacing.
 - **Quality gate thresholds were fitted on combed input**; measured shift was +4.7% and
   in the safe direction, so no retune shipped. Watch the `"blurry"` rejection rate.
-- **`/interlace/index.html` is checked into `frontend/public/`** (~4.4 MB of PNGs). It
-  is the evidence for this decision and for re-running the comparison after any change
-  — delete it only along with this ADR's conclusions.
+- **The comparison page is NOT in version control.** It lives at
+  `frontend/public/interlace/` on the box (served at `/interlace/index.html`) and is
+  gitignored: it is ~4.4 MB of real patient frames, and git history is impractical to
+  purge if that ever becomes a problem. The numbers it supports are all in this ADR;
+  only the pictures are impermanent. To regenerate after changing the deinterlacer:
+
+  ```sh
+  # references, straight from ffmpeg, on a 720x576 clinic recording
+  ffmpeg -vsync 0 -i CLIP.webm -vf "crop=720:480:0:0"                        -frames:v 40 woven/%03d.png
+  ffmpeg -vsync 0 -i CLIP.webm -vf "crop=720:480:0:0,setfield=tff,yadif=0:0:0" -frames:v 40 yadif/%03d.png
+  ffmpeg -vsync 0 -i CLIP.webm -vf "crop=720:480:0:0,setfield=tff,bwdif=0:0:0" -frames:v 40 bwdif/%03d.png
+  ```
+
+  `-vsync 0` matters: these files carry a bogus `r_frame_rate=1000/1`, and without it
+  ffmpeg pads to a constant rate by duplicating frames — which is what produced the
+  false "98% of frames are duplicates" reading recorded above. Score each variant on
+  comb (mean |row y - row y+1| over mean |row y - row y+2|), on detail (the
+  denominator alone), and on PSNR/SSIM against bwdif. Pick frames by measured
+  inter-frame difference so gentle, medium and fast motion are all represented —
+  methods separate most at the fast end.
