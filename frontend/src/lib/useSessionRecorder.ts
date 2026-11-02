@@ -44,10 +44,53 @@ const CHUNK_MS = 3000;
  *  regardless of outcome must not turn one failure into a request fired many
  *  times per second forever. See startCooldownUntilRef. */
 const START_RETRY_COOLDOWN_MS = 30_000;
-/** ~9 MB/minute. Chunks are now held until the session ends, so this is what
- *  the browser buffers in memory as well as what lands on disk. 720p endoscopy
- *  still reads clearly at this rate. */
-const VIDEO_BITS_PER_SECOND = 1_200_000;
+/** Selectable recording quality. The clinic's own report stills spend ~45 KB
+ *  per frame; at the old fixed 1.2 Mbps a video frame got ~5 KB -- a tenth of
+ *  the per-frame budget the same signal gets on the clinic's workstation, and
+ *  the measured reason saved videos looked so much softer than report images.
+ *  8 Mbps matches that still-image budget with a far better codec, so it is
+ *  the default; the lower rungs exist for when disk or upload time matters
+ *  more than fidelity. Chunks land on disk (OPFS/IndexedDB -- see
+ *  chunkStore.ts), so a higher rate costs storage and upload, not memory. */
+export const RECORDING_QUALITIES = [
+  { key: "standard", bps: 1_200_000, mbPerMin: 9 },
+  { key: "high", bps: 4_000_000, mbPerMin: 30 },
+  { key: "maximum", bps: 8_000_000, mbPerMin: 60 },
+] as const;
+export type RecordingQualityKey = (typeof RECORDING_QUALITIES)[number]["key"];
+/** The rate is a free number, not one of three rungs: the presets above are
+ *  landmarks on the scale (and what the diagnostic sweeps), but the operator
+ *  tunes the real one by eye on /sim and the clinic needs to be able to meet
+ *  whatever disk and uplink it actually has. */
+export const MIN_RECORDING_BPS = 500_000;
+export const MAX_RECORDING_BPS = 15_000_000;
+const BPS_STORAGE_KEY = "polyp_recording_bps";
+const DEFAULT_BPS = 8_000_000;
+
+export function getRecordingBps(): number {
+  try {
+    const v = Number(localStorage.getItem(BPS_STORAGE_KEY));
+    if (Number.isFinite(v) && v >= MIN_RECORDING_BPS && v <= MAX_RECORDING_BPS) return v;
+  } catch { /* SSR or storage blocked -- the default is fine */ }
+  return DEFAULT_BPS;
+}
+
+export function setRecordingBps(bps: number) {
+  const clamped = Math.max(MIN_RECORDING_BPS, Math.min(MAX_RECORDING_BPS, Math.round(bps)));
+  try { localStorage.setItem(BPS_STORAGE_KEY, String(clamped)); } catch { /* ignore */ }
+}
+
+/** Roughly what a minute of video costs at this rate, for the UI to show
+ *  before anyone commits a procedure to disk. */
+export function mbPerMinute(bps: number): number {
+  return Math.round((bps / 8 / 1e6) * 60);
+}
+
+/** Read at MediaRecorder creation, not module load: MediaRecorder's bitrate is
+ *  fixed for its lifetime, so a change applies when the NEXT recording starts. */
+function recordingBitsPerSecond(): number {
+  return getRecordingBps();
+}
 
 const MIME_CANDIDATES = [
   "video/webm;codecs=vp9",
@@ -74,6 +117,12 @@ export interface SessionRecorder {
    *  For a small "N of M uploaded" readout next to the recording controls. */
   uploadedChunks: number;
   totalChunks: number;
+  /** Chunks MediaRecorder has handed over but the server has not yet
+   *  acknowledged -- unlike totalChunks, this is live from the first
+   *  chunk, not just once an upload attempt has surveyed the store. Pairs
+   *  with waitingForLink in the UI: pending chunks that aren't currently
+   *  held for the live gate are just a slow uplink working through them. */
+  pendingChunks: number;
   /** True while a chunk is ready to send but is deliberately being held back
    *  because a live-inference loop is still running somewhere in this tab
    *  (see uploadCoordinator.ts) -- the upload isn't stalled or failed, it's
@@ -87,7 +136,8 @@ export interface SessionRecorder {
    *  loses everything not yet uploaded, same as before this feature existed. */
   storageKind: ChunkStoreKind | null;
   start: () => Promise<void>;
-  stop: () => void;
+  /** `reason` is recorded against the recording -- see RecSession.stopReason. */
+  stop: (reason?: string) => void;
   /** Pauses capture without ending the session — no data is recorded while
    *  paused. Auto-driven by in-body/out-of-body by default; also callable
    *  directly for a manual override. */
@@ -141,10 +191,17 @@ interface RecSession {
   saved: Blob[];
   aborted: boolean;
   finalized: boolean;
+  /** What ended this recording, reported to the server so the next
+   *  incident is diagnosable from the metadata instead of by correlating
+   *  against server logs. Set by stop() and by the unmount/pagehide
+   *  handlers; left undefined when the recorder stopped on its own (camera
+   *  unplugged, screen share revoked), which finalize reads as
+   *  "tracks-ended". */
+  stopReason?: string;
   startedAt: number;
 }
 
-function pickMimeType(): string | null {
+export function pickMimeType(): string | null {
   if (typeof MediaRecorder === "undefined") return null;
   return MIME_CANDIDATES.find((m) => MediaRecorder.isTypeSupported(m)) ?? null;
 }
@@ -157,7 +214,7 @@ async function detail(res: Response, fallback: string): Promise<string> {
   return fallback;
 }
 
-export function useSessionRecorder(caseId: string, source: "camera" | "screen",
+export function useSessionRecorder(caseId: string, source: "camera" | "screen" | "replay",
                                    stream: MediaStream | null): SessionRecorder {
   const [status, setStatus]     = useState<RecorderStatus>("idle");
   const [elapsedMs, setElapsed] = useState(0);
@@ -166,6 +223,7 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen",
   const [uploadedBytes, setUploaded] = useState(0);
   const [uploadedChunks, setUploadedChunks] = useState(0);
   const [totalChunks, setTotalChunks] = useState(0);
+  const [pendingChunks, setPendingChunks] = useState(0);
   const [waitingForLink, setWaitingForLink] = useState(false);
   const [error, setError]       = useState("");
   const [finishedCount, setFinished] = useState(0);
@@ -250,6 +308,7 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen",
           if (owns(sess)) {
             setUploaded(data.bytes ?? 0);
             setUploadedChunks(seq + 1);
+            setPendingChunks((n) => Math.max(0, n - 1));
           }
           // The server closes a recording that hits its size cap; keep
           // uploading into it and every later chunk 409s.
@@ -326,6 +385,31 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen",
     }
 
     if (owns(sess)) setStatus("stopping");
+    const reason = sess.stopReason ?? "tracks-ended";
+    const markStopped = async (closing: boolean) => {
+      try {
+        const body = new FormData();
+        body.append("duration_ms", String(Math.round(durationMs)));
+        body.append("stop_reason", reason);
+        if (closing) body.append("closing", "true");
+        await fetch(`${API}/api/recordings/${sess.caseId}/${sess.id}/stop`,
+                    { method: "POST", body, credentials: "include" });
+      } catch { /* the bytes are on disk either way; the stale sweep finalizes it */ }
+    };
+    // Mark it finished FIRST -- before the drain below, not after.
+    //
+    // The drain is deliberately deprioritised behind live inference (see
+    // putChunk) and can run for many minutes, and until the server has this
+    // mark the recording carries no duration, so every picker filters it
+    // out. On 2026-10-21 a recording trickled for 11m48s after it had
+    // already ended; the tab closed one second after its last chunk landed,
+    // and the single stop call that used to live only at the END of this
+    // function never went out. Six recordings across two clinic days --
+    // 29.5 minutes of footage -- sat unlistable with every byte uploaded.
+    //
+    // "closing" is what keeps the server accepting the rest of the chunks;
+    // a plain stop would 409 them, and putChunk treats a 4xx as fatal.
+    await markStopped(true);
     // Most of this recording may already be on the server -- pause() fires an
     // opportunistic trickle upload during every out-of-body stretch (see
     // LiveCameraPlayer.tsx), so this just drains whatever's left, resuming
@@ -337,12 +421,8 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen",
     // uploadPending's own internal read happened to see -- read it again
     // here; cheap, and guarantees completeness regardless of trickle timing.
     sess.saved = sess.store ? await sess.store.readAll() : [];
-    try {
-      const body = new FormData();
-      body.append("duration_ms", String(Math.round(durationMs)));
-      await fetch(`${API}/api/recordings/${sess.caseId}/${sess.id}/stop`,
-                  { method: "POST", body, credentials: "include" });
-    } catch { /* the recording is on disk either way; it just shows as interrupted */ }
+    // Everything has landed: flip "closing" to "complete".
+    await markStopped(false);
     // Once every chunk has reached the server, the local durable copy has
     // done its job -- clear it so a normal, successful session doesn't show up
     // in the next page load's orphan-recovery scan. A failed/aborted session
@@ -380,6 +460,7 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen",
     setUploaded(0);
     setUploadedChunks(0);
     setTotalChunks(0);
+    setPendingChunks(0);
     setWaitingForLink(false);
     setStorageKind(null);
     setLocalBytes(0);
@@ -435,10 +516,11 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen",
     setStorageKind(sess.store.kind);
 
     try {
-      const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: VIDEO_BITS_PER_SECOND });
+      const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: recordingBitsPerSecond() });
       recorder.ondataavailable = (e) => {
         if (e.data.size === 0 || sess.aborted) return;
         const seq = sess.seq++;
+        if (owns(sess)) setPendingChunks((n) => n + 1);
         const write = sess.store
           ? sess.store.append(e.data, seq).catch((err) => {
               // A single failed local write must not stop the recording -- it's
@@ -503,18 +585,31 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen",
 
   const downloadLocal = useCallback(() => {
     const sess = lastRef.current;
-    const chunks = sess?.saved ?? [];
-    if (!sess || chunks.length === 0) return;
-    const blob = new Blob(chunks, { type: sess.mime });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `noormind-${sess.caseId}-${sess.id}.webm`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    // Revoking immediately can cancel the download in some browsers.
-    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    if (!sess) return;
+    void (async () => {
+      let chunks = sess.saved;
+      if (chunks.length === 0 && sess.store) {
+        // Mid-recording, `saved` is still empty -- it is only filled by
+        // finalize(). This used to mean the button silently did nothing for
+        // the entire procedure, while RecordingControls offered it as soon as
+        // localBytes > 0 and the doc comment promised it worked mid
+        // recording. On a link that uploads slower than the camera records,
+        // this is the operator's only way to keep the video.
+        await Promise.all(sess.pendingWrites);
+        chunks = await sess.store.readAll().catch(() => []);
+      }
+      if (chunks.length === 0) return;
+      const blob = new Blob(chunks, { type: sess.mime });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `noormind-${sess.caseId}-${sess.id}.webm`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      // Revoking immediately can cancel the download in some browsers.
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    })();
   }, []);
 
   const mark = useCallback(() => {
@@ -527,10 +622,11 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen",
     return { recordingId: sess.id, offsetMs: recordedMsRef.current + openSegment };
   }, []);
 
-  const stop = useCallback(() => {
+  const stop = useCallback((reason: string = "manual") => {
     const recorder = recorderRef.current;
     const sess = activeRef.current;
     if (!recorder || !sess) return;
+    sess.stopReason = reason;
     setStatus("stopping");
     try {
       // Flushes the partial slice as one last ondataavailable, then fires onstop.
@@ -561,21 +657,46 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen",
   useEffect(() => {
     if (status !== "recording") return;
     const warn = (e: BeforeUnloadEvent) => { e.preventDefault(); e.returnValue = ""; };
+    // beforeunload can only ASK; it cannot reliably send. pagehide is what
+    // fires on an actual tab close, and sendBeacon is the only request that
+    // survives it -- a normal fetch is cancelled along with the page. Without
+    // this, closing the tab left the recording stuck at "recording" with no
+    // duration and invisible to every picker: exactly how 2026-10-21 lost
+    // three videos. duration_ms here is wall clock, because the page is going
+    // away and there is no time to measure anything better; the stale sweep
+    // (backend/scripts/finalize_stale_recordings.py) corrects it off the file.
+    const flush = () => {
+      const sess = activeRef.current;
+      if (!sess || sess.finalized) return;
+      const body = new FormData();
+      body.append("duration_ms", String(Math.round(Date.now() - sess.startedAt)));
+      body.append("stop_reason", "tab-closed");
+      body.append("closing", "true");
+      try {
+        navigator.sendBeacon(`${API}/api/recordings/${sess.caseId}/${sess.id}/stop`, body);
+      } catch { /* nothing left to try at this point */ }
+    };
     window.addEventListener("beforeunload", warn);
-    return () => window.removeEventListener("beforeunload", warn);
+    window.addEventListener("pagehide", flush);
+    return () => {
+      window.removeEventListener("beforeunload", warn);
+      window.removeEventListener("pagehide", flush);
+    };
   }, [status]);
 
   // Unmount (navigating out of the live mode) closes the recording cleanly.
   // Without this the server keeps it open and it lists as interrupted.
   useEffect(() => () => {
     const recorder = recorderRef.current;
+    const sess = activeRef.current;
+    if (sess && !sess.stopReason) sess.stopReason = "unmount";
     if (recorder && recorder.state !== "inactive") {
       try { recorder.stop(); } catch { /* already stopped */ }
     }
   }, []);
 
   return { status, elapsedMs, recordedMs, capturing, uploadedBytes, uploadedChunks, totalChunks,
-           waitingForLink, error, supported,
+           pendingChunks, waitingForLink, error, supported,
            storageKind, start, stop, pause, resume,
            finishedCount, mark, downloadLocal, localBytes };
 }

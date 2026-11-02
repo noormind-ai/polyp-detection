@@ -257,7 +257,9 @@ class MemoryChunkStore implements ChunkStore {
   kind: ChunkStoreKind = "memory";
   private chunks: Blob[] = [];
   async append(blob: Blob): Promise<void> { this.chunks.push(blob); }
-  async readAll(): Promise<Blob[]> { return this.chunks; }
+  // Copies, not the live array: a caller that slices or unshifts its result
+  // would otherwise be editing the store's own backing buffer.
+  async readAll(): Promise<Blob[]> { return this.chunks.slice(); }
   async clear(): Promise<void> { this.chunks = []; }
 }
 

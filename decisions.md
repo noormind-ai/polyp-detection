@@ -18,3 +18,21 @@ was filed, we decided to make tier 3 fire whenever tier 2 files a capture
 beep for every captured image, accepting that if a future model raises
 capture volume back up, tier 3 gets noisy again automatically since it now
 equals tier 2 (documents/adr/0002-capture-also-alerts.md).
+
+## Detection gates off by default
+
+In the context of live polyp detection on noormind-iran, facing five stacked
+mechanisms that could withhold a detection -- including a client-side 2-of-3
+persistence gate whose cost was unmeasurable because tier 2 filing is fed
+post-gate boxes, and a ByteTrack instance silently enforcing a 0.40 confidence
+floor on new lesions plus its own non-switchable 2-frame rule -- we decided to
+default the temporal and frame-quality gates to off and stop running ByteTrack
+on the live stream, to achieve a path where the model's output reaches the
+screen and the lesion the doctor missed is not filtered out by an unvalidated
+filter, accepting more per-frame false positives and more alerts, and accepting
+that the recall gained is as unmeasured as the recall previously lost until the
+saved clinic recordings are replayed; and, so that no beep is left without an
+image behind it, we decided to file two captures per appearance -- the first
+detected frame immediately with no bar, plus the clearest frame of the window as
+before -- labelled `first`/`best` in a new manifest column
+(documents/adr/0005-detection-gates-off-by-default.md).

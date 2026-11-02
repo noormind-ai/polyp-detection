@@ -25,6 +25,7 @@ import time
 from fastapi import WebSocket
 
 log = logging.getLogger("spectate_bus")
+netstat_log = logging.getLogger("netstat")
 
 # One send may not hang around waiting for a stalled spectator connection —
 # that would let a single bad viewer back up delivery to everyone else.
@@ -39,23 +40,64 @@ _active_rooms: dict[str, dict] = {}
 # own throttle (a couple of seconds, not per-frame); this is just the latest
 # value, overwritten each time, not a history.
 _room_stats: dict[str, dict] = {}
+# case_ids an operator has asked to stop, from a DIFFERENT browser/tab/device
+# than the one running the session -- see /api/sessions/{case_id}/stop. The
+# live loop in infer.py polls this because nothing else can reach into
+# another tab's running websocket.
+_stop_requested: set[str] = set()
 
 
-def mark_room_active(case_id: str, engine: str) -> None:
+def mark_room_active(case_id: str, engine: str, user: str | None = None) -> None:
     """Called once when a real live-camera session's websocket opens (see
     infer.py's infer_stream) — this is what makes a session show up in the
     spectator lobby. Never called for file-replay sessions (/ws/infer-file):
-    those are one person's own test, not a room for anyone else to watch."""
-    _active_rooms[case_id] = {"case_id": case_id, "started_at": time.time(), "engine": engine}
+    those are one person's own test, not a room for anyone else to watch.
+
+    `user` is who to show when a second operator finds this room already open
+    (see /api/sessions/active) -- optional only because older call sites may
+    not have a user handy; a room with it unset just shows as unattributed."""
+    _active_rooms[case_id] = {
+        "case_id": case_id, "started_at": time.time(), "engine": engine, "user": user,
+    }
 
 
 def mark_room_inactive(case_id: str) -> None:
     _active_rooms.pop(case_id, None)
     _room_stats.pop(case_id, None)
+    _stats_log_at.pop(case_id, None)
+    _stop_requested.discard(case_id)
+
+
+def request_stop(case_id: str) -> None:
+    """Ask a live session running in some OTHER tab/device to end itself.
+    The loop in infer.py polls stop_requested() between frames -- that is
+    the only way to reach into a websocket this process does not own."""
+    _stop_requested.add(case_id)
+
+
+def stop_requested(case_id: str) -> bool:
+    return case_id in _stop_requested
+
+
+# How often set_room_stats writes a log line for a given case -- the room
+# itself already throttles its POSTs to a couple of seconds; this throttles
+# again on top so a long session does not spend one log line per POST.
+STATS_LOG_INTERVAL_S = 10.0
+_stats_log_at: dict[str, float] = {}
 
 
 def set_room_stats(case_id: str, stats: dict) -> None:
     _room_stats[case_id] = stats
+    now = time.time()
+    last = _stats_log_at.get(case_id, 0.0)
+    if now - last < STATS_LOG_INTERVAL_S:
+        return
+    _stats_log_at[case_id] = now
+    netstat_log.info(
+        "case=%s rtt=%dms server=%dms net=%dms fps=%.1f uplink=%.2fMbps sent=%d recv=%d",
+        case_id, stats.get("rtt_ms", 0), stats.get("avg_ms", 0), stats.get("net_ms", 0),
+        stats.get("fps", 0.0), stats.get("uplink_mbps", 0.0), stats.get("sent", 0), stats.get("received", 0),
+    )
 
 
 def get_room_stats(case_id: str) -> dict | None:

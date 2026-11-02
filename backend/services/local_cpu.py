@@ -8,24 +8,20 @@ Runtime + numpy is ~150 MB, so the whole pipeline here — letterbox, decode, NM
 is hand-written against numpy rather than borrowed from ultralytics.
 
 Serves several models, selected as "cpu:<name>", so the UI can offer a real
-comparison from one box:
-
-    cpu:yolo11n_polyp  the polyp fine-tune (2026-08-13). Real detections, fastest.
-    cpu:yolov5m        the long-deployed polyp detector. Real detections.
-    cpu:yolo11n        stock COCO weights. NOT polyp-trained — a speed probe only.
-    cpu:yolo26n        stock COCO weights. NOT polyp-trained — a speed probe only.
-
-The two stock models are what proved the CPU was fast enough to be worth
-fine-tuning for. They find essentially nothing on colonoscopy frames, and that
-is expected — they are kept only as a latency reference.
+comparison from one box. As of 2026-10-20 the registry carries only the two
+RT-DETR variants (the YOLO entries were retired from the picker; their .onnx
+files remain in backend/models/ and can be re-registered any time).
 
 Every model carries its own frame confidence threshold, because confidence
-scales are not comparable across architectures: scored on the 108 report-linked
-studies, yolov5m peaks at 0.30 and yolo11n_polyp at 0.50.
+scales are not comparable across architectures or input resolutions — the
+same weights at 640 need a lower threshold (0.20) than their 320 export
+(0.30) to produce the same false-positive count (measured on the 1,164
+doctor-labelled frames, scores in ~/rtdetr-lowres/scores-s42-640.csv).
 
-Inference runs at 320 px because the frontend already downsizes frames to 320
-(RealtimePlayer.tsx:21) — running at ultralytics' default 640 pays 4x the compute
-to upscale pixels that were discarded at capture.
+Every model also carries its own input resolution (imgsz), exposed through
+/api/backends so the frontend captures frames at the size the model will
+actually consume — the client must not send 320 to a 640 model (upscaling
+buys nothing) nor 640 to a 320 model (wasted upload).
 """
 
 import asyncio
@@ -55,27 +51,25 @@ IOU = 0.45
 # total (62%) and would starve them.
 THREADS = int(os.getenv("POLYP_CPU_THREADS", "4"))
 
-# name -> (onnx file, UI label, detects polyps?, frame confidence threshold)
+# name -> (onnx file, UI label, detects polyps?, frame confidence threshold,
+#          input resolution the client should capture at)
 MODELS = {
     # Scored on 7,166 in-house frames against the doctor's labels: 51 false
     # positives against yolov5m's 167, for 80.9% recall against 83.1%. The
     # difference is the training data, not the architecture -- this one saw
     # full procedures with their long artefact-heavy negative stretches, while
     # the YOLO was fine-tuned on Kvasir and has barely seen a non-polyp frame.
-    "rtdetr": ("tc-rtdetr-s123_320.onnx", "RT-DETR · TRUE-Colon · fewest false positives", True, 0.30),
-    # 2.7x faster than RT-DETR and still far cleaner than the old yolov5m: at a
-    # matched 80% recall it produces 23 false positives against RT-DETR's 13 and
-    # yolov5m's 57. Same TRUE-Colon training, cheaper architecture.
-    #
-    # Its threshold is LOW because its scores are compressed, not because it is
-    # reckless: 0.27 is where it reaches 70% recall. Confidence scales do not
-    # transfer between architectures -- reading this number next to RT-DETR's
-    # 0.30 as if they meant the same thing is the mistake to avoid.
-    "tc_yolo11m": ("tc-yolo11m-s123_320.onnx", "YOLO11m · TRUE-Colon · fast", True, 0.27),
-    "yolo11n_polyp": ("yolo11n_polyp.onnx", "YOLO11n · polyp fine-tune · fastest", True, 0.50),
-    "yolov5m": ("yolov5m.onnx", "YOLOv5m · polyp (previous default)", True, 0.30),
-    "yolo11n": ("yolo11n.onnx", "YOLO11n · NOT polyp-trained — speed test only", False, 0.30),
-    "yolo26n": ("yolo26n.onnx", "YOLO26n · NOT polyp-trained — speed test only", False, 0.30),
+    "rtdetr": ("tc-rtdetr-s123_320.onnx", "RT-DETR · TRUE-Colon · fewest false positives", True, 0.30, 320),
+    # Seed 42 at the weights' native training resolution. On the A2000 it runs
+    # 25 ms/frame (vs 14.5 at 320) -- the cost is the ~4x frame upload, which
+    # is why it is an option, not the default. Threshold 0.20 is the measured
+    # matched-false-positive point against rtdetr@0.30 on the 1,164
+    # doctor-labelled frames (2026-10-20). Caveat that must travel with this
+    # entry: on that eval set (de-identified crops, ~430-450 px wide, upscaled
+    # to 640) it only TIES the 320 model -- the case for 640 rests on live
+    # frames carrying true 640-wide detail, which no labelled in-house set yet
+    # tests. Measure before claiming accuracy gains.
+    "rtdetr640": ("tc-rtdetr-s42_640.onnx", "RT-DETR 640 · TRUE-Colon · full-detail, needs fast upload", True, 0.20, 640),
 }
 DEFAULT_MODEL = os.getenv("POLYP_CPU_DEFAULT", "rtdetr")
 
@@ -87,13 +81,17 @@ DEFAULT_MODEL = os.getenv("POLYP_CPU_DEFAULT", "rtdetr")
 # to build, so listing a model here that's missing or CPU-fine is harmless.
 GPU_MODELS = {m.strip() for m in os.getenv("POLYP_GPU_MODELS", ",".join(MODELS)).split(",") if m.strip()}
 
-# Exported at 320, matching the resolution the frontend already sends. The
-# 640 export is 2.2x slower (251 ms vs 116 ms at 14 threads) for no gain:
-# measured on 400 in-house frames it found 45 polyp frames against 44, and
-# produced 25 false positives against 10. Upscaling a 320 frame to 640 buys
-# nothing but compute and, on this footage, extra false positives.
-RTDETR = {"rtdetr"}
-RTDETR_IMGSZ = 320
+# Models that take the RT-DETR path: plain stretch preprocessing and the
+# NMS-free (1, 300, 6) decode. Any new RT-DETR registration MUST be added
+# here -- its output shape also matches _decode's YOLO26 branch, which would
+# silently read the normalised columns as pixels and produce garbage boxes
+# with plausible confidences.
+#
+# (A 2026-09-03 note here used to reject 640 as "2.2x slower for no gain" --
+# that was measured on the CPU, 251 ms at 14 threads, feeding it upscaled
+# 320-wide frames. Both premises are gone: the A2000 runs 640 at 25 ms, and
+# the frontend now captures at the model's own imgsz.)
+RTDETR = {"rtdetr", "rtdetr640"}
 
 _sessions: dict[str, object] = {}
 _load_lock = threading.Lock()
@@ -156,8 +154,9 @@ def available_models() -> list[dict]:
 
     return [
         {"name": n, "label": label, "polyp_trained": trained,
-         "conf": conf, "backend": f"cpu:{n}", "gpu": cuda_ok and n in GPU_MODELS}
-        for n, (_, label, trained, conf) in MODELS.items()
+         "conf": conf, "imgsz": imgsz, "backend": f"cpu:{n}",
+         "gpu": cuda_ok and n in GPU_MODELS}
+        for n, (_, label, trained, conf, imgsz) in MODELS.items()
         if model_path(n).exists()
     ]
 
@@ -225,7 +224,7 @@ def _letterbox(frame: np.ndarray) -> tuple[np.ndarray, float, int, int]:
     return np.ascontiguousarray(x), r, left, top
 
 
-def _stretch(frame: np.ndarray, imgsz: int = RTDETR_IMGSZ) -> np.ndarray:
+def _stretch(frame: np.ndarray, imgsz: int) -> np.ndarray:
     """Plain resize to a square. Aspect ratio NOT preserved, no padding.
 
     Not interchangeable with _letterbox -- see this module's RT-DETR note.
@@ -335,11 +334,12 @@ def _to_frame_coords(xyxy: np.ndarray, r: float, pad_x: int, pad_y: int,
 def _predict(name: str, frame: np.ndarray) -> tuple[list[dict], float]:
     sess = _session(name)
     conf_thr = MODELS[name][3]
+    imgsz = MODELS[name][4]
     rt = name in RTDETR
     h0, w0 = frame.shape[:2]
 
     if rt:
-        x = _stretch(frame)
+        x = _stretch(frame, imgsz)
         r = pad_x = pad_y = 0.0
     else:
         x, r, pad_x, pad_y = _letterbox(frame)

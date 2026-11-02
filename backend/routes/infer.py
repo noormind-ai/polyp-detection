@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 
 from backend import auth
 from backend.routes.auth import require_user
+from backend.routes.feedback import _check_id
 from backend.services import engine, spectate_bus
 from backend.services.tracker import PersistenceTracker
 
@@ -25,6 +26,12 @@ UPLOAD_DIR = Path("/tmp/polyp-uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_UPLOAD_MB = 500
+
+# How often _stream_frames wakes up with no frame in hand, purely to check
+# whether another tab/device asked this session to stop (see
+# POST /api/sessions/{case_id}/stop). Short enough that a stop request lands
+# quickly; long enough not to spin the loop while idle out-of-body.
+STOP_POLL_INTERVAL_S = 2.0
 
 # One row per streaming session, so engine comparisons are a spreadsheet rather
 # than a grep over the log. Deliberately session-level: per-frame rows would be
@@ -60,7 +67,7 @@ def _new_case_id() -> str:
 
 
 @router.post("/case/new")
-async def case_new():
+async def case_new(user: str = Depends(require_user)):
     """A case ID without starting a GPU.
 
     Feedback capture is filed per-case and is available in every mode,
@@ -71,7 +78,7 @@ async def case_new():
 
 
 @router.get("/backends")
-async def backends():
+async def backends(user: str = Depends(require_user)):
     """Which inference engines this deployment can serve, and which is default.
 
     The UI reads this so it only offers choices that will actually work, and so
@@ -81,7 +88,7 @@ async def backends():
 
 
 @router.post("/session/start")
-async def session_start(backend: str | None = None):
+async def session_start(backend: str | None = None, user: str = Depends(require_user)):
     """Boot the engine. Called when someone opens live camera or screen share —
     NOT on page load, and never for the demos.
 
@@ -109,7 +116,7 @@ async def session_start(backend: str | None = None):
 
 
 @router.post("/session/stop")
-async def session_stop():
+async def session_stop(user: str = Depends(require_user)):
     """Marks the end of a session from the UI's point of view.
 
     It does NOT force the GPU container down, and deliberately does not
@@ -120,6 +127,31 @@ async def session_stop():
     never starting a container we do not need, not from this call.
     """
     return {"status": "stopped"}
+
+
+@router.get("/sessions/active")
+async def sessions_active(user: str = Depends(require_user)):
+    """Live-camera rooms open right now, for any signed-in operator -- not
+    gated on the spectator allowlist like /api/spectate/rooms, because this
+    is about avoiding a collision with your own clinic PC, not watching
+    someone else's procedure.
+
+    In-memory, same as the rest of spectate_bus: a backend restart forgets
+    active rooms, and only label=="live" sessions are tracked here -- a
+    file replay never calls mark_room_active."""
+    return {"rooms": spectate_bus.list_active_rooms()}
+
+
+@router.post("/sessions/{case_id}/stop")
+async def sessions_stop(case_id: str, user: str = Depends(require_user)):
+    """Ask a session running in a DIFFERENT tab/device to end itself --
+    the caller's own session already has session/stop for that. The
+    websocket loop in _stream_frames polls for this between frames, since
+    nothing else can reach into a socket this process does not own."""
+    _check_id(case_id, "case_id")
+    log.info("operator %s requested stop of case %s", user, case_id)
+    spectate_bus.request_stop(case_id)
+    return {"ok": True, "requested": True}
 
 
 @router.post("/infer-video")
@@ -143,11 +175,15 @@ async def infer_video(file: UploadFile = File(...), user: str = Depends(require_
         )
 
 
-async def _stream_inference(websocket: WebSocket, label: str):
+async def _stream_inference(websocket: WebSocket, label: str, user: str | None = None):
     """Frame-in / boxes-out loop, shared by both websocket routes. Owns the
     room-lobby bookkeeping (mark active/inactive) around the actual frame
     loop in _stream_frames, so that bookkeeping runs exactly once per
-    connection regardless of how the loop below exits."""
+    connection regardless of how the loop below exits.
+
+    `user` is whoever this socket authenticated as -- carried through to
+    mark_room_active purely so /api/sessions/active can tell a second
+    operator who already has this case open."""
     import json
 
     # Engine is fixed for the life of the socket: switching mid-stream would make
@@ -169,7 +205,7 @@ async def _stream_inference(websocket: WebSocket, label: str):
     # to watch, so it never appears there even if it happens to carry a case_id.
     is_room = label == "live" and bool(case_id)
     if is_room:
-        spectate_bus.mark_room_active(case_id, engine_name)
+        spectate_bus.mark_room_active(case_id, engine_name, user)
 
     # ByteTrack is NOT run on the live stream as of 2026-10-11 -- see
     # documents/adr/0005-detection-gates-off-by-default.md.
@@ -212,8 +248,27 @@ async def _stream_frames(websocket: WebSocket, label: str, engine_name: str, eng
     while True:
         try:
             t_recv = time.perf_counter()
-            frame_bytes = await websocket.receive_bytes()
+            frame_bytes = await asyncio.wait_for(
+                websocket.receive_bytes(), timeout=STOP_POLL_INTERVAL_S,
+            )
             recv_ms = int((time.perf_counter() - t_recv) * 1000)
+        except asyncio.TimeoutError:
+            # Nothing arrived in STOP_POLL_INTERVAL_S -- completely normal
+            # out-of-body (the client sends no frames at all while paused), so
+            # this is NOT treated as a disconnect. The only thing worth waking
+            # up for is a stop requested from a different tab/device, since
+            # nothing else can reach into a websocket this process does not own.
+            if case_id and spectate_bus.stop_requested(case_id):
+                log.info(
+                    "WS session stopped by operator request (%s) | case=%s | %d frames",
+                    label, case_id, frame_n,
+                )
+                try:
+                    await websocket.close(code=1000, reason="stopped by operator")
+                except Exception:
+                    pass
+                break
+            continue
         except Exception:
             # Summarise on close. Comparing engines means comparing
             # distributions, and grepping several hundred per-frame lines to get
@@ -245,9 +300,9 @@ async def _stream_frames(websocket: WebSocket, label: str, engine_name: str, eng
             timing["total_ms"] = int((time.perf_counter() - t_total) * 1000)
             latencies.append(timing["modal_ms"])
             log.info(
-                "frame %d | %s | %d bytes | infer=%dms total=%dms | %d boxes",
+                "frame %d | %s | %d bytes | infer=%dms total=%dms recv=%dms | %d boxes",
                 frame_n, engine_name, len(frame_bytes), timing["modal_ms"],
-                timing["total_ms"], len(detections),
+                timing["total_ms"], timing["recv_ms"], len(detections),
             )
             await websocket.send_text(json.dumps({"boxes": detections, "timing": timing}))
 
@@ -283,10 +338,22 @@ async def _stream_frames(websocket: WebSocket, label: str, engine_name: str, eng
 
 @router.websocket("/ws/infer")
 async def infer_stream(websocket: WebSocket):
-    """Live camera and screen share — open, no login. This is the real clinical
-    path, and the footage never leaves the operator's own capture device."""
+    """Live camera and screen share.
+
+    This used to be open on the grounds that the footage never leaves the
+    operator's capture device. It is gated now because the rest of the app is:
+    an anonymous caller could still spend GPU here, and leaving one unlocked
+    door makes "is this server closed?" unanswerable. Same 1008 handshake as
+    the file path, so the client can tell "sign in" from "unreachable".
+    """
+    user = auth.read_session(websocket.cookies.get(auth.COOKIE_NAME, ""))
+    if not user:
+        await websocket.accept()
+        await websocket.close(code=1008, reason="sign-in required")
+        log.info("WS rejected (live): not signed in")
+        return
     await websocket.accept()
-    await _stream_inference(websocket, "live")
+    await _stream_inference(websocket, "live", user)
 
 
 @router.websocket("/ws/infer-file")
@@ -306,4 +373,4 @@ async def infer_stream_file(websocket: WebSocket):
         log.info("WS rejected (file): not signed in")
         return
     await websocket.accept()
-    await _stream_inference(websocket, f"file/{user}")
+    await _stream_inference(websocket, f"file/{user}", user)

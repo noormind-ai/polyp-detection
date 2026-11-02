@@ -1,6 +1,50 @@
 // Farsi translations, gettext-style: the English source string is the lookup
 // key (same convention used in OrganAI's translations, kept consistent here).
 export const FA: Record<string, string> = {
+
+  // --- Doctor screen: the live view on a second monitor (DoctorScreen) ---
+  "Doctor screen": "نمایشگر پزشک",
+  "Open doctor screen": "باز کردن نمایشگر پزشک",
+  "Close doctor screen": "بستن نمایشگر پزشک",
+  "Open doctor view there": "باز کردن نمای پزشک روی همان نمایشگر",
+  "Open doctor window here": "باز کردن پنجرهٔ پزشک همین‌جا",
+  "Which display is the doctor's?": "کدام نمایشگر مال پزشک است؟",
+  "this one": "همین",
+  "built-in": "داخلی",
+  "primary": "اصلی",
+  "Session stopped": "نشست متوقف شد",
+  "Press Full screen inside the doctor window — a browser won't do that for a window it just opened.":
+    "در پنجرهٔ پزشک دکمهٔ تمام‌صفحه را بزنید — مرورگر این کار را برای پنجره‌ای که تازه باز کرده انجام نمی‌دهد.",
+  "This browser can't put a window on a display you choose. Drag the doctor window onto the other monitor, then press Full screen inside it.":
+    "این مرورگر نمی‌تواند پنجره را روی نمایشگر دلخواه شما بگذارد. پنجرهٔ پزشک را با ماوس به نمایشگر دیگر بکشید و بعد در آن دکمهٔ تمام‌صفحه را بزنید.",
+  "Only one display is connected — the doctor view opened on this one.":
+    "فقط یک نمایشگر متصل است — نمای پزشک روی همین باز شد.",
+  "Permission to use the other display wasn't given. You can still open the doctor window here and drag it across, or allow 'Window management' for this site in the browser's site settings.":
+    "اجازهٔ استفاده از نمایشگر دیگر داده نشد. می‌توانید پنجرهٔ پزشک را همین‌جا باز کنید و با ماوس به نمایشگر دیگر بکشید، یا در تنظیمات سایت در مرورگر، «مدیریت پنجره‌ها» را برای این سایت مجاز کنید.",
+  "The displays changed — if the doctor window moved, close it and open it again.":
+    "نمایشگرها تغییر کردند — اگر پنجرهٔ پزشک جابه‌جا شده، آن را ببندید و دوباره باز کنید.",
+  "The browser blocked the second window. Allow pop-ups for this site and try again.":
+    "مرورگر پنجرهٔ دوم را مسدود کرد. برای این سایت پنجره‌های بازشو را مجاز کنید و دوباره تلاش کنید.",
+
+  // --- Latency readout (LatencyHud): the compact overlay's abbreviations are
+  // kept short in both languages on purpose -- it sits over the picture. ---
+  "Show latency numbers on the full-screen view": "نمایش اعداد تاخیر روی نمای تمام‌صفحه",
+  "rtt": "رفت‌وبرگشت",
+  "srv": "سرور",
+  "net": "شبکه",
+  "fps": "فریم",
+
+  // --- Captured-frame strip over the fullscreen picture (CaptureStrip) ---
+  "Captured frames": "فریم‌های ثبت‌شده",
+  "Bigger frames": "فریم‌های بزرگ‌تر",
+  "Smaller frames": "فریم‌های کوچک‌تر",
+  "Captured {ago} ago": "{ago} پیش ثبت شد",
+  "not uploaded": "ارسال نشده",
+  "Dr": "پزشک",
+  "Bottom": "پایین",
+  "Top": "بالا",
+  "Right": "راست",
+  "Off": "خاموش",
   // --- Save-video prompt when a file is replayed through the live pipeline ---
   "Save video for this clip?": "ویدیوی این کلیپ ذخیره شود؟",
   "A replay can be recorded to the server exactly like a live procedure. Frames you capture for feedback are saved either way.": "پخش دوباره می‌تواند دقیقاً مانند یک پروسیجر زنده روی سرور ضبط شود. فریم‌هایی که برای بازخورد ثبت می‌کنید، در هر حال ذخیره می‌شوند.",
@@ -72,9 +116,13 @@ export const FA: Record<string, string> = {
   "Choose a demo clip to run inference on:": "یک کلیپ نمونه برای اجرای استنتاج انتخاب کنید:",
   "Loading…": "در حال بارگذاری…",
   "connecting": "در حال اتصال",
+  "⌨ No keyboard? Type with the mouse": "صفحه‌کلید ندارید؟ با ماوس تایپ کنید",
+  "Typing into: {field}": "نوشتن در: {field}",
   "connected": "متصل",
   "error": "خطا",
   "closed ({code})": "بسته شد ({code})",
+  "reconnecting… ({code})": "در حال اتصال مجدد… ({code})",
+  "No picture from the capture device — reopening it.": "تصویری از دستگاه دریافت نمی‌شود — در حال باز کردن دوباره.",
   "Polyp detected": "پولیپ شناسایی شد",
   "Stop": "توقف",
   "Hide": "پنهان کردن",
@@ -93,6 +141,10 @@ export const FA: Record<string, string> = {
   "Analysed": "تحلیل‌شده",
   "— of which server": "— سهم سرور",
   "— of which network": "— سهم شبکه",
+  "Uplink (measured)": "اتصال خروجی (اندازه‌گیری‌شده)",
+  "{mbps} Mbps": "{mbps} مگابیت بر ثانیه",
+  "Slow uplink measured — a slow start, or an uploading recording lagging behind, is likely why.":
+    "اتصال خروجی کند اندازه‌گیری شد — به احتمال زیاد دلیل شروع کند یا تأخیر بارگذاری ضبط، همین است.",
   "Frames scaled to {width}px before sending · one frame in flight at a time · ~{rtt}ms round trip ({server}ms of it server-side)": "فریم‌ها پیش از ارسال به عرض {width} پیکسل تغییر اندازه می‌یابند · در هر لحظه فقط یک فریم در حال ارسال است · رفت‌وبرگشت حدود {rtt} میلی‌ثانیه ({server} میلی‌ثانیه آن در سرور)",
   "Error": "خطا",
   "Plays continuously — right panel shows the last analyzed frame": "پخش پیوسته — پنل مقابل، آخرین فریم تحلیل‌شده را نشان می‌دهد",
@@ -152,6 +204,8 @@ export const FA: Record<string, string> = {
   "Select capture region": "انتخاب ناحیه تصویربرداری",
   "Reset (use full frame)": "بازنشانی (استفاده از کل فریم)",
   "Saved on this server": "ذخیره‌شده روی این سرور",
+  // Source picker: one group per clinic day rather than one flat list.
+  "Clinic · {day} ({n})": "درمانگاه · {day} ({n})",
   "Replaying recording: {name}": "پخش مجدد ضبط: {name}",
   "← Stop replay": "→ توقف پخش مجدد",
   "Crop to the picture area": "برش به ناحیه تصویر",
@@ -167,6 +221,20 @@ export const FA: Record<string, string> = {
   "← Disconnect screen share": "→ قطع اشتراک‌گذاری صفحه",
   "Drag a rectangle around just the video area, then release.": "یک مستطیل فقط دور ناحیه ویدیو بکشید و سپس رها کنید.",
   "Cancel": "انصراف",
+  "Already open somewhere else": "در جایی دیگر در حال حاضر باز است",
+  "This case is already being scanned from another tab, device, or the clinic PC. Starting a second one means two detectors sharing the same uplink.":
+    "این مورد هم‌اکنون از تب، دستگاه یا رایانه دیگری در حال اسکن است. شروع یک جلسه دوم یعنی دو آشکارساز خروجی یکسانی را با هم به اشتراک می‌گذارند.",
+  "Opened by {user}": "باز شده توسط {user}",
+  "Opened by an unknown operator": "باز شده توسط اپراتور نامشخص",
+  "{age} · {engine}": "{age} · {engine}",
+  "This will end {user}'s live procedure right now. Are you sure?":
+    "این کار پروسیجر زنده {user} را همین الان پایان می‌دهد. مطمئن هستید؟",
+  "Yes, stop it": "بله، متوقف شود",
+  "Stopping…": "در حال توقف…",
+  "Stop this session": "توقف این نشست",
+  "Continue anyway": "به هر حال ادامه بده",
+  "{n}s ago": "{n} ثانیه پیش",
+  "{n}m ago": "{n} دقیقه پیش",
   "Frames scaled to {width}px before sending · one frame in flight at a time · ~{avgMs}ms round trip per frame": "فریم‌ها پیش از ارسال به عرض {width} پیکسل تغییر اندازه می‌یابند · در هر لحظه فقط یک فریم در حال ارسال است · رفت‌وبرگشت هر فریم حدود {avgMs} میلی‌ثانیه",
   "Frames with polyp: {n} / {total}": "فریم‌های دارای پولیپ: {n} / {total}",
   "Detection rate: {rate}%": "نرخ تشخیص: {rate}%",
@@ -338,6 +406,9 @@ export const FA: Record<string, string> = {
   "{n} pieces uploaded so far": "{n} بخش تاکنون بارگذاری شده",
   "⏳ Waiting — the link is busy with a live procedure right now. Upload will resume the moment it's free.":
     "⏳ در انتظار — اتصال در حال حاضر مشغول یک پروسیجر زنده است. بارگذاری به محض آزاد شدن ادامه می‌یابد.",
+  "⏳ Waiting — the link is busy with a live procedure right now. {n} saved pieces will resume uploading the moment it's free.":
+    "⏳ در انتظار — اتصال در حال حاضر مشغول یک پروسیجر زنده است. {n} بخش ذخیره‌شده به محض آزاد شدن اتصال، بارگذاری خود را از سر می‌گیرند.",
+  "{n} pieces saved, not yet sent": "{n} بخش ذخیره شده، هنوز ارسال نشده",
   "Only detections at or above this score are boxed and filed.":
     "فقط مواردی که امتیازشان از این حد بیشتر باشد کادر می‌گیرند و ثبت می‌شوند.",
   "⏹ Stop auto-capture": "⏹ توقف ثبت خودکار",
@@ -391,6 +462,9 @@ export const FA: Record<string, string> = {
   "Recorded in this session": "ضبط‌شده در این نشست",
   "Saved recordings": "ضبط‌های ذخیره‌شده",
   "All recordings on this server": "همهٔ ضبط‌های این سرور",
+  "{day} · {n} recordings": "{day} · {n} ضبط",
+  "Hide the pieces that were stitched together": "پنهان‌کردن قطعه‌هایی که به هم دوخته شده‌اند",
+  "Also show {n} pieces that were stitched together": "نمایش {n} قطعهٔ به‌هم‌دوخته‌شده",
   "Play back sessions recorded on this server": "پخش نشست‌هایی که روی این سرور ضبط شده‌اند",
   "🔒 Sign in to watch recorded sessions.": "🔒 برای تماشای نشست‌های ضبط‌شده وارد شوید.",
   "Refresh": "به‌روزرسانی",
@@ -507,8 +581,8 @@ export const FA: Record<string, string> = {
   "Confidence": "آستانه اطمینان",
   "False frames per clean study": "فریم نادرست در هر مطالعه سالم",
   "Clean studies alerted": "مطالعات سالم دارای هشدار",
-  "Real-time colonoscopy polyp detection · YOLOv5m · 77% of studies found on our own archive":
-    "تشخیص بلادرنگ پولیپ در کولونوسکوپی · YOLOv5m · شناسایی ۷۷٪ مطالعات در آرشیو ما",
+  "Real-time colonoscopy polyp detection · RT-DETR (TRUE-Colon) · fewest false alarms on our own archive":
+    "تشخیص بلادرنگ پولیپ در کولونوسکوپی · RT-DETR (TRUE-Colon) · کمترین هشدار کاذب در آرشیو ما",
   "YOLOv5m · 320px · border cropped": "YOLOv5m · ۳۲۰ پیکسل · با برش حاشیه",
   "YOLOv5m · 320px · no crop": "YOLOv5m · ۳۲۰ پیکسل · بدون برش",
   "YOLOv5m · 640px": "YOLOv5m · ۶۴۰ پیکسل",
@@ -619,4 +693,73 @@ export const FA: Record<string, string> = {
     "مدل آموزش‌دیده روی ۶ دیتاست، در اندازه استقرار، با برش — ترکیبی که پیش‌تر هرگز اندازه‌گیری نشده بود.",
   "Trained on a pooled 6-dataset corpus. Best ranking of anything tried, and by far the quietest on noise.":
     "آموزش‌دیده روی مجموعه‌ای از ۶ دیتاست. بهترین رتبه‌بندی میان همه موارد آزموده‌شده و به‌مراتب کم‌هشدارترین روی نویز.",
+  // --- Recording quality selector (RecordingControls) ---
+  "Recording quality": "کیفیت ضبط",
+  "Standard — ~{mb} MB/min": "معمولی — حدود {mb} مگابایت در دقیقه",
+  "High — ~{mb} MB/min": "بالا — حدود {mb} مگابایت در دقیقه",
+  "Maximum — ~{mb} MB/min": "حداکثر — حدود {mb} مگابایت در دقیقه",
+  "Quality changes take effect when the next recording starts.": "تغییر کیفیت از شروع ضبط بعدی اعمال می‌شود.",
+
+  // --- Recording bitrate slider ---
+  "{mbps} Mbps · ~{mb} MB/min": "{mbps} مگابیت بر ثانیه · حدود {mb} مگابایت در دقیقه",
+  "1.2 = the old setting · 8 = the clinic's own still-image quality · above 12 mostly stores noise.": "۱٫۲ = تنظیم قبلی · ۸ = کیفیت تصاویر ثابت خود کلینیک · بالاتر از ۱۲ بیشتر نویز ذخیره می‌کند.",
+
+  // --- Live picture controls (enhancement + proc-amp) ---
+  "Picture settings": "تنظیمات تصویر",
+  " · enhancement on": " · بهبود روشن",
+  "Deinterlace": "اصلاح درهم‌بافی",
+  "Automatic (motion-adaptive)": "خودکار (تطبیقی با حرکت)",
+  "Bob (discard a field)": "باب (حذف یک فیلد)",
+  "Off (show the raw signal)": "خاموش (نمایش سیگنال خام)",
+  "Denoise": "کاهش نویز",
+  "Sharpen": "وضوح لبه‌ها",
+  "Correct to 4:3 (SD pixels are not square)": "اصلاح نسبت به ۴:۳ (پیکسل‌های SD مربعی نیستند)",
+  "From the capture card itself — these change the signal every part of the app receives.": "از خودِ کارت تصویربرداری — این‌ها سیگنالی را که همه بخش‌های برنامه دریافت می‌کنند تغییر می‌دهند.",
+  "Picture settings change what you see, not what is analysed or recorded.": "تنظیمات تصویر فقط آنچه می‌بینید را تغییر می‌دهد، نه آنچه تحلیل یا ضبط می‌شود.",
+  "brightness": "روشنایی",
+  "contrast": "کنتراست",
+  "saturation": "اشباع رنگ",
+  "sharpness": "تیزی",
+
+  // --- Engineering tools row (home page) ---
+  "Tools": "ابزارها",
+  "🩺 Capture-card diagnostic": "🩺 عیب‌یابی کارت تصویربرداری",
+  "🎛 Capture simulator": "🎛 شبیه‌ساز کارت تصویربرداری",
+
+  // --- Tool cards (home page) ---
+  "Measure this computer & capture card": "سنجش این رایانه و کارت تصویربرداری",
+  "Runs a 2-minute test and files the result. Needs the card plugged in.": "یک آزمون دو دقیقه‌ای اجرا و نتیجه را بایگانی می‌کند. کارت باید متصل باشد.",
+  "Tune picture & recording quality": "تنظیم کیفیت تصویر و ضبط",
+  "Replays a saved video or the live card to compare settings side by side.": "یک ویدیوی ذخیره‌شده یا تصویر زندهٔ کارت را پخش می‌کند تا تنظیم‌ها را کنار هم مقایسه کنید.",
+
+  // --- Deinterlacer menu + enhancement watchdog ---
+  "Motion-adaptive (default)": "تطبیقی با حرکت (پیش‌فرض)",
+  "Bwdif-style (best quality)": "سبک Bwdif (بهترین کیفیت)",
+  "Yadif-style": "سبک Yadif",
+  "Blend fields": "ترکیب دو فیلد",
+  "Off (raw signal)": "خاموش (سیگنال خام)",
+  "Turn enhancement off": "خاموش کردن بهبود تصویر",
+  "Enhancement switched off — it was too slow on this computer.": "بهبود تصویر خاموش شد — روی این رایانه بیش از حد کند بود.",
+
+  // --- Proc-amp auto-tune ---
+  "Auto-tune": "تنظیم خودکار",
+  "Tuning the capture card…": "در حال تنظیم کارت تصویربرداری…",
+  "Tuned automatically when the card is connected. Adjust only if you want to.": "هنگام اتصال کارت به‌طور خودکار تنظیم می‌شود. فقط در صورت تمایل تغییر دهید.",
+
+  "Motion-adaptive (original)": "تطبیقی با حرکت (نسخهٔ اولیه)",
+
+  // --- The review timeline: a spot per captured frame, and playing from one ---
+  "Click to play from that moment": "برای پخش از آن لحظه کلیک کنید",
+  "{at} · {conf}%": "{at} · {conf}٪",
+  "▶ Play from here": "▶ پخش از اینجا",
+  "Play from a few seconds before this frame, forward to now": "از چند ثانیه پیش از این فریم تا همین حالا پخش می‌کند",
+  "Latest detection": "آخرین تشخیص",
+  "No video is held for that moment — only the captured frame.": "برای آن لحظه ویدیویی نگه داشته نشده — فقط فریم ثبت‌شده.",
+  "One frame back": "یک فریم به عقب",
+  "One frame forward": "یک فریم به جلو",
+  "← Back to the captured frame": "← بازگشت به فریم ثبت‌شده",
+  "Caught up to the live view.": "به نمای زنده رسید.",
+  "Following the live view": "در حال دنبال کردن نمای زنده",
+  "· live": "· زنده",
+
 };

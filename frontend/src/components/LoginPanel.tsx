@@ -20,7 +20,8 @@
  *                replaced, so we ask here rather than sending them elsewhere.
  */
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import OnScreenKeyboard from "@/components/OnScreenKeyboard";
 import { useAuth } from "@/lib/auth";
 import { useLanguage } from "@/lib/i18n";
 
@@ -36,7 +37,8 @@ export default function LoginPanel({
   standalone?: boolean;
 }) {
   const { t } = useLanguage();
-  const { login, register, setNewPassword, registrationOpen, inviteRequired } = useAuth();
+  const { login, register, setNewPassword, registrationOpen, inviteRequired,
+          kioskSignin, kioskLogin } = useAuth();
   const [step, setStep] = useState<"credentials" | "newPassword">("credentials");
   const [tab, setTab] = useState<"login" | "register">("login");
   const [username, setUsername] = useState("");
@@ -47,6 +49,41 @@ export default function LoginPanel({
   const [newPw2, setNewPw2] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+
+  /**
+   * Clickable keyboard, for a machine that has a mouse and nothing else.
+   *
+   * The clinic PC is exactly that, and the kiosk browser keeps its own fresh
+   * profile -- so the first thing it ever shows is a login form, with no way
+   * to fill it in. Shown there automatically; everywhere else it is a button,
+   * because a visitor with no keyboard has no other way to ask for one.
+   *
+   * It types by calling the focused field's own setter rather than faking
+   * input events on the DOM node, which is what usually breaks with React's
+   * controlled inputs.
+   */
+  type Field = "username" | "password" | "password2" | "invite";
+  const [kbField, setKbField] = useState<Field>("username");
+  const [kbOpen, setKbOpen] = useState(false);
+  useEffect(() => {
+    try { if (localStorage.getItem("polyp_kiosk") === "1") setKbOpen(true); } catch { /* ignore */ }
+  }, []);
+
+  const SETTERS: Record<Field, (fn: (v: string) => string) => void> = {
+    username:  (fn) => setUsername(fn),
+    password:  (fn) => setPassword(fn),
+    password2: (fn) => setPassword2(fn),
+    invite:    (fn) => setInvite(fn),
+  };
+  const FIELD_LABELS: Record<Field, string> = {
+    username:  t("Username"),
+    password:  t("Password"),
+    password2: t("Repeat password"),
+    invite:    t("Invite code"),
+  };
+  const kbType  = (ch: string) => SETTERS[kbField]((v) => v + ch);
+  const kbBack  = ()           => SETTERS[kbField]((v) => v.slice(0, -1));
+  const kbClear = ()           => SETTERS[kbField](() => "");
 
   const registering = tab === "register";
 
@@ -232,12 +269,33 @@ export default function LoginPanel({
         </div>
       )}
 
+      {/* The emergency door, and only while the server is holding it open.
+          One button because that is all the clinic PC can manage: it has a
+          mouse and no keyboard, and its launcher reloads the page every few
+          seconds, so anything needing several clicks never completes. */}
+      {kioskSignin && (
+        <button
+          type="button"
+          disabled={busy}
+          onClick={async () => {
+            setBusy(true); setError("");
+            try { await kioskLogin(); onSignedIn?.(); }
+            catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+            finally { setBusy(false); }
+          }}
+          className="w-full mb-4 py-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-lg font-semibold transition-colors"
+        >
+          {busy ? t("Please wait…") : t("Sign in as {user} (clinic PC)", { user: kioskSignin })}
+        </button>
+      )}
+
       <form onSubmit={submit} className="space-y-3">
         <input
           className={field}
           name="username"
           value={username}
           onChange={(e) => setUsername(e.target.value)}
+          onFocus={() => setKbField("username")}
           placeholder={t("Username")}
           autoComplete="username"
           autoFocus
@@ -248,6 +306,7 @@ export default function LoginPanel({
           type="password"
           value={password}
           onChange={(e) => setPassword(e.target.value)}
+          onFocus={() => setKbField("password")}
           placeholder={t("Password")}
           autoComplete={registering ? "new-password" : "current-password"}
         />
@@ -258,6 +317,7 @@ export default function LoginPanel({
             type="password"
             value={password2}
             onChange={(e) => setPassword2(e.target.value)}
+            onFocus={() => setKbField("password2")}
             placeholder={t("Repeat password")}
             autoComplete="new-password"
           />
@@ -268,6 +328,7 @@ export default function LoginPanel({
             name="invite"
             value={invite}
             onChange={(e) => setInvite(e.target.value)}
+            onFocus={() => setKbField("invite")}
             placeholder={t("Invite code")}
           />
         )}
@@ -280,6 +341,24 @@ export default function LoginPanel({
           {busy ? t("Please wait…") : registering ? t("Create account") : t("Sign in")}
         </button>
       </form>
+
+      {kbOpen ? (
+        <OnScreenKeyboard
+          label={t("Typing into: {field}", { field: FIELD_LABELS[kbField] })}
+          onKey={kbType}
+          onBackspace={kbBack}
+          onClear={kbClear}
+          onClose={() => setKbOpen(false)}
+        />
+      ) : (
+        <button
+          type="button"
+          onClick={() => setKbOpen(true)}
+          className="mt-3 w-full text-sm px-3 py-2 rounded-lg border border-gray-700 text-gray-400 hover:text-gray-200 hover:border-gray-500 transition-colors"
+        >
+          {t("⌨ No keyboard? Type with the mouse")}
+        </button>
+      )}
 
       {errorBox}
 

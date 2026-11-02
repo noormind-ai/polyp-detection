@@ -4,6 +4,45 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useLanguage } from "@/lib/i18n";
 import { features, explain } from "@/lib/inBody";
 import ScoreChips from "./ScoreChips";
+import SessionTimeline, { type Spot, type SpotState } from "./SessionTimeline";
+import ReplaySurface from "./ReplaySurface";
+import type { RingFrame } from "@/lib/frameRing";
+
+/** Everything the live player has to lend this panel for the timeline to
+ *  exist: how long the procedure is, how far back there is video for, where a
+ *  given capture sits on that axis, and the frames themselves.
+ *
+ *  Optional, and absent on purpose for the spectator page and the standalone
+ *  feedback mode -- neither has a frame store, so neither gets a bar. They keep
+ *  the thumbnail strips instead. */
+export interface TimelineSource {
+  totalMs: number;
+  /** Oldest moment with video. Spots before it still open their still frame. */
+  playableFromMs: number;
+  atMsOf: (e: { filename: string; timestamp: string }) => number | null;
+  getFrames: () => RingFrame[];
+}
+
+function parseBoxes(raw?: string): Box[] {
+  if (!raw) return [];
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) ? (v as Box[]) : [];
+  } catch { return []; }
+}
+
+function bestConf(e: Entry): number {
+  let best = 0;
+  for (const b of parseBoxes(e.ai_detections)) if (b.conf > best) best = b.conf;
+  return best;
+}
+
+function spotState(e: Entry): SpotState {
+  if (e.status === "dr_found") return "dr";
+  if (e.status === "pending") return "pending";
+  if (e.status === "confirmed") return "confirmed";
+  return "rejected";
+}
 
 const API = process.env.NEXT_PUBLIC_API_URL || "";
 
@@ -78,7 +117,11 @@ const byNewest = (a: Entry, b: Entry) => Number(b.timestamp || 0) - Number(a.tim
 // A newly-arrived capture takes over the open card. Both lanes already did that
 // separately, so merging does not introduce it -- and the strip above keeps the
 // older ones one click away.
-export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: string; refreshSignal?: number }) {
+export default function FeedbackPanel({ caseId, refreshSignal, timeline }: {
+  caseId: string;
+  refreshSignal?: number;
+  timeline?: TimelineSource;
+}) {
   const { t } = useLanguage();
   const [pending, setPending] = useState<Entry[]>([]);
   const [drFound, setDrFound] = useState<Entry[]>([]);
@@ -240,6 +283,7 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
   return (
     <Lane
       title={laneTitle}
+      timeline={timeline}
       activeEntries={activeEntries}
       current={current}
       onOpen={(e) => setCurrentKey(e.filename)}
@@ -320,9 +364,10 @@ export default function FeedbackPanel({ caseId, refreshSignal }: { caseId: strin
 // One self-contained lane: bar of active thumbnails, its own review card
 // (with its own box-editing state), and a reviewed-history bar underneath.
 function Lane({
-  title, activeEntries, current, onOpen, onDelete, onSkip, renderActions, reviewedTitle, reviewedEntries, onOpenReviewed,
+  title, timeline, activeEntries, current, onOpen, onDelete, onSkip, renderActions, reviewedTitle, reviewedEntries, onOpenReviewed,
 }: {
   title: React.ReactNode;
+  timeline?: TimelineSource;
   activeEntries: Entry[];
   current: Entry | null;
   onOpen: (e: Entry) => void;
@@ -334,21 +379,51 @@ function Lane({
   onOpenReviewed: (e: Entry) => void;
 }) {
   const { t } = useLanguage();
+
+  // Every capture, as a spot on the procedure's own timeline. This is what
+  // replaces the thumbnail strips below when a timeline is available: a spot
+  // says WHEN, which is the question actually being asked in the room.
+  const all = [...activeEntries, ...reviewedEntries];
+  const spots: Spot[] = timeline
+    ? all.flatMap((e) => {
+        const atMs = timeline.atMsOf(e);
+        return atMs === null ? [] : [{ id: e.filename, atMs, state: spotState(e), conf: bestConf(e) }];
+      })
+    : [];
+  const selectSpot = (id: string) => {
+    const hit = activeEntries.find((e) => e.filename === id);
+    if (hit) { onOpen(hit); return; }
+    const old = reviewedEntries.find((e) => e.filename === id);
+    if (old) onOpenReviewed(old);
+  };
+
   return (
     <div className="space-y-3 bg-gray-900/50 border border-gray-800 rounded-xl p-3">
       <div className="text-sm text-gray-300 font-medium">{title}</div>
 
       {current ? (
-        <ReviewCard entry={current} onSkip={() => onSkip(current)} renderActions={renderActions} />
+        <ReviewCard
+          entry={current}
+          onSkip={() => onSkip(current)}
+          renderActions={renderActions}
+          timeline={timeline}
+          spots={spots}
+          onSelectSpot={selectSpot}
+        />
       ) : (
         <p className="text-sm text-gray-500 text-center py-6">{t("✓ All caught up")}</p>
       )}
 
-      <div className="border-t border-gray-800 pt-3">
-        <Bar title={t("Queue")} entries={activeEntries} emptyText={t("Nothing yet.")} currentFilename={current?.filename ?? null} onOpen={onOpen} onDelete={onDelete} />
-      </div>
+      {/* The strips are what the spots replace. Kept for the views that have no
+          timeline to replace them with -- the spectator page and the
+          standalone feedback mode, neither of which holds any frames. */}
+      {!timeline && (
+        <div className="border-t border-gray-800 pt-3">
+          <Bar title={t("Queue")} entries={activeEntries} emptyText={t("Nothing yet.")} currentFilename={current?.filename ?? null} onOpen={onOpen} onDelete={onDelete} />
+        </div>
+      )}
 
-      {reviewedEntries.length > 0 && (
+      {!timeline && reviewedEntries.length > 0 && (
         <div className="border-t border-gray-800 pt-3 space-y-2">
           <Bar title={reviewedTitle} entries={reviewedEntries} emptyText="" currentFilename={current?.filename ?? null} onOpen={onOpenReviewed} onDelete={onDelete} />
         </div>
@@ -359,12 +434,24 @@ function Lane({
 
 // The image + editable box + action buttons for whichever entry is current in
 // its lane. Owns its own box-editing state so the two lanes never interfere.
-function ReviewCard({ entry, onSkip, renderActions }: {
+function ReviewCard({ entry, onSkip, renderActions, timeline, spots, onSelectSpot }: {
   entry: Entry;
   onSkip: () => void;
   renderActions: (entry: Entry, box: UserBox | null, corrected: boolean) => React.ReactNode;
+  timeline?: TimelineSource;
+  spots: Spot[];
+  onSelectSpot: (id: string) => void;
 }) {
   const { t } = useLanguage();
+  // Null means the captured still is showing -- which is the frame the review
+  // buttons below apply to. A number means motion is playing from that moment.
+  const [playFromMs, setPlayFromMs] = useState<number | null>(null);
+  const [playheadMs, setPlayheadMs] = useState<number | null>(null);
+  const selfAtMs = timeline ? timeline.atMsOf(entry) : null;
+  // A newly arrived capture takes over this card. Drop out of motion when it
+  // does: the buttons underneath would now refer to a different frame than the
+  // one on screen, which is how someone confirms the wrong thing.
+  useEffect(() => { setPlayFromMs(null); setPlayheadMs(null); }, [entry.filename]);
   const [box, setBox] = useState<UserBox | null>(null);
   const [dragMode, setDragMode] = useState<"move" | "draw" | null>(null);
   const [dragStart, setDragStart] = useState<[number, number] | null>(null);
@@ -430,23 +517,34 @@ function ReviewCard({ entry, onSkip, renderActions }: {
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between gap-2">
-        {entry.review_clip_status === "ready" ? (
-          <video
-            src={`${API}/api/feedback/${entry.case_id}/clip/${entry.filename}`}
-            controls muted playsInline
-            title={t("A few seconds of the session recording around this capture")}
-            className="h-14 w-24 rounded-lg border border-gray-800 bg-black object-cover"
-          />
-        ) : offsetLabel(entry) ? (
-          <span className="text-xs text-gray-500 font-mono" title={t("Position in the session recording")}>
-            🎞 {offsetLabel(entry)}
-          </span>
-        ) : <span />}
+        <div className="flex items-center gap-2 min-w-0">
+          {/* Review happens inside the full session recording now, not in a
+              separate cut-out: "Play from here" below opens the recording at
+              this frame's own offset. The server no longer cuts the little
+              per-capture clips (see routes/recordings.py), and recordings are
+              remuxed with a real duration and cue index, so seeking straight
+              to the moment works instead of needing a whole-file scan. */}
+          {offsetLabel(entry) ? (
+            <span className="text-xs text-gray-500 font-mono" title={t("Position in the session recording")}>
+              🎞 {offsetLabel(entry)}
+            </span>
+          ) : <span />}
+        </div>
         <button onClick={onSkip} className="text-xs text-gray-500 hover:text-gray-300 transition-colors">{t("Skip → next")}</button>
       </div>
 
-      {/* Fills the lane, no width cap — the captured frame has the same ratio as
-          the live video, so at equal column widths it renders at the same size. */}
+      {/* One media box, two states. Motion and the captured still share it
+          rather than sitting in separate panels -- the still IS a moment on the
+          bar below, so splitting them into two surfaces made one thing look
+          like two. */}
+      {playFromMs !== null && timeline ? (
+        <ReplaySurface
+          getFrames={timeline.getFrames}
+          startAtMs={playFromMs}
+          onPos={setPlayheadMs}
+          onExit={() => { setPlayFromMs(null); setPlayheadMs(null); }}
+        />
+      ) : (
       <div className="relative w-full rounded-xl overflow-hidden border border-gray-800 bg-black">
         <img
           src={`${API}/api/feedback/${entry.case_id}/image/${entry.filename}`}
@@ -477,9 +575,27 @@ function ReviewCard({ entry, onSkip, renderActions }: {
         {imgNatural.w > 0 && aiBoxes.map((b, i) => {
           const [x1, y1, x2, y2] = b.bbox;
           const scaleX = 100 / imgNatural.w, scaleY = 100 / imgNatural.h;
+          // The model's confidence on this box, in the same neon-green badge the
+          // live view burns in (lib/drawBoxes.ts) -- so a reviewer reads the same
+          // number, in the same place, that the room saw during the procedure.
+          // It was always stored (ai_detections carries conf per box); only the
+          // panel never drew it, so a reviewer was judging a box with no idea
+          // whether the model was at 32% or 95% on it.
+          //
+          // Sits above the box, and flips to inside the top edge when the box is
+          // too close to the top of the frame for the badge to fit -- a polyp at
+          // the very top of the picture is common, and a label clipped off the
+          // image is the same as no label.
+          const labelInside = y1 * scaleY < 7;
           return (
             <div key={i} className="absolute border-2 border-[#39ff14] pointer-events-none"
-              style={{ left: `${x1 * scaleX}%`, top: `${y1 * scaleY}%`, width: `${(x2 - x1) * scaleX}%`, height: `${(y2 - y1) * scaleY}%` }} />
+              style={{ left: `${x1 * scaleX}%`, top: `${y1 * scaleY}%`, width: `${(x2 - x1) * scaleX}%`, height: `${(y2 - y1) * scaleY}%` }}>
+              <span
+                className="absolute left-0 bg-[#39ff14] text-black font-mono font-bold text-[11px] leading-none px-1 py-0.5 whitespace-nowrap"
+                style={labelInside ? { top: 0 } : { bottom: "100%" }}>
+                {t("polyp  {conf}%", { conf: Math.round(b.conf * 100) })}
+              </span>
+            </div>
           );
         })}
         {rounded && imgNatural.w > 0 && (() => {
@@ -491,6 +607,48 @@ function ReviewCard({ entry, onSkip, renderActions }: {
           );
         })()}
       </div>
+      )}
+
+      {timeline && (
+        <div className="space-y-1.5">
+          <SessionTimeline
+            totalMs={timeline.totalMs}
+            playableFromMs={timeline.playableFromMs}
+            spots={spots}
+            selectedId={entry.filename}
+            playheadMs={playFromMs !== null ? playheadMs : selfAtMs}
+            onSelectSpot={(id) => { setPlayFromMs(null); setPlayheadMs(null); onSelectSpot(id); }}
+            onSeek={(atMs) => setPlayFromMs(atMs)}
+          />
+          {playFromMs === null && (
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <button
+                onClick={() => selfAtMs !== null && setPlayFromMs(Math.max(0, selfAtMs - 3000))}
+                disabled={selfAtMs === null}
+                title={t("Play from a few seconds before this frame, forward to now")}
+                className={`px-2.5 py-1 rounded-md font-medium transition-colors ${
+                  selfAtMs === null
+                    ? "bg-gray-800 text-gray-600 cursor-not-allowed"
+                    : "bg-blue-600 hover:bg-blue-500 text-white"
+                }`}
+              >
+                {t("▶ Play from here")}
+              </button>
+              {spots.length > 1 && (
+                <button
+                  onClick={() => {
+                    const newest = spots.reduce((a, b) => (b.atMs > a.atMs ? b : a));
+                    onSelectSpot(newest.id);
+                  }}
+                  className="px-2.5 py-1 rounded-md border border-gray-800 text-gray-400 hover:text-gray-200 hover:border-gray-600 transition-colors"
+                >
+                  {t("Latest detection")}
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {gateScore && (
         <ScoreChips

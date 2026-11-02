@@ -39,18 +39,37 @@ export const LEVELS = [
 export type TLevelKey = (typeof LEVELS)[number]["key"];
 export const DEFAULT_LEVEL: TLevelKey = "gentle";
 
-// Off: every detection shown immediately, no persistence check.
+// Off: every detection shown immediately, no persistence check. THE DEFAULT
+//   since 2026-10-11 -- see DEFAULT_MODE below and ADR 0005.
 // Heuristic: this file's own IoU-matching gate (the class below) -- self
 //   authored, no motion model, unvalidated against labels (see file header).
-// Bytetrack: trusts the `persistent` flag the real, vendored ByteTrack
-//   computes server-side (backend/services/tracker.py) -- a real MOT library,
-//   but with its low-confidence recovery pass currently inert at this app's
-//   serving threshold (see that file's docstring).
-// Both real mechanisms are offered side by side, deliberately, rather than
-// picking one -- see the plan discussion for why.
+// Bytetrack: trusted the `persistent` flag the vendored ByteTrack computed
+//   server-side. NO LONGER OFFERED -- the server stopped running the tracker
+//   on 2026-10-11 (ADR 0005), so nothing sets `persistent` any more and
+//   selecting this would filter every box away. A UI switch that silently
+//   blinds the detector is worse than no switch, so it is off the picker.
+//   The value stays in the type so the code path and the saved-preference
+//   handling still compile; re-offering it means reverting that ADR.
 export const MODES = ["off", "heuristic", "bytetrack"] as const;
 export type Mode = (typeof MODES)[number];
-export const DEFAULT_MODE: Mode = "heuristic";
+/** The modes actually offered in the UI -- see the note on MODES. */
+export const SELECTABLE_MODES: readonly Mode[] = ["off", "heuristic"];
+// OFF by default as of 2026-10-11, a clinical call by the user, pending evidence.
+// The gate suppresses any lesion the model does not fire on twice within three
+// consecutive inferred frames -- and since tier 2 filing is fed post-gate boxes
+// (LiveCameraPlayer.tsx), whatever it suppresses is never filed, never reviewed
+// and cannot appear in the feedback manifest. Its cost in missed polyps is
+// therefore unmeasurable from production data by construction, while the lesion
+// the doctor did not see is the whole point of the product. Until a replay of
+// the saved clinic recordings says what 2-of-3 actually costs, the default
+// suppresses nothing. Still selectable per operator.
+//
+// Note also that `of` counts FRAMES, not time, so this gate's clinical meaning
+// drifts with inference rate: 3 frames was ~0.75 s when the box was CPU-only
+// (~5 infer/s) and is ~50 ms now that RT-DETR runs on the GPU at 17 ms/frame.
+// It was never re-tuned for that, and the "~4 inferences/second" figure in this
+// file header is pre-GPU and stale.
+export const DEFAULT_MODE: Mode = "off";
 
 // Two boxes count as the same lesion above this overlap. Deliberately loose:
 // between frames the scope moves, so the same polyp can shift a long way, and

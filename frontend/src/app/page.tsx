@@ -11,6 +11,7 @@ import ReviewCallout from "@/components/ReviewCallout";
 import ModelPerformance from "@/components/ModelPerformance";
 import { useAuth } from "@/lib/auth";
 import { useLanguage } from "@/lib/i18n";
+import { measureNetwork } from "@/lib/clinicDiagnostic";
 
 /** Where the whole-file upload flow is in its own little lifecycle. */
 type UploadStage = "idle" | "processing" | "done";
@@ -36,6 +37,16 @@ interface GtData {
   frames: { bbox: [number, number, number, number] }[][];
 }
 
+/** A live-camera room some other tab/device/clinic PC already has open --
+ *  see GET /api/sessions/active. `user` is unset only for sessions opened
+ *  before this field existed; the UI just shows those as unattributed. */
+interface ActiveRoom {
+  case_id: string;
+  started_at: number;
+  engine: string;
+  user: string | null;
+}
+
 /** A CPU model the server has actually deployed. `polyp_trained` is false for
  *  the stock COCO nano models, which are carried only to measure CPU speed. */
 interface CpuModel {
@@ -43,6 +54,10 @@ interface CpuModel {
   label: string;
   polyp_trained: boolean;
   conf?: number;
+  // Capture width this model consumes (320 or 640), from the server registry.
+  // The players size their inference canvas from it so the model never sees
+  // upscaled pixels. Absent on an older server -> players default to 320.
+  imgsz?: number;
   backend: string;
   // True when this model's onnx session is bound to CUDAExecutionProvider on
   // this box, not just present. A GPU joined noormind-iran 2026-09-27 -- only
@@ -116,17 +131,53 @@ const API = process.env.NEXT_PUBLIC_API_URL || "";
 // response, so the timer only counts down once streaming has actually stopped.
 const MODAL_IDLE_MS = 2 * 60 * 1000;
 
+/**
+ * Kiosk mode — the clinic PC.
+ *
+ * That machine is switched on in the morning, shows this app on a screen in
+ * the procedure room, and has nobody whose job it is to click through it. With
+ * this flag set the page goes straight into Live Camera and the player opens
+ * the capture card itself (LiveCameraPlayer's `autoStart`): power on, picture,
+ * nothing else to do.
+ *
+ * Set once per machine by visiting /?kiosk=1 and cleared with /?kiosk=0. Kept
+ * in localStorage rather than being a server or account setting because it is
+ * a property of THAT computer: the same login opened on a laptop should still
+ * land on the mode picker like everyone else's.
+ */
+const KIOSK_KEY = "polyp_kiosk";
+
 /** The modes that need an account: the one that spends GPU on a video the user
  *  supplied, and the one that plays back patient video held on this server. */
 const NEEDS_ACCOUNT: Mode[] = ["upload", "recordings"];
 /** The modes that need a warm GPU container before they can do anything. */
 const NEEDS_GPU: Mode[] = ["simulation", "camera", "screen"];
+// A quick upload-speed reading at session start, so a slow start has a
+// number attached to it instead of just a feeling. Far smaller than the
+// clinic-test diagnostic's own probe (measureNetwork's default) -- this
+// runs on every session, before the operator can begin scanning, so it
+// has to stay a one-to-two-second cost on even a very slow uplink.
+const UPLINK_PROBE_BYTES = 256 * 1024;
 
 export default function Home() {
   const { t, lang, toggleLang } = useLanguage();
   const { user, loading: authLoading, logout, reviewer, spectator } = useAuth();
 
   const [mode, setMode] = useState<Mode | null>(null);
+
+  const [kiosk, setKiosk] = useState(false);
+  // Auto-opens once per page load and no more: backing out of Live Camera has
+  // to leave the operator on the mode picker, not bounce them straight back in.
+  const kioskOpenedRef = useRef(false);
+
+  useEffect(() => {
+    try {
+      const q = new URLSearchParams(window.location.search).get("kiosk");
+      if (q === "1") localStorage.setItem(KIOSK_KEY, "1");
+      else if (q === "0") localStorage.removeItem(KIOSK_KEY);
+      setKiosk(localStorage.getItem(KIOSK_KEY) === "1");
+    } catch { /* private mode: kiosk simply stays off */ }
+  }, []);
 
   // RecordingControls sits several levels down inside the players; an event is
   // less invasive than threading a callback through every one of them.
@@ -135,6 +186,22 @@ export default function Home() {
     window.addEventListener("polyp:signin", open);
     return () => window.removeEventListener("polyp:signin", open);
   }, []);
+
+  // Whole app behind the login, matching the server (every inference, feedback
+  // and recording endpoint now requires a session). The one-shot guard is the
+  // same precaution /login already takes: if the session is refused on arrival
+  // for any reason, a plain redirect here would bounce the two pages forever.
+  useEffect(() => {
+    if (authLoading || user) return;
+    try {
+      if (sessionStorage.getItem("polyp_home_bounce")) return;
+      sessionStorage.setItem("polyp_home_bounce", "1");
+    } catch { /* private mode: accept the small risk of one extra hop */ }
+    window.location.replace("/login?next=/");
+  }, [authLoading, user]);
+  useEffect(() => {
+    if (user) { try { sessionStorage.removeItem("polyp_home_bounce"); } catch { /* ignore */ } }
+  }, [user]);
   const [gpu, setGpu] = useState<GpuState>("off");
   const [uploadStage, setUploadStage] = useState<UploadStage>("idle");
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
@@ -143,6 +210,17 @@ export default function Home() {
   const [showGt, setShowGt] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [caseId, setCaseId] = useState<string | null>(null);
+  // Measured once per session/start (see openMode) -- shown next to the
+  // live latency readout, and carried in LiveCameraPlayer's own room-stats
+  // report so it lands in the server's netstat log too.
+  const [uplinkMbps, setUplinkMbps] = useState<number | null>(null);
+  // Other rooms found open at session start (see openMode) -- non-null
+  // shows the conflict dialog. stoppingCaseId/confirmStopOther track one
+  // row's own in-progress stop and, when it belongs to a different
+  // operator, the extra confirm before ending someone else's procedure.
+  const [sessionConflicts, setSessionConflicts] = useState<ActiveRoom[] | null>(null);
+  const [stoppingCaseId, setStoppingCaseId] = useState<string | null>(null);
+  const [confirmStopOther, setConfirmStopOther] = useState<ActiveRoom | null>(null);
   const [backends, setBackends] = useState<BackendInfo | null>(null);
   // Empty until /api/backends answers, and empty means "whatever this
   // deployment serves" — the server reads INFERENCE_BACKEND. It used to start
@@ -154,15 +232,21 @@ export default function Home() {
 
   const markActive = useCallback(() => { lastActiveRef.current = Date.now(); }, []);
 
+  // The model the engine picker currently points at -- carries the per-model
+  // capture width (imgsz) and serving threshold (conf) from /api/backends.
+  const selectedModel = backends?.cpu_models?.find((m) => m.backend === backend);
+
   // A case ID for filing feedback captures under. Deliberately its own endpoint
   // rather than session/start: every mode files feedback, including the
   // precomputed demos, and those must never wake a GPU.
-  useEffect(() => {
+  const newCase = useCallback(() => {
     fetch(`${API}/api/case/new`, { method: "POST", credentials: "include" })
       .then((r) => r.json())
       .then((d) => setCaseId(d.case_id ?? null))
       .catch(() => { /* feedback capture degrades on its own if this fails */ });
   }, []);
+
+  useEffect(() => { newCase(); }, [newCase]);
 
   // Ask the server which engines it can actually serve, so the UI never offers
   // a choice that will fail. Read-only and starts nothing.
@@ -175,6 +259,17 @@ export default function Home() {
       })
       .catch(() => { /* picker just stays on the Modal default */ });
   }, []);
+
+  // Kiosk: open Live Camera without being asked to. Waits for /api/backends so
+  // the session starts on the engine this deployment actually serves, and so
+  // the player is handed that model's capture width and threshold, rather than
+  // on whatever an empty `backend` resolves to.
+  useEffect(() => {
+    if (!kiosk || authLoading || !user || !backends || mode !== null) return;
+    if (kioskOpenedRef.current) return;
+    kioskOpenedRef.current = true;
+    void openMode("camera");
+  }, [kiosk, authLoading, user, backends, mode]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   const stopGpu = useCallback(async () => {
     setGpu("off");
@@ -224,6 +319,38 @@ export default function Home() {
       }
       const data = await res.json();
       if (data.case_id) setCaseId(data.case_id);
+      setUplinkMbps(null);
+      try {
+        const net = await measureNetwork(UPLINK_PROBE_BYTES);
+        const upload = net.upload as { mbps?: number } | undefined;
+        if (typeof upload?.mbps === "number") setUplinkMbps(upload.mbps);
+      } catch {
+        // Best-effort -- a failed probe must never block starting the session.
+      }
+
+      // Someone else (another tab, device, or the clinic PC left running)
+      // may already have this case -- or any case -- open. Surfaced as a
+      // blocking dialog rather than just a warning, since starting a
+      // second live socket means two detectors competing for the same
+      // uplink, which is the exact problem this session start just paid
+      // to measure. Best-effort: a failed check must not block a normal
+      // start, so it fails open.
+      try {
+        const activeRes = await fetch(`${API}/api/sessions/active`, { credentials: "include" });
+        if (activeRes.ok) {
+          const activeData = await activeRes.json();
+          const others: ActiveRoom[] = (activeData.rooms ?? []).filter(
+            (r: ActiveRoom) => r.case_id !== data.case_id,
+          );
+          if (others.length > 0) {
+            setSessionConflicts(others);
+            markActive();
+            return; // The dialog decides when (or whether) gpu becomes "ready".
+          }
+        }
+      } catch {
+        // Best-effort -- see above.
+      }
       markActive();
       setGpu("ready");
     } catch (err: unknown) {
@@ -247,6 +374,70 @@ export default function Home() {
     setVideoUrl(null);
     setGroundTruth(null);
     setShowGt(false);
+  }
+
+  function roomAge(startedAt: number): string {
+    const secs = Math.max(0, Math.round(Date.now() / 1000 - startedAt));
+    return secs < 60
+      ? t("{n}s ago", { n: secs })
+      : t("{n}m ago", { n: Math.round(secs / 60) });
+  }
+
+  /** The conflict dialog is clear (either nothing was found, or every row
+   *  the operator stopped has actually gone) -- let the session everyone
+   *  was already waiting on become ready. */
+  function proceedPastConflicts() {
+    setSessionConflicts(null);
+    markActive();
+    setGpu("ready");
+  }
+
+  /** Operator chose not to touch the other session(s) at all -- back out of
+   *  the session this openMode() call just started, same as any other
+   *  openMode failure. */
+  async function cancelPastConflicts() {
+    setSessionConflicts(null);
+    await stopGpu();
+    setMode(null);
+  }
+
+  /** Ends a room running in some OTHER tab/device -- see
+   *  POST /api/sessions/{case_id}/stop. Ending a different operator's
+   *  session needs a second confirm first (see confirmStopOther); ending
+   *  one's own leftover tab does not. */
+  async function stopOtherSession(room: ActiveRoom) {
+    if (room.user && room.user !== user && confirmStopOther?.case_id !== room.case_id) {
+      setConfirmStopOther(room);
+      return;
+    }
+    setConfirmStopOther(null);
+    setStoppingCaseId(room.case_id);
+    try {
+      await fetch(`${API}/api/sessions/${encodeURIComponent(room.case_id)}/stop`, {
+        method: "POST", credentials: "include",
+      });
+    } catch {
+      // Best-effort -- the poll below just keeps showing the row if this failed.
+    }
+    // The websocket loop only notices a stop request between frames (or
+    // every STOP_POLL_INTERVAL_S while idle out-of-body), so this is not
+    // instant -- poll briefly rather than assuming the single POST above
+    // was enough.
+    for (let i = 0; i < 10; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      try {
+        const res = await fetch(`${API}/api/sessions/active`, { credentials: "include" });
+        if (res.ok) {
+          const resData = await res.json();
+          const stillThere = (resData.rooms ?? []).some((r: ActiveRoom) => r.case_id === room.case_id);
+          if (!stillThere) break;
+        }
+      } catch { /* keep polling */ }
+    }
+    setStoppingCaseId(null);
+    const next = (sessionConflicts ?? []).filter((r) => r.case_id !== room.case_id);
+    if (next.length === 0) proceedPastConflicts();
+    else setSessionConflicts(next);
   }
 
   async function handleUpload(file: File, gtUrl?: string) {
@@ -344,7 +535,7 @@ export default function Home() {
         <div>
           <h1 className="text-xl sm:text-2xl font-semibold mb-1">{t("Polyp Detection AI")}</h1>
           <p className="text-gray-500 text-sm">
-            {t("Real-time colonoscopy polyp detection · YOLOv5m · 77% of studies found on our own archive")}
+            {t("Real-time colonoscopy polyp detection · RT-DETR (TRUE-Colon) · fewest false alarms on our own archive")}
           </p>
         </div>
         <div className="flex gap-2 flex-shrink-0 flex-wrap justify-start sm:justify-end items-center">
@@ -513,6 +704,44 @@ export default function Home() {
             </a>
           </div>
 
+          {/* Engineering tools. Signed-in only -- both routes bounce to
+              /login, and a card that can only disappoint is worse than no
+              card. A quiet row rather than cards: these are for us, not for
+              the clinic's workflow. */}
+          {user && (
+            <div className="space-y-2">
+              <span className="text-xs text-gray-600">{t("Tools")}</span>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <a href="/clinic-test"
+                   className="flex items-start gap-3 px-3 py-2.5 rounded-lg border border-gray-800
+                              hover:border-gray-600 transition-colors group">
+                  <span className="text-xl flex-shrink-0">🩺</span>
+                  <span className="min-w-0">
+                    <span className="block text-sm text-gray-300 group-hover:text-white">
+                      {t("Measure this computer & capture card")}
+                    </span>
+                    <span className="block text-xs text-gray-600">
+                      {t("Runs a 2-minute test and files the result. Needs the card plugged in.")}
+                    </span>
+                  </span>
+                </a>
+                <a href="/sim"
+                   className="flex items-start gap-3 px-3 py-2.5 rounded-lg border border-gray-800
+                              hover:border-gray-600 transition-colors group">
+                  <span className="text-xl flex-shrink-0">🎛</span>
+                  <span className="min-w-0">
+                    <span className="block text-sm text-gray-300 group-hover:text-white">
+                      {t("Tune picture & recording quality")}
+                    </span>
+                    <span className="block text-xs text-gray-600">
+                      {t("Replays a saved video or the live card to compare settings side by side.")}
+                    </span>
+                  </span>
+                </a>
+              </div>
+            </div>
+          )}
+
           {/* Playback of sessions already recorded to this server. Deliberately
               its own row rather than a fifth card: it starts nothing and
               analyses nothing, it just opens the archive. */}
@@ -566,15 +795,21 @@ export default function Home() {
                   an experiment run on a separate code path measures that path,
                   not the one that runs in clinic. */}
               {mode === "simulation" && (
-                <LiveCameraPlayer caseId={caseId ?? "no-case"} onStop={closeMode} onActivity={markActive} initialMode="demo" backend={backend} />
+                <LiveCameraPlayer caseId={caseId ?? "no-case"} onStop={closeMode} onActivity={markActive} initialMode="demo" backend={backend} inferWidth={selectedModel?.imgsz} initialConf={selectedModel?.conf} />
               )}
 
+              {/* onCaseEnd is kiosk-only on purpose. The page there is never
+                  reloaded, so without it a whole clinic day of patients would
+                  be filed under the single case id minted on boot. An operator
+                  working the page by hand already gets a fresh case each time
+                  they open a mode, and rotating under them would silently
+                  change the spectator link they had just shared. */}
               {mode === "camera" && (
-                <LiveCameraPlayer caseId={caseId ?? "no-case"} onStop={closeMode} onActivity={markActive} backend={backend} />
+                <LiveCameraPlayer caseId={caseId ?? "no-case"} onStop={closeMode} onActivity={markActive} backend={backend} inferWidth={selectedModel?.imgsz} initialConf={selectedModel?.conf} autoStart={kiosk} onCaseEnd={kiosk ? newCase : undefined} uplinkMbps={uplinkMbps} />
               )}
 
               {mode === "screen" && (
-                <LiveCameraPlayer caseId={caseId ?? "no-case"} onStop={closeMode} onActivity={markActive} initialMode="screen" backend={backend} />
+                <LiveCameraPlayer caseId={caseId ?? "no-case"} onStop={closeMode} onActivity={markActive} initialMode="screen" backend={backend} inferWidth={selectedModel?.imgsz} initialConf={selectedModel?.conf} uplinkMbps={uplinkMbps} />
               )}
 
               {mode === "recordings" && <RecordingsPanel title={t("All recordings on this server")} />}
@@ -679,6 +914,74 @@ export default function Home() {
       {error && (
         <div className="mt-4 bg-red-950 border border-red-800 rounded-lg px-4 py-3 text-red-300 text-sm font-mono">
           {error}
+        </div>
+      )}
+
+      {sessionConflicts && (
+        <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
+          <div className="w-full max-w-md rounded-xl border border-gray-700 bg-gray-900 p-5 space-y-3">
+            <h3 className="text-base font-semibold text-white">
+              {t("Already open somewhere else")}
+            </h3>
+            <p className="text-sm text-gray-300">
+              {t("This case is already being scanned from another tab, device, or the clinic PC. Starting a second one means two detectors sharing the same uplink.")}
+            </p>
+            <div className="space-y-2">
+              {sessionConflicts.map((room) => (
+                <div key={room.case_id} className="rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 space-y-1">
+                  <p className="text-sm text-white">
+                    {room.user ? t("Opened by {user}", { user: room.user }) : t("Opened by an unknown operator")}
+                  </p>
+                  <p className="text-xs text-gray-400">
+                    {t("{age} \u00b7 {engine}", { age: roomAge(room.started_at), engine: room.engine })}
+                  </p>
+                  {confirmStopOther?.case_id === room.case_id ? (
+                    <div className="pt-1 space-y-2">
+                      <p className="text-xs text-amber-400">
+                        {t("This will end {user}'s live procedure right now. Are you sure?", { user: room.user ?? "" })}
+                      </p>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => void stopOtherSession(room)}
+                          className="flex-1 px-3 py-1.5 bg-red-700 hover:bg-red-600 rounded-lg text-white text-xs font-medium transition-colors"
+                        >
+                          {t("Yes, stop it")}
+                        </button>
+                        <button
+                          onClick={() => setConfirmStopOther(null)}
+                          className="flex-1 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded-lg text-white text-xs font-medium transition-colors"
+                        >
+                          {t("Cancel")}
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => void stopOtherSession(room)}
+                      disabled={stoppingCaseId === room.case_id}
+                      className="mt-1 w-full px-3 py-1.5 bg-red-700 hover:bg-red-600 disabled:opacity-60 rounded-lg text-white text-xs font-medium transition-colors"
+                    >
+                      {stoppingCaseId === room.case_id ? t("Stopping\u2026") : t("Stop this session")}
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+            <div className="flex gap-2 pt-1">
+              <button
+                onClick={proceedPastConflicts}
+                className="flex-1 px-3 py-2 bg-sky-600 hover:bg-sky-500 rounded-lg text-white text-sm font-medium transition-colors"
+              >
+                {t("Continue anyway")}
+              </button>
+              <button
+                onClick={() => void cancelPastConflicts()}
+                className="flex-1 px-3 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-white text-sm font-medium transition-colors"
+              >
+                {t("Cancel")}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </main>

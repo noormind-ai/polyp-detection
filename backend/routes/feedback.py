@@ -27,15 +27,17 @@ frontend has one available. The model's own detections for that exact frame
 are kept separately as metadata (`ai_detections`), and a user-drawn/adjusted
 box is kept separately too (`bbox_*`).
 
-Storage: backend/data/feedback/cases/{case_id}/images/*.{jpg,webm} + a
-single manifest.csv (with a case_id column, so a "review everything" view
-can aggregate across cases). Not committed to git (`data/` is gitignored).
+Storage: the frames stay on disk at
+backend/data/feedback/cases/{case_id}/images/*.{jpg,webm}; everything known
+ABOUT them lives in SQLite at backend/data/feedback/feedback.db (see
+backend/db.py for the schema and for why it is no longer a CSV). Neither is
+committed to git (`data/` is gitignored). backend/scripts/export_manifest.py
+regenerates the old manifest.csv from the database for the offline analysis
+scripts that still read it.
 """
 
-import csv
 import asyncio
 import json
-import threading
 import logging
 import re
 import time
@@ -46,7 +48,8 @@ from typing import Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
-from backend.routes.auth import current_user
+from backend import db
+from backend.routes.auth import current_user, require_user
 
 log = logging.getLogger("feedback")
 
@@ -76,6 +79,11 @@ MANIFEST_FIELDS = [
     # was signed in. Not enforced: these actions still work signed out, so
     # this is best-effort attribution, not an audit guarantee.
     "reviewed_by",
+    # "first" or "best" -- which of an appearance's two auto-captures this row
+    # is (see maybeAutoCapture in the players). "" on rows written before
+    # 2026-10-11, when a single "best" capture per appearance was all there was,
+    # and on manual doctor-found captures, which are neither.
+    "capture_kind",
 ]
 STATUSES = {"pending", "confirmed", "false_positive", "dr_found"}
 NOTICED_FIRST = {"dr", "ai", ""}
@@ -95,31 +103,89 @@ def _case_dir(case_id: str) -> Path:
     return d
 
 
-def _read_manifest() -> list[dict]:
-    if not MANIFEST_PATH.exists():
-        return []
-    with MANIFEST_PATH.open("r", newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+def _images_dir(case_id: str) -> Path:
+    """Where a case's frames are, WITHOUT creating anything.
+
+    _case_dir() mkdir()s, which is right on the capture path and wrong on the
+    read path: a 404 image request used to create an empty case directory as a
+    side effect, which is how 242 case dirs came to exist for 200 cases that
+    actually have captures.
+    """
+    _check_id(case_id, "case_id")
+    return CASES_DIR / case_id / "images"
 
 
-def _write_manifest(rows: list[dict]) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with MANIFEST_PATH.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=MANIFEST_FIELDS)
-        writer.writeheader()
-        writer.writerows(rows)
+def _num(v) -> str:
+    """A stored number as the CSV would have written it.
+
+    Integral floats render without the ".0": the browser sends box coordinates
+    as JSON integers, json.loads made them ints, and csv wrote "146". Coming
+    back out of a REAL column they are 146.0, and str() would say "146.0" --
+    a different string for the same number, which is exactly the kind of drift
+    the baseline diff is there to catch.
+    """
+    if v is None:
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
 
 
-_MANIFEST_LOCK = threading.Lock()
+def _tri(v) -> str:
+    """A nullable boolean as the CSV wrote it: "", "True" or "False"."""
+    return "" if v is None else ("True" if v else "False")
 
-_ROW_DEFAULTS = {
-    "case_id": "", "filename": "", "has_video": False, "timestamp": 0,
-    "source": "auto", "status": "pending", "noticed_first": "",
-    "bbox_x1": "", "bbox_y1": "", "bbox_x2": "", "bbox_y2": "",
-    "ai_detections": "", "box_corrected": "",
-    "recording_id": "", "video_offset_ms": "", "review_clip_status": "",
-    "morphology": "", "reviewed_by": "",
-}
+
+def _row_to_api(r) -> dict:
+    """Render a captures row in the exact shape the CSV-backed API emitted.
+
+    Every value the manifest ever produced was a string, because it came out of
+    csv.DictReader. The frontend's Entry interface types all of these as
+    `string` and does its own parsing -- Number(timestamp), JSON.parse on
+    ai_detections, truthiness checks against "" for the optional ones. Emitting
+    real ints and nulls here would be tidier and would quietly break all of it.
+    The storage is typed; the wire format stays bug-compatible, which is what
+    lets this migration ship without touching the frontend.
+
+    Key order matches MANIFEST_FIELDS because that is the order csv.DictReader
+    yielded and therefore the order the JSON has always had.
+    """
+    return {
+        "case_id": r["case_id"],
+        "filename": r["filename"],
+        "has_video": "True" if r["has_video"] else "False",
+        "timestamp": str(r["timestamp"]),
+        "source": r["source"],
+        "status": r["status"],
+        "noticed_first": r["noticed_first"],
+        "bbox_x1": _num(r["bbox_x1"]),
+        "bbox_y1": _num(r["bbox_y1"]),
+        "bbox_x2": _num(r["bbox_x2"]),
+        "bbox_y2": _num(r["bbox_y2"]),
+        "ai_detections": r["ai_detections"],
+        "box_corrected": _tri(r["box_corrected"]),
+        "recording_id": r["recording_id"],
+        "video_offset_ms": _num(r["video_offset_ms"]),
+        "review_clip_status": r["review_clip_status"],
+        "morphology": r["morphology"],
+        "reviewed_by": r["reviewed_by"],
+        "capture_kind": r["capture_kind"],
+    }
+
+
+# Columns that are numeric and nullable. The capture handlers pass "" for
+# "not set" because that is what a form field with nothing in it sends, and ""
+# is not a number.
+_NULLABLE_NUM = ("bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2", "video_offset_ms")
+
+
+def _blank_to_none(extra: dict) -> dict:
+    out = dict(extra)
+    for k in _NULLABLE_NUM:
+        if out.get(k) == "":
+            out[k] = None
+    return out
+
 
 CLIPS_DIRNAME = "clips"
 
@@ -133,81 +199,60 @@ def _clip_path(case_id: str, filename_base: str) -> Path:
 
 
 def clip_output_path(case_id: str, filename: str) -> Path:
-    """Where review_clips.py should write the clip for a given manifest row's
+    """Where review_clips.py should write the clip for a given capture's
     `filename` (its image name, e.g. "170...abcd1234.jpg"). Public wrapper
     around _clip_path so recordings.py doesn't reach into a private name."""
     return _clip_path(case_id, filename.rsplit(".", 1)[0])
 
 
 def list_pending_clip_sources(recording_id: str) -> list[dict]:
-    """Manifest rows that reference this recording and don't have a ready
-    clip yet. Used once a recording finishes uploading to generate review
-    clips for every capture that was filed against it while it was live."""
-    return [
-        r for r in _read_manifest()
-        if r.get("recording_id") == recording_id
-        and r.get("video_offset_ms")
-        and r.get("review_clip_status") != "ready"
-    ]
+    """Captures that reference this recording and don't have a ready clip yet.
+    Used once a recording finishes uploading to generate review clips for every
+    capture filed against it while it was live.
+
+    Shape is unchanged from the CSV version, so recordings.py needs no edit."""
+    con = db.connect()
+    try:
+        rows = con.execute(
+            "SELECT * FROM captures WHERE recording_id = ? AND video_offset_ms"
+            " IS NOT NULL AND review_clip_status != 'ready'", (recording_id,)).fetchall()
+    finally:
+        con.close()
+    return [_row_to_api(r) for r in rows]
 
 
 def set_review_clip_status(case_id: str, filename: str, status: str) -> None:
-    with _MANIFEST_LOCK:
-        rows = _read_manifest()
-        for r in rows:
-            if r["case_id"] == case_id and r["filename"] == filename:
-                r["review_clip_status"] = status
-                _write_manifest(rows)
-                return
+    con = db.connect()
+    try:
+        con.execute("UPDATE captures SET review_clip_status = ? WHERE case_id = ?"
+                    " AND filename = ?", (status, case_id, filename))
+    finally:
+        con.close()
 
 
-def _append_manifest(row: dict) -> None:
-    """Append one row. The old path read the whole manifest and rewrote it on
-    every capture, which is O(rows) per detection during a live procedure and
-    grows for the length of the deployment. Only edits (review/delete) need the
-    read-modify-write; a new capture does not."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with _MANIFEST_LOCK:
-        _migrate_header_locked()
-        fresh = not MANIFEST_PATH.exists()
-        with MANIFEST_PATH.open("a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=MANIFEST_FIELDS)
-            if fresh:
-                writer.writeheader()
-            writer.writerow(row)
-
-
-def _migrate_header_locked() -> None:
-    """Bring an older manifest up to the current columns. Call with the lock
-    held. Appending a row with more fields than the file's header would leave
-    every later column shifted, so this has to happen before the first append,
-    not on some future maintenance run."""
-    if not MANIFEST_PATH.exists():
-        return
-    with MANIFEST_PATH.open("r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        if reader.fieldnames == MANIFEST_FIELDS:
-            return
-        rows = list(reader)
-    log.info("manifest: migrating header to %d columns", len(MANIFEST_FIELDS))
-    with MANIFEST_PATH.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=MANIFEST_FIELDS, restval="",
-                                extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
+def _insert_capture(row: dict) -> None:
+    cols = [c for c in MANIFEST_FIELDS if c in row]
+    con = db.connect()
+    try:
+        con.execute(
+            "INSERT INTO captures (%s, created_at) VALUES (%s, ?)"
+            % (", ".join(cols), ", ".join("?" * len(cols))),
+            [row[c] for c in cols] + [time.time()])
+    finally:
+        con.close()
 
 
 def _save_and_record(case_id: str, image: bytes, video: Optional[bytes],
                      extra: dict) -> str:
-    """Write the frame, the clip and the manifest row. Blocking on purpose —
+    """Write the frame, the clip and the database row. Blocking on purpose —
     callers hand it to a worker thread. Doing this inline on the event loop
     froze the inference websocket for the duration of the disk write, which is
     exactly the video stutter a clinician sees at the moment of capture."""
     filename, ts, has_video = _save_capture(case_id, image, video)
-    row = dict(_ROW_DEFAULTS)
-    row.update(case_id=case_id, filename=filename, has_video=has_video, timestamp=ts)
-    row.update(extra)
-    _append_manifest(row)
+    row = {"case_id": case_id, "filename": filename, "has_video": has_video,
+           "timestamp": ts}
+    row.update(_blank_to_none(extra))
+    _insert_capture(row)
     return filename
 
 
@@ -231,9 +276,14 @@ async def auto_capture(
     video: Optional[UploadFile] = File(default=None),
     recording_id: Optional[str] = Form(default=None),
     video_offset_ms: Optional[str] = Form(default=None),
+    capture_kind: Optional[str] = Form(default=None),
 ):
-    """Called automatically (client-side throttled) whenever the live model
-    detects something. Lands as "pending" for a nurse to triage later."""
+    """Called automatically whenever the live model detects something. Lands as
+    "pending" for a nurse to triage later.
+
+    An appearance files two of these: "first" the moment it is detected, and
+    "best" once the window closes. Anything else is recorded as "" rather than
+    rejected -- a capture is worth more than its label."""
     image_bytes = await file.read()
     if not image_bytes:
         raise HTTPException(status_code=400, detail="empty image")
@@ -241,7 +291,8 @@ async def auto_capture(
     filename = await asyncio.to_thread(
         _save_and_record, case_id, image_bytes, video_bytes,
         {"source": "auto", "status": "pending", "ai_detections": ai_detections,
-         "recording_id": recording_id or "", "video_offset_ms": video_offset_ms or ""},
+         "recording_id": recording_id or "", "video_offset_ms": video_offset_ms or "",
+         "capture_kind": capture_kind if capture_kind in ("first", "best") else ""},
     )
     return {"filename": filename}
 
@@ -284,18 +335,29 @@ async def dr_found_capture(
 
 
 @router.get("/feedback/queue")
-async def get_queue(case_id: Optional[str] = None):
+async def get_queue(case_id: Optional[str] = None, user: str = Depends(require_user)):
     """Pending auto-captures awaiting review, oldest first. Pass case_id to
     scope to one procedure, or omit for "Feedback mode" browsing across all."""
     # "dr_found" belongs here too. It was filed and then never surfaced: the
     # queue only listed "pending", so a doctor flagging something the model
     # missed saw the capture vanish — the one workflow this feature exists for.
-    rows = [r for r in _read_manifest() if r["status"] in ("pending", "dr_found")]
+    sql = ("SELECT * FROM captures WHERE status IN ('pending', 'dr_found')")
+    params: list = []
     if case_id:
         _check_id(case_id, "case_id")
-        rows = [r for r in rows if r["case_id"] == case_id]
-    rows.sort(key=lambda r: int(r.get("timestamp", 0)))
-    return rows
+        sql += " AND case_id = ?"
+        params.append(case_id)
+    con = db.connect()
+    try:
+        # case_id, filename break ties. SQL has no implicit stable order, so
+        # without them two captures sharing a timestamp -- which is common, the
+        # resolution is one second and an appearance files two rows -- can swap
+        # places between two requests for no reason.
+        rows = con.execute(sql + " ORDER BY timestamp, case_id, filename",
+                           params).fetchall()
+    finally:
+        con.close()
+    return [_row_to_api(r) for r in rows]
 
 
 @router.post("/feedback/{case_id}/{filename}/review")
@@ -323,23 +385,40 @@ async def review_capture(
         raise HTTPException(status_code=400, detail="noticed_first must be 'dr' or 'ai'")
     if morphology not in MORPHOLOGY:
         raise HTTPException(status_code=400, detail=f"morphology must be one of {sorted(MORPHOLOGY)}")
-    rows = _read_manifest()
-    for r in rows:
-        if r["case_id"] == case_id and r["filename"] == filename:
-            r["status"] = "confirmed" if correct else "false_positive"
-            r["noticed_first"] = noticed_first
-            r["box_corrected"] = box_corrected
-            r["morphology"] = morphology if correct else ""
-            r["reviewed_by"] = user or r.get("reviewed_by", "")
-            if bbox:
-                try:
-                    x1, y1, x2, y2 = json.loads(bbox)
-                    r["bbox_x1"], r["bbox_y1"], r["bbox_x2"], r["bbox_y2"] = x1, y1, x2, y2
-                except (ValueError, TypeError):
-                    raise HTTPException(status_code=400, detail="invalid bbox")
-            _write_manifest(rows)
-            return {"filename": filename, "status": r["status"]}
-    raise HTTPException(status_code=404, detail="not found")
+    box = None
+    if bbox:
+        try:
+            x1, y1, x2, y2 = json.loads(bbox)
+            box = (x1, y1, x2, y2)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="invalid bbox")
+
+    status = "confirmed" if correct else "false_positive"
+    sets = ["status = ?", "noticed_first = ?", "box_corrected = ?", "morphology = ?",
+            # COALESCE so signing out doesn't blank an existing attribution:
+            # reviewed_by is only overwritten when we actually know who it was.
+            "reviewed_by = COALESCE(NULLIF(?, ''), reviewed_by)"]
+    params: list = [status, noticed_first, int(box_corrected),
+                    morphology if correct else "", user or ""]
+    if box is not None:
+        sets += ["bbox_x1 = ?", "bbox_y1 = ?", "bbox_x2 = ?", "bbox_y2 = ?"]
+        params += list(box)
+
+    con = db.connect()
+    try:
+        with con:
+            cur = con.execute(
+                "UPDATE captures SET %s WHERE case_id = ? AND filename = ?"
+                % ", ".join(sets), params + [case_id, filename])
+            if not cur.rowcount:
+                raise HTTPException(status_code=404, detail="not found")
+            db.log_event(con, case_id, filename, "review", status=status,
+                         noticed_first=noticed_first,
+                         morphology=morphology if correct else "", bbox=bbox,
+                         box_corrected=box_corrected, reviewed_by=user or "")
+    finally:
+        con.close()
+    return {"filename": filename, "status": status}
 
 
 # What a frame IS, as opposed to whether its detection was right. Kept separate
@@ -365,38 +444,57 @@ async def label_capture(case_id: str, filename: str, label: str = Form(...),
     if label not in FRAME_LABELS:
         raise HTTPException(
             status_code=400, detail=f"label must be one of {sorted(FRAME_LABELS)}")
-    rows = _read_manifest()
-    for r in rows:
-        if r["case_id"] == case_id and r["filename"] == filename:
-            r["status"] = label
-            r["reviewed_by"] = user or r.get("reviewed_by", "")
-            _write_manifest(rows)
-            return {"filename": filename, "status": label}
-    raise HTTPException(status_code=404, detail="not found")
+    con = db.connect()
+    try:
+        with con:
+            cur = con.execute(
+                "UPDATE captures SET status = ?,"
+                " reviewed_by = COALESCE(NULLIF(?, ''), reviewed_by)"
+                " WHERE case_id = ? AND filename = ?",
+                (label, user or "", case_id, filename))
+            if not cur.rowcount:
+                raise HTTPException(status_code=404, detail="not found")
+            db.log_event(con, case_id, filename, "label", status=label,
+                         reviewed_by=user or "")
+    finally:
+        con.close()
+    return {"filename": filename, "status": label}
 
 
 @router.get("/feedback/list")
-async def list_captures(status: Optional[str] = None, case_id: Optional[str] = None):
+async def list_captures(status: Optional[str] = None, case_id: Optional[str] = None,
+                        user: str = Depends(require_user)):
     """Reviewed/submitted history — optionally filtered by status
     (confirmed | false_positive | dr_found) and/or case. Newest first.
     This is what "Feedback mode" browses when no case is selected."""
-    rows = _read_manifest()
+    params: list = []
     if status:
         if status not in STATUSES:
             raise HTTPException(status_code=400, detail=f"unknown status '{status}'")
-        rows = [r for r in rows if r["status"] == status]
+        sql = "SELECT * FROM captures WHERE status = ?"
+        params.append(status)
     else:
-        rows = [r for r in rows if r["status"] != "pending"]
+        sql = "SELECT * FROM captures WHERE status != 'pending'"
     if case_id:
         _check_id(case_id, "case_id")
-        rows = [r for r in rows if r["case_id"] == case_id]
-    rows.sort(key=lambda r: int(r.get("timestamp", 0)), reverse=True)
-    return rows
+        sql += " AND case_id = ?"
+        params.append(case_id)
+    con = db.connect()
+    try:
+        # case_id, filename break ties. SQL has no implicit stable order, so
+        # without them two captures sharing a timestamp -- which is common, the
+        # resolution is one second and an appearance files two rows -- can swap
+        # places between two requests for no reason.
+        rows = con.execute(sql + " ORDER BY timestamp DESC, case_id, filename",
+                           params).fetchall()
+    finally:
+        con.close()
+    return [_row_to_api(r) for r in rows]
 
 
 @router.get("/feedback/{case_id}/image/{filename}")
-async def get_image(case_id: str, filename: str):
-    images_dir = _case_dir(case_id)
+async def get_image(case_id: str, filename: str, user: str = Depends(require_user)):
+    images_dir = _images_dir(case_id)
     _check_id(filename.split(".")[0], "filename")
     path = images_dir / filename
     if not path.exists():
@@ -405,8 +503,8 @@ async def get_image(case_id: str, filename: str):
 
 
 @router.get("/feedback/{case_id}/video/{filename}")
-async def get_video(case_id: str, filename: str):
-    images_dir = _case_dir(case_id)
+async def get_video(case_id: str, filename: str, user: str = Depends(require_user)):
+    images_dir = _images_dir(case_id)
     base = filename.rsplit(".", 1)[0]
     _check_id(base, "filename")
     path = images_dir / f"{base}.webm"
@@ -416,7 +514,7 @@ async def get_video(case_id: str, filename: str):
 
 
 @router.get("/feedback/{case_id}/clip/{filename}")
-async def get_review_clip(case_id: str, filename: str):
+async def get_review_clip(case_id: str, filename: str, user: str = Depends(require_user)):
     """The server-cut short clip around this capture's moment in the full
     session recording (see review_clips.py), if one has been generated.
     404 until then -- the caller falls back to the plain-text offset label."""
@@ -428,16 +526,24 @@ async def get_review_clip(case_id: str, filename: str):
 
 
 @router.delete("/feedback/{case_id}/{filename}")
-async def delete_capture(case_id: str, filename: str):
+async def delete_capture(case_id: str, filename: str, user: str = Depends(require_user)):
     _check_id(case_id, "case_id")
     base = filename.rsplit(".", 1)[0]
     _check_id(base, "filename")
-    rows = _read_manifest()
-    new_rows = [r for r in rows if not (r["case_id"] == case_id and r["filename"] == filename)]
-    if len(new_rows) == len(rows):
-        raise HTTPException(status_code=404, detail="not found")
-    _write_manifest(new_rows)
-    images_dir = CASES_DIR / case_id / "images"
+    con = db.connect()
+    try:
+        with con:
+            cur = con.execute("DELETE FROM captures WHERE case_id = ? AND filename = ?",
+                              (case_id, filename))
+            if not cur.rowcount:
+                raise HTTPException(status_code=404, detail="not found")
+            # review_events deliberately keeps its rows for a deleted capture:
+            # that a frame was reviewed and then removed is exactly the sort of
+            # thing you want still on record afterwards.
+            db.log_event(con, case_id, filename, "delete", reviewed_by=user or "")
+    finally:
+        con.close()
+    images_dir = _images_dir(case_id)
     (images_dir / filename).unlink(missing_ok=True)
     (images_dir / f"{base}.webm").unlink(missing_ok=True)
     _clip_path(case_id, base).unlink(missing_ok=True)
@@ -445,20 +551,28 @@ async def delete_capture(case_id: str, filename: str):
 
 
 @router.patch("/feedback/{case_id}/{filename}")
-async def update_capture(case_id: str, filename: str, bbox: Optional[str] = Form(default=None)):
+async def update_capture(case_id: str, filename: str, bbox: Optional[str] = Form(default=None),
+                         user: str = Depends(require_user)):
     """Edit (or clear) a reviewed capture's bounding box after the fact."""
     _check_id(case_id, "case_id")
-    rows = _read_manifest()
-    for r in rows:
-        if r["case_id"] == case_id and r["filename"] == filename:
-            if bbox:
-                try:
-                    x1, y1, x2, y2 = json.loads(bbox)
-                    r["bbox_x1"], r["bbox_y1"], r["bbox_x2"], r["bbox_y2"] = x1, y1, x2, y2
-                except (ValueError, TypeError):
-                    raise HTTPException(status_code=400, detail="invalid bbox")
-            else:
-                r["bbox_x1"] = r["bbox_y1"] = r["bbox_x2"] = r["bbox_y2"] = ""
-            _write_manifest(rows)
-            return {"updated": filename}
-    raise HTTPException(status_code=404, detail="not found")
+    if bbox:
+        try:
+            x1, y1, x2, y2 = json.loads(bbox)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="invalid bbox")
+    else:
+        x1 = y1 = x2 = y2 = None
+    con = db.connect()
+    try:
+        with con:
+            cur = con.execute(
+                "UPDATE captures SET bbox_x1 = ?, bbox_y1 = ?, bbox_x2 = ?, bbox_y2 = ?"
+                " WHERE case_id = ? AND filename = ?",
+                (x1, y1, x2, y2, case_id, filename))
+            if not cur.rowcount:
+                raise HTTPException(status_code=404, detail="not found")
+            db.log_event(con, case_id, filename, "bbox_edit", bbox=bbox,
+                         reviewed_by=user or "")
+    finally:
+        con.close()
+    return {"updated": filename}

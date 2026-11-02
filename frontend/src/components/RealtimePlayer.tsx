@@ -31,6 +31,22 @@ const INFER_TIMEOUT_MS = 6000;
 // data/precompute_demos.py encodes the saved demo results at this same width, so
 // replayed boxes land in the same coordinate space as live ones. Change both together.
 const INFER_WIDTH = 320;
+
+/** Fixed-320 view of a larger capture, for the gates whose thresholds were
+ *  fitted at 320px (lib/frameQuality resamples from the capture size, so
+ *  feeding it a 640 capture shifts its statistics; see useQualityGate). */
+function downscaleForGates(src: HTMLCanvasElement): HTMLCanvasElement {
+  const w = INFER_WIDTH;
+  const h = Math.max(1, Math.round((src.height * w) / src.width));
+  const c = document.createElement("canvas");
+  c.width = w;
+  c.height = h;
+  const ctx = c.getContext("2d")!;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(src, 0, 0, w, h);
+  return c;
+}
 // Frames measured at the start of a clip to find its picture area. See
 // lib/fov.ts — the union of several beats one, and the border does not move.
 const FOV_SAMPLE_FRAMES = 8;
@@ -56,7 +72,7 @@ const DETECTION_GAP_MS = 1000;
 // if you change one, change the other.
 //
 //   tier 1  box on screen   temporal gate, 2-of-3 (~0.5 s)   lib/temporal.ts
-//   tier 2  filed capture   FILE_MIN_MS + FILE_MIN_HITS
+//   tier 2  filed capture   first frame at once, then best of the window
 //   tier 3  audible alert   tier 1's bar exactly -- lib/useAlertSound.ts
 //
 // Tier 1's threshold is the operating point Holzwanger et al. (Endoscopy 2021)
@@ -114,8 +130,8 @@ interface PredData {
 }
 
 export default function RealtimePlayer({
-  caseId, onStop, onActivity, wsPath = "/api/ws/infer-file", backend, cpuOnly = false,
-}: { caseId: string; onStop: () => void; onActivity?: () => void; wsPath?: string; backend?: string; cpuOnly?: boolean }) {
+  caseId, onStop, onActivity, wsPath = "/api/ws/infer-file", backend, cpuOnly = false, inferWidth = INFER_WIDTH, initialConf = 0.30,
+}: { caseId: string; onStop: () => void; onActivity?: () => void; wsPath?: string; backend?: string; cpuOnly?: boolean; inferWidth?: number; initialConf?: number }) {
   const { user } = useAuth();
   const { t } = useLanguage();
   // Cheap colour gate in front of the detector: while the camera is outside the
@@ -178,7 +194,7 @@ export default function RealtimePlayer({
   // we are back to queueing POSTs against the same upstream the frame stream
   // uses; none at all and a capture that merely coincided with a busy uplink is
   // lost outright — which is a lesion the reviewer never sees.
-  const deferredRef = useRef<{ blob: Blob; boxes: Box[] } | null>(null);
+  const deferredRef = useRef<{ blob: Blob; boxes: Box[]; kind: "first" | "best" } | null>(null);
   // Tier 3. The controls live in the live player and the spectator view; here we
   // only consume the stored settings — mute and duration both — so a demo
   // behaves like the room it is demonstrating.
@@ -220,14 +236,16 @@ export default function RealtimePlayer({
   const [videoEnded, setVideoEnded]   = useState(false);
   const [aspect, setAspect]           = useState("560/480"); // replaced with the clip's real ratio on load
   // Confidence gate, client-side and live-adjustable. The server runs the model
-  // at its own low threshold (0.30) and reports every box with its score, so
+  // at its own per-model threshold and reports every box with its score, so
   // moving this mid-procedure costs nothing — no round trip, no restart, and it
   // applies to what is drawn and what is auto-captured alike. A scope that is
-  // noisy today can be tightened without redeploying anything.
-  const [confMin, setConfMin] = useState(0.30);
+  // noisy today can be tightened without redeploying anything. Starts at the
+  // selected model's own serving threshold: confidence scales differ per
+  // model -- the 640 export serves at 0.20 where the 320 serves at 0.30.
+  const [confMin, setConfMin] = useState(initialConf);
   // The capture loop closes over the render it started in and cannot see the
   // state above.
-  const confMinRef = useRef(0.30);
+  const confMinRef = useRef(initialConf);
   const [showDetected, setShowDetected] = useState(true);
   const [showLive, setShowLive]         = useState(true);
   const msHistory = useRef<number[]>([]);
@@ -594,6 +612,22 @@ export default function RealtimePlayer({
     episodeHitsRef.current += 1;
     considerBest(cap, hi, boxes);
 
+    // TWO captures per appearance, 2026-10-11 (ADR 0005):
+    //
+    //   "first" -- this frame, filed immediately, no bar to clear. Tier 3 beeps
+    //     on the first drawn box, so anything stricter here means the room
+    //     hears a sound with nothing behind it for a reviewer to look at. And a
+    //     lesion the model glimpsed only once is precisely the one most likely
+    //     to have been missed by eye, which is what this product is for.
+    //   "best"  -- below, unchanged: the clearest frame of the appearance
+    //     (frameScore: sharpness, confidence, apparent size), filed once
+    //     FILE_MIN_MS has passed or the appearance ends, whichever comes first,
+    //     then refreshed while the lesion stays on screen.
+    //
+    // FILE_MIN_HITS still guards "best" only, so a single-frame detection files
+    // exactly one image rather than the same frame twice.
+    if (episodeHitsRef.current === 1) flushBest(now, "first");
+
     const age = now - episodeStartRef.current;
 
     // Tier 2 — the capture. First filing waits for the window to close; after
@@ -614,15 +648,21 @@ export default function RealtimePlayer({
 
   /** Tier 2. Hand the best frame of this appearance to the uploader. Silent --
    *  tier 3 fires off the drawn box, not off filing. */
-  function flushBest(now: number) {
+  function flushBest(now: number, kind: "first" | "best" = "best") {
     const best = bestRef.current;
     const canvas = bestCanvasRef.current;
     if (!best || !canvas) return;
-    episodeFiledRef.current = true;
-    lastAutoCaptureRef.current = now;
     const boxes = best.boxes;
-    bestRef.current = null;  // a refresh picks a fresh best, not this one again
-    canvas.toBlob((blob) => { if (blob) sendCapture(blob, boxes); }, "image/jpeg", 0.82);
+    // "first" deliberately leaves the episode bookkeeping alone: the "best"
+    // capture still happens afterwards on its own schedule. Marking the episode
+    // filed here would push the best frame out to the refresh interval instead
+    // of FILE_MIN_MS, and clearing bestRef would stop it being scored at all.
+    if (kind === "best") {
+      episodeFiledRef.current = true;
+      lastAutoCaptureRef.current = now;
+      bestRef.current = null;  // a refresh picks a fresh best, not this one again
+    }
+    canvas.toBlob((blob) => { if (blob) sendCapture(blob, boxes, kind); }, "image/jpeg", 0.82);
   }
 
   /** One upload at a time, with a single holding slot behind it.
@@ -634,12 +674,14 @@ export default function RealtimePlayer({
    *  the PREVIOUS appearance's timestamp, so a lesion that came and went inside
    *  that window was never filed at all. Deferring instead of dropping means
    *  the bookkeeping above can be honest — the capture really will be sent. */
-  function sendCapture(blob: Blob, boxes: Box[]) {
-    if (uploadingRef.current) { deferredRef.current = { blob, boxes }; return; }
+  function sendCapture(blob: Blob, boxes: Box[], kind: "first" | "best") {
+    if (uploadingRef.current) { deferredRef.current = { blob, boxes, kind }; return; }
     uploadingRef.current = true;
     const fd = new FormData();
     fd.append("file", blob, "frame.jpg");
     fd.append("ai_detections", JSON.stringify(boxes));
+    // Which of an appearance's two captures this is -- see maybeAutoCapture.
+    fd.append("capture_kind", kind);
     // No clip: for a played file the position in that file is the whole
     // answer, and it costs nothing to send.
     const v = videoRef.current;
@@ -654,7 +696,7 @@ export default function RealtimePlayer({
         uploadingRef.current = false;
         const next = deferredRef.current;
         deferredRef.current = null;
-        if (next) sendCapture(next.blob, next.boxes);
+        if (next) sendCapture(next.blob, next.boxes, next.kind);
       }
     })();
   }
@@ -705,28 +747,36 @@ export default function RealtimePlayer({
       const { x: srcX, y: srcY, w: srcW, h: srcH } = sourceRect(video);
       setAspect(`${srcW}/${srcH}`);
 
-      const scale = INFER_WIDTH / srcW;
-      const capW  = INFER_WIDTH;
+      const scale = inferWidth / srcW;
+      const capW  = inferWidth;
       const capH  = Math.round(srcH * scale);
       const cap   = document.createElement("canvas");
       cap.width   = capW;
       cap.height  = capH;
-      // Not deinterlaced: the shrink to ~213 lines averages neighbouring lines
-      // and cancels the comb on its own. Measured clean (0.60-0.65) drawn
-      // straight. Full-size paths are handled properly -- see grabCapture.
+      // At 320 the shrink to ~213 lines averages neighbouring lines and
+      // cancels the comb on its own (measured clean, 0.60-0.65, drawn
+      // straight). A 640 capture keeps too many lines for that to work, so
+      // larger sizes go through the real motion-adaptive deinterlacer.
       const capCtx = cap.getContext("2d")!;
       capCtx.imageSmoothingEnabled = true;
       capCtx.imageSmoothingQuality = "high";
-      capCtx.drawImage(video, srcX, srcY, srcW, srcH, 0, 0, capW, capH);
+      if (capH * 2 >= srcH) {
+        drawDeinterlaced(video, srcX, srcY, srcW, srcH, cap, capW, capH);
+      } else {
+        capCtx.drawImage(video, srcX, srcY, srcW, srcH, 0, 0, capW, capH);
+      }
       // Grabbed now, from this same video frame, so a filed capture and the boxes
       // drawn on it describe the same instant. See grabCapture.
       const hi = grabCapture(video, srcX, srcY, srcW, srcH);
+      // The gates read a fixed-320 view so a larger model imgsz never moves
+      // their operating points (thresholds were fitted on 320px captures).
+      const gateCap = capW > INFER_WIDTH ? downscaleForGates(cap) : cap;
 
       // Out of body: no JPEG encode, no round trip, no inference. The panel keeps
       // showing the real frame with no boxes, so it stays obvious that the feed is
       // live and the detector is simply not being asked. Paced at roughly the
       // inference cadence rather than spinning a tight while loop.
-      if (!inBody.shouldInfer(cap)) {
+      if (!inBody.shouldInfer(gateCap)) {
         updateBoxes([]);
         drawAnalyzedFrame(cap, hi, []);
         // Let the appearance state machine see the quiet frame — see the else
@@ -741,7 +791,7 @@ export default function RealtimePlayer({
       // ON by default at level "medium" (useQualityGate.ts), which by the table
       // in lib/frameQuality also rejects ~3.5% of frames a doctor labelled as
       // containing a polyp. That is a real cost, paid before inference runs.
-      if (!quality.shouldInfer(cap)) {
+      if (!quality.shouldInfer(gateCap)) {
         updateBoxes([]);
         drawAnalyzedFrame(cap, hi, []);
         maybeAutoCapture([], null, null);
@@ -1000,7 +1050,6 @@ export default function RealtimePlayer({
               {wsStatusText}
             </span>
           )}
-          {polyp && <span className="text-[#39ff14] font-medium animate-pulse">{t("Polyp detected")}</span>}
         </div>
         <button onClick={onStop} className="text-sm text-red-400 hover:text-red-300 transition-colors">{t("Stop")}</button>
       </div>
@@ -1364,8 +1413,8 @@ export default function RealtimePlayer({
 
       <p className="text-xs text-gray-600">
         {replaying
-          ? t("Replaying detections computed once at {width}px — identical to a live run, without the GPU", { width: pred?.width ?? INFER_WIDTH })
-          : t("Frames scaled to {width}px before sending · one frame in flight at a time", { width: INFER_WIDTH })}
+          ? t("Replaying detections computed once at {width}px — identical to a live run, without the GPU", { width: pred?.width ?? inferWidth })
+          : t("Frames scaled to {width}px before sending · one frame in flight at a time", { width: inferWidth })}
       </p>
     </div>
   );

@@ -58,3 +58,9 @@ ongoing/
 # not versioned. Regenerate with the recipe in that ADR; it is served from
 # the box at /interlace/index.html.
 frontend/public/interlace/
+
+# stray in-place edit backups -- never meant for commit
+*.bak-*
+
+# third-party Sysinternals binary -- not vendored, fetch if ever needed again
+clinic-pc/Autologon*.exe

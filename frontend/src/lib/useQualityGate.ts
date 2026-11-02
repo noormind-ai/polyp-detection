@@ -5,13 +5,18 @@ import {
   frameQuality, isInformative, DEFAULTS, LEVELS, DEFAULT_LEVEL,
   type QualityMetrics, type Reason, type LevelKey,
 } from "./frameQuality";
+import { resetStoredGateChoices } from "./gateDefaults";
 
 const STORAGE_KEY = "polyp_quality_filter";
-// On by default at the user's request. At the `medium` level this rejects 3.5%
-// of frames a doctor called `polyp` in exchange for 20.4% of the ones a doctor
-// called `noisy`. That cost is real and lands on a detector that already has a
-// recall gap -- the level selector exists so it can be dialled back.
-const DEFAULT_ON = true;
+// OFF by default as of 2026-10-11, a clinical call by the user, pending evidence.
+// It was on at `medium`, which rejects 3.5% of frames a doctor called `polyp`
+// in exchange for 20.4% of the ones a doctor called `noisy`. Unlike the
+// temporal gate that cost is measured, and it is paid BEFORE inference runs --
+// a frame dropped here is not recoverable by any later tier. On a detector with
+// a known recall gap, aimed at the lesion the doctor missed, a 3.5% up-front
+// recall cut bought with noise cosmetics is the wrong trade. Both the switch
+// and the level selector remain, so it can be turned back on per operator.
+const DEFAULT_ON = false;
 const LEVEL_KEY = "polyp_quality_level";
 // Display-only smoothing. The skip decision is per frame -- exactly the bad
 // frames are dropped -- but a banner that blinks at inference rate is unreadable,
@@ -40,6 +45,8 @@ export interface QualityGateState {
 }
 
 export function useQualityGate(): QualityGateState {
+  // Before the first read of localStorage below -- see gateDefaults.ts.
+  resetStoredGateChoices();
   const [enabled, setEnabledState] = useState<boolean>(() => {
     if (typeof window === "undefined") return DEFAULT_ON;
     const v = window.localStorage.getItem(STORAGE_KEY);

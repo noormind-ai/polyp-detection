@@ -48,6 +48,10 @@ const API = process.env.NEXT_PUBLIC_API_URL || "";
  */
 const PANEL = "/review/api";
 
+/** How often to re-ask /api/me, which also renews the session. Well under the
+ *  shortest session (12h) with room for a laptop to be shut for a while. */
+const SESSION_PING_MS = 10 * 60 * 1000;
+
 /** What a submitted login came back with. */
 export type LoginResult =
   | { done: true }
@@ -75,6 +79,11 @@ interface AuthContextValue {
   /** signed-in name is on the server's spectator allowlist. Display only --
    *  the websocket and /api/spectate/rooms both re-check this themselves. */
   spectator: boolean;
+  /** Account the server will sign in with no password, or null (normal).
+   *  Only non-null while the emergency kiosk door is open. */
+  kioskSignin: string | null;
+  /** Take that door. Throws if the server has it closed. */
+  kioskLogin: () => Promise<LoginResult>;
   login: (username: string, password: string) => Promise<LoginResult>;
   register: (username: string, password: string, invite: string) => Promise<LoginResult>;
   /** Replace an admin-issued one-time password, then sign in. */
@@ -119,6 +128,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [reviewer, setReviewer] = useState(false);
   const [reviewRole, setReviewRole] = useState<string | null>(null);
   const [spectator, setSpectator] = useState(false);
+  const [kioskSignin, setKioskSignin] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -131,6 +141,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setReviewer(!!data.reviewer);
       setReviewRole(data.review_role ?? null);
       setSpectator(!!data.spectator);
+      setKioskSignin(data.kiosk_signin ?? null);
     } catch {
       // Backend down or unreachable — treat as signed out rather than blocking
       // the whole page, since the open modes still work without it.
@@ -144,6 +155,30 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => { refresh(); }, [refresh]);
+
+  /**
+   * Keep the session alive for as long as the page is actually open.
+   *
+   * /api/me re-issues the session cookie, so polling it is what turns a fixed
+   * expiry into an idle one. It exists for one installation in particular: the
+   * clinic PC that is left running with this app on screen for a whole list,
+   * where a session dying on the clock means the next person to touch the
+   * mouse meets a login form mid-procedure. A closed browser polls nothing, so
+   * the idle timeout itself is unchanged.
+   *
+   * Skipped while the tab is hidden and run again when it comes back, because
+   * a suspended laptop fires no timers and would otherwise return to a session
+   * that quietly lapsed while it slept.
+   */
+  useEffect(() => {
+    const tick = () => { if (!document.hidden) void refresh(); };
+    const id = setInterval(tick, SESSION_PING_MS);
+    document.addEventListener("visibilitychange", tick);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", tick);
+    };
+  }, [refresh]);
 
   async function submit(path: string, fields: Record<string, string>, fallback: string) {
     const body = new FormData();
@@ -211,6 +246,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return completeLogin(username, next, data?.review ?? me.role);
   };
 
+  /** One click, no password, one allowlisted account. See backend/auth.py. */
+  const kioskLogin = async (): Promise<LoginResult> => {
+    const res = await fetch(`${API}/api/kiosk-login`, { method: "POST", credentials: "include" });
+    if (!res.ok) throw new Error(await errorFrom(res, "One-click sign-in is not enabled."));
+    await refresh();
+    return { done: true } as const;
+  };
+
   const logout = async () => {
     // Sign out of both, since there was only ever one sign-in. The panel call
     // is best-effort: not being signed in there is not a failure to sign out.
@@ -228,7 +271,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   return (
     <AuthContext.Provider
       value={{ user, loading, registrationOpen, inviteRequired, reviewer, reviewRole, spectator,
-               login, register, setNewPassword, logout }}
+               kioskSignin, kioskLogin, login, register, setNewPassword, logout }}
     >
       {children}
     </AuthContext.Provider>

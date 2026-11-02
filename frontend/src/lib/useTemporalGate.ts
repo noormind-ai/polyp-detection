@@ -2,6 +2,7 @@
 
 import { useCallback, useRef, useState } from "react";
 import { TemporalGate, LEVELS, DEFAULT_LEVEL, MODES, DEFAULT_MODE, type TLevelKey, type TBox, type Mode } from "./temporal";
+import { resetStoredGateChoices } from "./gateDefaults";
 
 const MODE_KEY = "polyp_temporal_mode";
 const LEVEL_KEY = "polyp_temporal_level";
@@ -25,6 +26,8 @@ export interface TemporalGateState {
 }
 
 export function useTemporalGate(): TemporalGateState {
+  // Before the first read of localStorage below -- see gateDefaults.ts.
+  resetStoredGateChoices();
   const [mode, setModeState] = useState<Mode>(() => {
     if (typeof window === "undefined") return DEFAULT_MODE;
     const v = window.localStorage.getItem(MODE_KEY) as Mode | null;

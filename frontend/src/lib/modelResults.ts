@@ -202,8 +202,8 @@ export const MODEL_RESULTS: ModelResult[] =[
     "familyLabel": "YOLOv5m",
     "imgsz": 320,
     "crop": true,
-    "deployed": true,
-    "note": "Deployed. Kvasir-SEG fine-tune at the resolution the browser sends, with the black border cropped off first.",
+    "deployed": false,
+    "note": "Previous default, retired 2026-10-20 (RT-DETR TRUE-Colon serves live now; it is not among these benchmark rows). Kvasir-SEG fine-tune at the resolution the browser sends, with the black border cropped off first.",
     "label": "YOLOv5m \u00b7 320px \u00b7 cropped",
     "sweep": [
       {

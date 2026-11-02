@@ -15,6 +15,24 @@ export function LanguageProvider({ children }: { children: ReactNode }) {
   const [lang, setLang] = useState<Lang>("fa");
 
   useEffect(() => {
+    // ?lang=fa / ?lang=en in the URL beats whatever this browser last stored.
+    //
+    // The clinic PC came up in English because somebody toggled it once,
+    // months ago, and localStorage remembered. Nobody reconfigures that
+    // machine by hand, so its language has to be a property of how it is
+    // launched rather than of a click nobody remembers making. The kiosk
+    // launcher passes ?lang=fa, the same way it passes ?kiosk=1.
+    //
+    // Stored as well as applied, so the override survives in-app navigation
+    // that drops the query string.
+    try {
+      const q = new URLSearchParams(window.location.search).get("lang");
+      if (q === "fa" || q === "en") {
+        setLang(q);
+        localStorage.setItem("polyp_lang", q);
+        return;
+      }
+    } catch { /* no URL/storage: fall through to the stored value */ }
     const stored = localStorage.getItem("polyp_lang");
     if (stored === "fa" || stored === "en") setLang(stored);
   }, []);

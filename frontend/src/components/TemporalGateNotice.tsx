@@ -1,7 +1,7 @@
 "use client";
 
 import { useLanguage } from "@/lib/i18n";
-import { LEVELS, MODES } from "@/lib/temporal";
+import { LEVELS, SELECTABLE_MODES } from "@/lib/temporal";
 import type { TemporalGateState } from "@/lib/useTemporalGate";
 import type { Mode } from "@/lib/temporal";
 
@@ -42,7 +42,7 @@ export default function TemporalGateNotice({ gate }: { gate: TemporalGateState }
           {t("Persistence filter")}
         </p>
         <div className="flex gap-1 flex-shrink-0">
-          {MODES.map((m) => (
+          {SELECTABLE_MODES.map((m) => (
             <button key={m} onClick={() => gate.setMode(m)} className={modeBtn(gate.mode === m)}>
               {t(MODE_LABEL[m])}
             </button>

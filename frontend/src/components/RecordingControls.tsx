@@ -13,9 +13,13 @@
  * playback rather than being available to anyone who opens the page.
  */
 
+import { useEffect, useState } from "react";
 import { useLanguage } from "@/lib/i18n";
 import { useAuth } from "@/lib/auth";
-import { SessionRecorder } from "@/lib/useSessionRecorder";
+import {
+  SessionRecorder, getRecordingBps, setRecordingBps, mbPerMinute,
+  MIN_RECORDING_BPS, MAX_RECORDING_BPS,
+} from "@/lib/useSessionRecorder";
 
 /** mm:ss, or h:mm:ss once a procedure runs past the hour. */
 export function formatDuration(ms: number): string {
@@ -53,6 +57,11 @@ export default function RecordingControls({
 }: RecordingControlsProps) {
   const { t } = useLanguage();
   const { user, loading } = useAuth();
+  // Rendered with the default first and the stored choice applied after mount:
+  // the page is statically prerendered, so reading localStorage during the
+  // first render would make the server HTML and the client disagree.
+  const [bps, setBpsState] = useState(8_000_000);
+  useEffect(() => { setBpsState(getRecordingBps()); }, []);
 
   // Nothing at all until auth has answered — flashing "sign in to record" at
   // someone who IS signed in is worse than a moment of empty space.
@@ -157,6 +166,39 @@ export default function RecordingControls({
         {t("auto-record while inside the body")}
       </label>
 
+      {/* Bitrate for the saved video. Read when a recording starts (the
+          MediaRecorder's rate is fixed for its lifetime), so mid-recording
+          changes apply from the next recording -- the hint below says so
+          whenever that is the case. A slider rather than three rungs: what
+          this clinic can afford depends on its disk and its uplink, and the
+          right value is found by eye on /sim, not chosen from a menu. */}
+      <div className="px-1 space-y-1">
+        <div className="flex items-center justify-between text-[11px]">
+          <span className="text-gray-500">{t("Recording quality")}</span>
+          <span className="font-mono text-gray-300">
+            {t("{mbps} Mbps · ~{mb} MB/min", { mbps: (bps / 1e6).toFixed(1), mb: mbPerMinute(bps) })}
+          </span>
+        </div>
+        <input
+          type="range"
+          min={MIN_RECORDING_BPS}
+          max={MAX_RECORDING_BPS}
+          step={100_000}
+          value={bps}
+          onChange={(e) => {
+            const v = Number(e.target.value);
+            setBpsState(v);
+            setRecordingBps(v);
+          }}
+          className="w-full accent-blue-500 cursor-pointer"
+        />
+        <p className="text-[11px] text-gray-600">
+          {recording
+            ? t("Quality changes take effect when the next recording starts.")
+            : t("1.2 = the old setting · 8 = the clinic's own still-image quality · above 12 mostly stores noise.")}
+        </p>
+      </div>
+
       {recording && (
         <div className="flex items-center gap-2 px-1">
           <button
@@ -198,11 +240,14 @@ export default function RecordingControls({
           LiveCameraPlayer.tsx), so upload progress is real and worth showing
           mid-recording too, not only during the final Stop-triggered drain. */}
       {(recorder.status === "stopping" || recorder.waitingForLink
+        || recorder.pendingChunks > 0
         || (recorder.totalChunks > 0 && recorder.uploadedChunks < recorder.totalChunks)) && (
         <div className="space-y-1 px-1">
           {recorder.waitingForLink ? (
             <p className="text-xs text-amber-400">
-              {t("⏳ Waiting — the link is busy with a live procedure right now. Upload will resume the moment it's free.")}
+              {recorder.pendingChunks > 0
+                ? t("⏳ Waiting — the link is busy with a live procedure right now. {n} saved pieces will resume uploading the moment it's free.", { n: recorder.pendingChunks })
+                : t("⏳ Waiting — the link is busy with a live procedure right now. Upload will resume the moment it's free.")}
             </p>
           ) : (
             <>
@@ -219,7 +264,9 @@ export default function RecordingControls({
                       done: recorder.uploadedChunks, total: recorder.totalChunks,
                       size: formatBytes(recorder.uploadedBytes),
                     })
-                  : t("Uploading to the server…")}
+                  : recorder.pendingChunks > 0
+                    ? t("{n} pieces saved, not yet sent", { n: recorder.pendingChunks })
+                    : t("Uploading to the server…")}
               </p>
             </>
           )}

@@ -37,16 +37,18 @@ def require_user(user: str | None = Depends(current_user)) -> str:
     return user
 
 
-def _session_response(username: str, request: Request) -> JSONResponse:
-    role = auth.panel_role(username)
-    resp = JSONResponse({"ok": True, "user": username,
-                         # Display only, and the browser's cue to go and mint a
-                         # panel session too. None for a signup account.
-                         "review": role})
+def _set_session_cookie(resp: JSONResponse, username: str, request: Request) -> None:
+    """Issue (or re-issue) this account's session cookie on `resp`.
+
+    Shared by login and by /me -- which renews rather than merely reporting.
+    See whoami for why.
+    """
     resp.set_cookie(
         auth.COOKIE_NAME,
         auth.issue_session(username),
-        max_age=auth.SESSION_HOURS * 3600,
+        # Per-account: the clinic PC's login is allowlisted for a year, every
+        # other account keeps the ordinary twelve hours. backend/auth.py.
+        max_age=auth.session_seconds(username),
         httponly=True,                     # JS cannot read it -> XSS can't steal it
         samesite="lax",                    # not sent on cross-site POSTs
         # Behind nginx the app itself sees http, so trust the proxy's header —
@@ -54,6 +56,15 @@ def _session_response(username: str, request: Request) -> JSONResponse:
         secure=request.headers.get("x-forwarded-proto", request.url.scheme) == "https",
         path="/",
     )
+
+
+def _session_response(username: str, request: Request) -> JSONResponse:
+    role = auth.panel_role(username)
+    resp = JSONResponse({"ok": True, "user": username,
+                         # Display only, and the browser's cue to go and mint a
+                         # panel session too. None for a signup account.
+                         "review": role})
+    _set_session_cookie(resp, username, request)
     return resp
 
 
@@ -96,6 +107,21 @@ def do_register(request: Request, username: str = Form(...), password: str = For
     # Sign the new account straight in — making someone register and then
     # immediately type the same credentials again is pointless friction.
     return _session_response(username.strip(), request)
+
+
+@router.post("/kiosk-login")
+def kiosk_login(request: Request):
+    """Issue a session for the one allowlisted kiosk account, with no password.
+
+    404 unless POLYP_KIOSK_SIGNIN_USER is set, which is the whole of the
+    control -- see backend/auth.py for why this exists and why it should be
+    switched off again immediately afterwards.
+    """
+    user = auth.KIOSK_SIGNIN_USER
+    if not user:
+        raise HTTPException(status_code=404, detail="Not enabled.")
+    log.warning("kiosk one-click sign-in used for %r", user)
+    return _session_response(user, request)
 
 
 @router.post("/logout")
@@ -145,9 +171,17 @@ def tutorials(user: str | None = Depends(current_user)):
 
 
 @router.get("/me")
-def whoami(user: str | None = Depends(current_user)):
-    """Who is signed in, and what the login form needs to render."""
-    return {
+def whoami(request: Request, user: str | None = Depends(current_user)):
+    """Who is signed in, and what the login form needs to render.
+
+    Also RENEWS the session. The page polls this while it is open
+    (frontend/src/lib/auth.tsx), so renewing here is what turns a fixed
+    expiry into an idle one: a session now only runs out once the app has
+    stopped being used. That is what keeps the always-on clinic machine from
+    presenting a login form in the middle of a procedure. Close the browser
+    and the polling stops, so the idle window itself is unchanged.
+    """
+    body = {
         "user": user,
         "registration_open": auth.REGISTRATION_OPEN,
         "invite_required": bool(auth.INVITE_CODE),
@@ -161,4 +195,10 @@ def whoami(user: str | None = Depends(current_user)):
         # reviewer/review_role above -- the websocket and /api/spectate/rooms
         # both re-check the allowlist themselves on every request.
         "spectator": auth.is_spectator_user(user) if user else False,
+        # Non-empty only while the emergency one-click door is open.
+        "kiosk_signin": auth.KIOSK_SIGNIN_USER or None,
     }
+    resp = JSONResponse(body)
+    if user:
+        _set_session_cookie(resp, user, request)
+    return resp

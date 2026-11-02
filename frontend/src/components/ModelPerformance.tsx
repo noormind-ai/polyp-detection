@@ -25,7 +25,12 @@ export default function ModelPerformance() {
 
   // The deployed row is the comparison everything else is judged against, so a
   // reader can see at a glance whether a model is better or merely different.
-  const base = MODEL_RESULTS.find((r) => r.deployed);
+  // No row carries deployed=true since the live picker moved to the
+  // TRUE-Colon RT-DETR models (not part of this benchmark set) -- the old
+  // default stays on as the comparison baseline, without the "in use" tag.
+  const base = MODEL_RESULTS.find((r) => r.deployed)
+    ?? MODEL_RESULTS.find((r) => r.key === DEFAULT_MODEL_KEY)
+    ?? MODEL_RESULTS[0];
   const delta = (v: number, b: number, digits = 1) => {
     const d = v - b;
     if (!base || m.deployed || Math.abs(d) < 10 ** -digits) return null;

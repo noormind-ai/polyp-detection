@@ -18,7 +18,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket
 
 from backend import auth
-from backend.routes.auth import current_user
+from backend.routes.auth import current_user, require_user
 from backend.routes.feedback import _check_id
 from backend.services import spectate_bus
 
@@ -38,7 +38,8 @@ def _num(d: dict, key: str, cast, default):
 
 
 @router.post("/spectate/{case_id}/room-stats")
-async def post_room_stats(case_id: str, request: Request):
+async def post_room_stats(case_id: str, request: Request,
+                          user: str = Depends(require_user)):
     """The room's own client-side connection stats (received count, round
     trip average split server/network, fps) -- a browser-side measurement
     the server has no other way to know, since it only ever sees its own
@@ -64,6 +65,7 @@ async def post_room_stats(case_id: str, request: Request):
         "rtt_ms": _num(body, "rtt_ms", int, 0),
         "net_ms": _num(body, "net_ms", int, 0),
         "fps": _num(body, "fps", float, 0.0),
+        "uplink_mbps": _num(body, "uplink_mbps", float, 0.0),
     })
     return {"ok": True}
 

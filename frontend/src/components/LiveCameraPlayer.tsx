@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import FeedbackPanel from "./FeedbackPanel";
 import RecordingControls from "./RecordingControls";
 import RecordingRecoveryBanner from "./RecordingRecoveryBanner";
@@ -22,11 +23,38 @@ import { detectFovRect, unionRect, intersectRect, trimmedFraction, NEGLIGIBLE_TR
 import { negotiateCameraMode, describeMode, type ModeAttempt } from "@/lib/cameraMode";
 import { combRatio, looksInterlaced, createDeinterlacer } from "@/lib/interlace";
 import { drawBoxes, type Box } from "@/lib/drawBoxes";
+import { createGLEnhancer, type GLEnhancer } from "@/lib/enhanceGL";
+import { createGLDeinterlacer, DEINT_MODES, type GLDeinterlacer, type DeintMode } from "@/lib/deinterlaceGL";
+import { readProcAmpCaps, readProcAmpValues, measureLevels, autoTuneProcAmp,
+         type ProcAmpCaps } from "@/lib/procAmp";
 import { useFullscreen, fsWrapClass, fsExitBtnClass, fsBoxStyle } from "@/lib/useFullscreen";
 import { useAlertSound } from "@/lib/useAlertSound";
 import AlertSoundControls from "./AlertSoundControls";
+import CaptureStrip, { StripChooser, STRIP_SIZE_DEFAULT, clampStripSize,
+         type Shot, type StripPos, type StripReplay } from "./CaptureStrip";
+import LatencyHud, { type LatencyStats } from "./LatencyHud";
+import DoctorScreen from "./DoctorScreen";
+import { useDoctorWindow, doctorRoot, canPlaceWindows, hasSecondDisplay,
+         listDisplays, suggestDisplay, watchDisplays,
+         type DoctorDisplay } from "@/lib/useDoctorWindow";
+import { Rolling } from "@/lib/rolling";
+import { FrameStore } from "@/lib/frameRing";
+import type { TimelineSource } from "./FeedbackPanel";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "";
+// Where the captured-frame strip sits in the fullscreen view. Same
+// remember-the-operator's-choice convention as the gate switches.
+const STRIP_POS_KEY = "polyp_strip_pos";
+const STRIP_SIZE_KEY = "polyp_strip_size";
+// Enough to glance back over the last minute or so of an appearance-heavy
+// stretch; small enough that the object URLs behind them stay trivial.
+const SHOT_RING = 12;
+// Whether the developer readout is drawn over the fullscreen picture.
+const HUD_KEY = "polyp_hud_on";
+// Long enough to be a baseline for "is this frame unusual", as opposed to
+// the 10/20-sample display averages, which a spike pollutes in three
+// frames. ~4s of a 15 fps session.
+const BASELINE_N = 60;
 const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 // Resolve the socket origin explicitly rather than leaning on a relative
 // WebSocket URL: the spec allows it, but an absolute ws:// is unambiguous and
@@ -36,6 +64,43 @@ const API_WS = (process.env.NEXT_PUBLIC_API_URL
 const INFER_TIMEOUT_MS = 6000;
 // Resize frames to this width before sending — faster inference, smaller payload
 const INFER_WIDTH = 320;
+
+/** Fixed-320 view of a larger capture, for the gates whose thresholds were
+ *  fitted at 320px (lib/frameQuality resamples from the capture size, so
+ *  feeding it a 640 capture shifts its statistics; see useQualityGate). */
+function downscaleForGates(src: HTMLCanvasElement): HTMLCanvasElement {
+  const w = INFER_WIDTH;
+  const h = Math.max(1, Math.round((src.height * w) / src.width));
+  const c = document.createElement("canvas");
+  c.width = w;
+  c.height = h;
+  const ctx = c.getContext("2d")!;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(src, 0, 0, w, h);
+  return c;
+}
+// Reconnect backoff for the inference socket. The clinic PC is unattended, so
+// a dropped socket has to heal itself -- a backend restart, an nginx reload or
+// a brief network outage must not end the day's detection. Doubles from 1s to
+// a 15s ceiling and then keeps trying at that rate indefinitely: there is
+// nobody there to reload the page, so giving up is never the right answer.
+const WS_RETRY_BASE_MS = 1_000;
+const WS_RETRY_MAX_MS  = 15_000;
+
+// Kiosk watchdog (autoStart only). How often to check that the capture card is
+// still open and still producing frames, and how long the picture may be
+// frozen before the device is re-opened. A card that is unplugged fires an
+// `ended` event and is handled the moment it happens; this is for the other
+// case -- a driver that keeps the track "live" while sending nothing, which
+// looks exactly like a quiet procedure to everything else in this file.
+const KIOSK_WATCH_MS  = 15_000;
+const KIOSK_FROZEN_MS = 45_000;
+// Re-opening the device has not helped this many times in a row -> reload the
+// page. Safe, and the last thing left to try: kiosk mode rebuilds the whole
+// session from localStorage, so the page comes back into live camera by itself.
+const KIOSK_MAX_RECOVERIES = 3;
+
 // How long out-of-body has to persist before auto-record treats it as the
 // procedure actually ending (finalize + upload) rather than a brief
 // withdrawal (pause, ready to resume the same recording). Past the threshold
@@ -105,7 +170,7 @@ const DETECTION_GAP_MS = 1000;
 // own by design.
 //
 //   tier 1  box on screen   temporal gate, 2-of-3 (~0.5 s)   lib/temporal.ts
-//   tier 2  filed capture   FILE_MIN_MS + FILE_MIN_HITS
+//   tier 2  filed capture   first frame at once, then best of the window
 //   tier 3  audible alert   tier 1's bar exactly -- lib/useAlertSound.ts
 //
 // Tier 1's threshold is the operating point Holzwanger et al. (Endoscopy 2021)
@@ -191,7 +256,7 @@ interface ServerRecording {
   // "joined" is a recording assembled on the server out of the fragments one
   // procedure was split into -- see the out-of-body stop threshold. It is read
   // and played like any other, it just was never uploaded by a browser.
-  source: "camera" | "screen" | "joined";
+  source: "camera" | "screen" | "joined" | "replay";
   width: number;
   height: number;
   started_at: number;
@@ -202,6 +267,16 @@ interface ServerRecording {
    *  actually holds: duration_ms is wall clock and counts paused out-of-body
    *  stretches, so a 6s entry can hold 0.2s of video. */
   bytes: number;
+  /** The day the procedure actually happened, as YYYY-MM-DD. Read off the
+   *  endoscope's own burnt-in overlay and written by
+   *  backend/scripts/triage_recordings.py -- NOT derivable from started_at,
+   *  which is when the server wrote the file and can be weeks later for
+   *  anything that was replayed. Absent on recordings made since, where
+   *  started_at is honest again. */
+  clinic_date?: string;
+  /** Ids this recording was stitched together from, so the parts can be
+   *  dropped from the picker instead of listed alongside the whole thing. */
+  joined_from?: string[];
 }
 
 /** m:ss under an hour, h:mm:ss past it -- a raw seconds count (e.g. "973.1s")
@@ -214,8 +289,30 @@ function formatClock(seconds: number): string {
   return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
 }
 
-/** Enough to tell two recordings apart in a dropdown: when it was made, how
- *  long it ran, and what it came from. */
+/** The day a recording belongs to, as YYYY-MM-DD. The endoscope's own overlay
+ *  wins where the cleanup recorded it; otherwise fall back to when the server
+ *  wrote the file, which is right for anything captured live. */
+function clinicDayKey(r: ServerRecording): string {
+  if (r.clinic_date) return r.clinic_date;
+  const d = new Date(r.started_at * 1000);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+/** Label for one option inside a day's optgroup. The date is deliberately
+ *  left out -- the group heading already carries it, and repeating it on every
+ *  row is what made the old flat list unreadable. */
+function describeRecordingInDay(r: ServerRecording): string {
+  const when = new Date(r.started_at * 1000);
+  const stamp = when.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const secs = Math.round((r.duration_ms || 0) / 1000);
+  const dur = secs >= 60 ? `${Math.floor(secs / 60)}m${String(secs % 60).padStart(2, "0")}s` : `${secs}s`;
+  const mb = r.bytes > 0 ? ` · ${Math.round(r.bytes / 1e6)} MB` : "";
+  const whole = r.source === "joined" ? "🎬 " : "";
+  return `${whole}${stamp} · ${dur}${mb}`;
+}
+
+/** Enough to tell two recordings apart on their own, outside any grouping --
+ *  the "now replaying…" banner, where there is no heading to lean on. */
 function describeRecording(r: ServerRecording): string {
   const when = new Date(r.started_at * 1000);
   const stamp = `${when.toLocaleDateString()} ${when.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
@@ -227,7 +324,38 @@ function describeRecording(r: ServerRecording): string {
 
 interface Timing { recv_ms: number; modal_ms: number; total_ms: number; }
 
-export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = "/api/ws/infer", initialMode = "camera", backend }: { caseId: string; onStop: () => void; onActivity?: () => void; wsPath?: string; initialMode?: "camera" | "screen" | "demo"; backend?: string }) {
+/**
+ * Which of these devices is the endoscope capture card?
+ *
+ * The label is the only signal a browser gives — enumerateDevices reports no
+ * device class and no USB id — so this is a guess, and it is written to
+ * abstain rather than guess wrong. The thing a wrong answer would pick is the
+ * machine's own webcam, pointed at the room, so built-in cameras are ruled OUT
+ * first and a grabber-shaped name is preferred among whatever is left. When
+ * neither signal settles it the operator still gets the dropdown.
+ *
+ * Only ever consulted when nothing has been remembered yet — see
+ * preselectRemembered. After the first explicit pick on a machine, that pick
+ * is what comes back, whatever its name looks like.
+ */
+const BUILTIN_CAMERA_RE = /integrated|built[- ]?in|facetime|webcam|front|rear|user[- ]?facing|laptop/i;
+/** The clinic's card is an ezcap/Somagic SMI-2021 (see lib/cameraMode.ts);
+ *  the rest are the names the common USB/HDMI grabbers enumerate under. */
+const CAPTURE_CARD_RE = /capture|grabber|ezcap|somagic|smi[- ]?2021|stk1160|usb ?video|av ?to ?usb|hdmi|utv\d|elgato|cam ?link/i;
+
+function pickCaptureCard(cams: MediaDeviceInfo[]): MediaDeviceInfo | undefined {
+  // Unlabelled devices carry no evidence either way; permission has not been
+  // granted yet and there is nothing to read.
+  const named = cams.filter((d) => d.label);
+  const grabber = named.find((d) => CAPTURE_CARD_RE.test(d.label) && !BUILTIN_CAMERA_RE.test(d.label));
+  if (grabber) return grabber;
+  // No recognisable name. One single non-webcam device is still unambiguous —
+  // two or more is not, and that is the case to leave alone.
+  const rest = named.filter((d) => !BUILTIN_CAMERA_RE.test(d.label));
+  return rest.length === 1 ? rest[0] : undefined;
+}
+
+export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = "/api/ws/infer", initialMode = "camera", backend, inferWidth = INFER_WIDTH, initialConf = 0.30, autoStart = false, onCaseEnd, uplinkMbps = null }: { caseId: string; onStop: () => void; onActivity?: () => void; wsPath?: string; initialMode?: "camera" | "screen" | "demo"; backend?: string; inferWidth?: number; initialConf?: number; /** Open the preselected camera on mount, with no click, and keep it open. Kiosk only — see the watchdog next to listDevicesQuietly. */ autoStart?: boolean; /** One procedure has ended (scope out of the body past OUT_OF_BODY_STOP_MS). The owner rotates the case id; see applyAutoRecord. */ onCaseEnd?: () => void; /** The uplink speed measured at session start (see page.tsx openMode), in Mbps -- carried through to the room-stats report so it lands in the server netstat log, and used here to warn if it looks too slow for the frame stream. Null until the probe resolves, or if it never ran (e.g. a replay with no real session start). */ uplinkMbps?: number | null }) {
   const { t, lang } = useLanguage();
   // Cheap colour gate in front of the detector: while the camera is outside the
   // patient there is nothing to detect, so the frame is never sent. The operator
@@ -260,6 +388,22 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // spectator has actually subscribed to this exact id.
   const WS_URL = `${API_WS}${wsPath}?case_id=${encodeURIComponent(caseId)}`
     + (backend ? `&backend=${encodeURIComponent(backend)}` : "");
+  // The socket outlives the render that opened it -- it reconnects on its own
+  // and is deliberately re-opened when the case id rotates -- so the URL and
+  // the case id are read from refs at connect time rather than captured in the
+  // mount-time closure, which would pin a reconnect to the previous patient.
+  const wsUrlRef  = useRef(WS_URL);
+  const caseIdRef = useRef(caseId);
+  useEffect(() => { wsUrlRef.current = WS_URL; caseIdRef.current = caseId; }, [WS_URL, caseId]);
+  // Same reason: the room-stats POST runs inside the socket's own message
+  // handler, not a render, so it must read the probe's result through a ref
+  // rather than close over the uplinkMbps prop at mount time -- the probe in
+  // page.tsx's openMode resolves after this component is already mounted.
+  const uplinkMbpsRef = useRef(uplinkMbps);
+  useEffect(() => { uplinkMbpsRef.current = uplinkMbps; }, [uplinkMbps]);
+  /** Drop the current socket so it comes straight back on the current URL.
+   *  Set by the socket effect; used when the case id rotates. */
+  const reopenSocketRef = useRef<(() => void) | null>(null);
   const videoRef    = useRef<HTMLVideoElement | null>(null);
   const analyzedRef = useRef<HTMLCanvasElement>(null); // last frame actually sent to the model, with boxes burned on
   const wsRef       = useRef<WebSocket | null>(null);
@@ -284,6 +428,26 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   const episodeStartRef   = useRef(0);
   const episodeHitsRef    = useRef(0);
   const episodeFiledRef   = useRef(false);
+  // Appearances kept so "where was it?" has an answer -- see
+  // lib/replaySource.ts. The ref is the source of truth and is mutated per
+  // inferred frame; the state is a snapshot published only when an appearance
+  // opens or closes, because re-rendering this component (both video panels,
+  // the overlays, the gates) several times a second is not free.
+  // Every frame of this patient that the model scored, so the review panel's
+  // timeline can be scrubbed and played. NOT the session recording: a
+  // MediaRecorder WebM cannot be played from the middle at all -- see
+  // lib/frameRing.ts for the three routes that were measured and rejected.
+  const frameStoreRef     = useRef<FrameStore>(new FrameStore());
+  // Wall clock at which the current procedure started. The timeline's axis is
+  // milliseconds from here, which works whether or not anything is recording.
+  const procStartRef      = useRef(0);
+  // Capture filename -> its moment on that axis, recorded when the upload comes
+  // back with the name the server gave it. This is what puts a reviewable
+  // capture at an exact point on the bar, rather than at its server timestamp,
+  // which is only second-resolution and on the server's clock.
+  const captureAtRef      = useRef<Map<string, number>>(new Map());
+  // The bar gets longer while a procedure runs, so the panel needs a heartbeat.
+  const [timelineTick, setTimelineTick] = useState(0);
   const bestRef = useRef<{ score: number; boxes: Box[] } | null>(null);
   // Two scratch canvases, reused for the life of the session: the frame being
   // considered, and the best one held so far. A fresh 960px canvas per inferred
@@ -301,7 +465,88 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // we are back to queueing POSTs against the same upstream the frame stream
   // uses; none at all and a capture that merely coincided with a busy uplink is
   // lost outright — which is a lesion the reviewer never sees.
-  const deferredRef = useRef<{ blob: Blob; boxes: Box[] } | null>(null);
+  const deferredRef = useRef<{ blob: Blob; boxes: Box[]; kind: "first" | "best"; shotId?: string } | null>(null);
+  // The last few filed captures, kept as object URLs so the doctor can glance
+  // back at them without leaving the live view -- see components/CaptureStrip.
+  // A ring and not a list: 12 x 960px JPEG is ~1.5 MB worst case, a whole
+  // procedure's worth would not be.
+  // Longer-window means, used ONLY to decide whether the current sample is a
+  // spike worth colouring. Deliberately separate from the display averages
+  // below, whose window lengths are a compatibility surface -- they are what
+  // gets posted to room-stats and rendered in spectator mode.
+  // Bumped once per annotated repaint. The doctor window's mirror loop runs
+  // on its own clock and uses this to tell "there is a new frame" from "the
+  // same frame again", so it copies pixels at most once per inference reply
+  // instead of once per monitor refresh.
+  const analyzedGenRef = useRef(0);
+  const doctor = useDoctorWindow();
+  // Getters, not values: handing the mirror loop a fresh closure on every
+  // inference reply would restart it 15 times a second.
+  const mirrorSource = useCallback(() => analyzedRef.current, []);
+  const mirrorGeneration = useCallback(() => analyzedGenRef.current, []);
+  const [displays, setDisplays] = useState<DoctorDisplay[] | null>(null);
+  const [chosenDisplay, setChosenDisplay] = useState(0);
+  const [doctorNote, setDoctorNote] = useState<string | null>(null);
+  const [doctorManual, setDoctorManual] = useState(false);
+
+  const rttBase    = useRef(new Rolling(BASELINE_N));
+  const serverBase = useRef(new Rolling(BASELINE_N));
+  const netBase    = useRef(new Rolling(BASELINE_N));
+  const fpsBase    = useRef(new Rolling(BASELINE_N));
+  // This frame's raw numbers. The grid shows the averages; only the spike
+  // test looks at these.
+  const [cur, setCur] = useState({ rtt: 0, server: 0, net: 0, fps: 0 });
+  const [hudOn, setHudOnState] = useState(false);
+  const setHudOn = useCallback((v: boolean) => {
+    setHudOnState(v);
+    try { localStorage.setItem(HUD_KEY, v ? "1" : "0"); } catch { /* private mode */ }
+  }, []);
+  useEffect(() => {
+    try { if (localStorage.getItem(HUD_KEY) === "1") setHudOnState(true); } catch { /* private mode */ }
+  }, []);
+
+  const [shots, setShots] = useState<Shot[]>([]);
+  const shotSeqRef = useRef(0);
+  const shotsRef = useRef<Shot[]>([]);
+  // Read inside pushShot's eviction, which runs from a toBlob callback and so
+  // cannot see the current render's state.
+  const openShotIdRef = useRef<string | null>(null);
+  const [openShotId, setOpenShotIdState] = useState<string | null>(null);
+  const setOpenShotId = useCallback((id: string | null) => {
+    openShotIdRef.current = id;
+    setOpenShotIdState(id);
+  }, []);
+  // Where the strip sits over the fullscreen picture, and whether it is shown
+  // at all. Seeded from localStorage in an effect rather than in the
+  // initialiser so the server and the first client render agree.
+  const [stripPos, setStripPosState] = useState<StripPos>("bottom");
+  const setStripPos = useCallback((p: StripPos) => {
+    setStripPosState(p);
+    try { localStorage.setItem(STRIP_POS_KEY, p); } catch { /* private mode */ }
+  }, []);
+  // How big the strip's tiles are. A bigger tile means fewer fit in the same
+  // band, which is the trade -- the band never grows, so the picture never
+  // shrinks whatever this is set to.
+  const [stripSize, setStripSizeState] = useState(STRIP_SIZE_DEFAULT);
+  const setStripSize = useCallback((n: number) => {
+    const v = clampStripSize(n);
+    setStripSizeState(v);
+    try { localStorage.setItem(STRIP_SIZE_KEY, String(v)); } catch { /* private mode */ }
+  }, []);
+  useEffect(() => {
+    try {
+      const v = localStorage.getItem(STRIP_SIZE_KEY);
+      if (v !== null && v !== "" && Number.isFinite(Number(v))) setStripSizeState(clampStripSize(Number(v)));
+    } catch { /* private mode */ }
+  }, []);
+
+  useEffect(() => { shotsRef.current = shots; }, [shots]);
+  useEffect(() => {
+    try {
+      const v = localStorage.getItem(STRIP_POS_KEY);
+      if (v === "bottom" || v === "top" || v === "right" || v === "off") setStripPosState(v);
+    } catch { /* private mode */ }
+  }, []);
   // "Copied" confirmation for the spectator-link button, cleared a moment
   // after the click so a stale "Copied" never lingers on screen.
   const [spectatorLinkCopied, setSpectatorLinkCopied] = useState(false);
@@ -359,6 +604,8 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
 
   const [devices, setDevices]             = useState<MediaDeviceInfo[]>([]);
   const [selectedDeviceId, setSelectedId] = useState("");
+  const selectedDeviceIdRef = useRef("");
+  useEffect(() => { selectedDeviceIdRef.current = selectedDeviceId; }, [selectedDeviceId]);
   const [permission, setPermission]       = useState<"idle" | "requesting" | "granted" | "denied">("idle");
   // What the capture device actually handed back, and whether any of it was
   // unwritten padding. Surfaced to the operator because a card that has
@@ -372,11 +619,17 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // this the operator is left watching a dead panel wondering whether their
   // click registered -- reported from the clinic, not hypothetical.
   const [negotiating, setNegotiating]     = useState("");
+  // Mirrors for the kiosk watchdog, which runs off a setTimeout chain and so
+  // cannot see the render that produced them.
+  const negotiatingRef = useRef("");
+  useEffect(() => { negotiatingRef.current = negotiating; }, [negotiating]);
   // Frame shape of the last stream, so a change of shape can invalidate the
   // things measured against the old one.
   const lastFrameSizeRef                  = useRef<{ w: number; h: number } | null>(null);
   const [streaming, setStreaming]         = useState(false);
-  const [wsStatus, setWsStatus]           = useState<"connecting" | "open" | "error" | "closed">("connecting");
+  // "closed" now means closed for good (the component is going away);
+  // an unexpected drop is "reconnecting", because it is about to come back.
+  const [wsStatus, setWsStatus]           = useState<"connecting" | "open" | "error" | "reconnecting" | "closed">("connecting");
   const [closeCode, setCloseCode]         = useState<number | null>(null);
   const [polyp, setPolyp]                 = useState(false);
   const [stats, setStats]                 = useState({ sent: 0, received: 0, avgMs: 0, rttMs: 0, netMs: 0, fps: 0 });
@@ -428,14 +681,16 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // it cannot read the state above; it reads this instead.
   const procedureStartedRef = useRef(true);
   // Confidence gate, client-side and live-adjustable. The server runs the model
-  // at its own low threshold (0.30) and reports every box with its score, so
+  // at its own per-model threshold and reports every box with its score, so
   // moving this mid-procedure costs nothing — no round trip, no restart, and it
   // applies to what is drawn and what is auto-captured alike. A scope that is
-  // noisy today can be tightened without redeploying anything.
-  const [confMin, setConfMin] = useState(0.30);
+  // noisy today can be tightened without redeploying anything. Starts at the
+  // selected model's own serving threshold: confidence scales differ per
+  // model -- the 640 export serves at 0.20 where the 320 serves at 0.30.
+  const [confMin, setConfMin] = useState(initialConf);
   // The capture loop closes over the render it started in and cannot see the
   // state above.
-  const confMinRef = useRef(0.30);
+  const confMinRef = useRef(initialConf);
   const [showDetected, setShowDetected]   = useState(true);
   const [showLive, setShowLive]           = useState(true);
   const msHistory = useRef<number[]>([]);
@@ -466,9 +721,28 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // long-running capture loop, but the session recorder is a hook and has to
   // re-run when the stream is replaced (a device switch, or camera → screen).
   const [activeStream, setActiveStream] = useState<MediaStream | null>(null);
-  // A demo clip records as "camera": it enters the pipeline the same way, and
-  // the server only accepts camera|screen as a recording source.
-  const recorder = useSessionRecorder(caseId, captureMode === "screen" ? "screen" : "camera", activeStream);
+  // A file played through the pipeline -- demo clip, local file, or a recording
+  // already on this server -- records as "replay", not "camera". It used to
+  // record as "camera", and the result was a server full of second copies of
+  // its own footage that nothing in the metadata could distinguish from real
+  // procedures. Most of what the 2026-10-11 cleanup had to archive was that.
+  const recorder = useSessionRecorder(
+    caseId,
+    captureMode === "screen" ? "screen" : captureMode === "camera" ? "camera" : "replay",
+    activeStream,
+  );
+  // The recorder, reachable from the long-running capture loop.
+  //
+  // useSessionRecorder's callbacks are bound to the caseId/source/stream they
+  // were created with, and the loop holds whichever object existed when
+  // startLoop ran. That was harmless while a case id lasted exactly as long as
+  // the loop -- but the clinic PC now rotates the case id per patient without
+  // reloading the page (see onCaseEnd), and a stale recorder filed every later
+  // patient under the FIRST patient's case. Measured, not theorised:
+  // e2e-case-rotate.js caught three recordings in a row going to the wrong one.
+  const recorderRef = useRef(recorder);
+  useEffect(() => { recorderRef.current = recorder; });
+
   const [showRecordings, setShowRecordings] = useState(false);
   // Read through a ref inside applyAutoRecord for the same reason every other
   // per-frame flag in the capture loop is -- startLoop's closure is captured
@@ -551,6 +825,12 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // just a local var in startLoop) so it can also be released as a safety
   // net on loop-end/unmount without leaking if the loop stops mid-hold.
   const liveInferenceReleaseRef = useRef<(() => void) | null>(null);
+  // When the current out-of-body stretch (that still holds the gate) started
+  // -- null once released, or while inside. Mirrors outsideStartRef's shape
+  // but is tracked separately: that ref only exists below autoRecordEnabled's
+  // early return, while the gate must apply unconditionally. See
+  // applyAutoRecord's gate block.
+  const gateOutsideSinceRef = useRef<number | null>(null);
   function setRecordOverride(v: "on" | "off") {
     recordOverrideRef.current = v;
     setRecordOverrideState(v);
@@ -583,18 +863,40 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     // unconditionally, even if autoRecordEnabled is off, because it answers
     // "is the link busy", which matters regardless of whether auto-record
     // itself is in use. Out of body, the branch below never calls ws.send, so
-    // the link is genuinely free; marking it idle here is what lets a
-    // still-uploading recording (this session's own paused one, or a
-    // leftover from the previous patient) use that window instead of purely
-    // waiting for Stop. See uploadCoordinator.ts.
-    if (insideNow && !liveInferenceReleaseRef.current) {
-      liveInferenceReleaseRef.current = beginLiveInference();
-    } else if (!insideNow && liveInferenceReleaseRef.current) {
-      liveInferenceReleaseRef.current();
-      liveInferenceReleaseRef.current = null;
+    // the link is genuinely free; releasing it is what lets a still-uploading
+    // recording (this session's own paused one, or a leftover from the
+    // previous patient) use that window instead of purely waiting for Stop.
+    // See uploadCoordinator.ts.
+    //
+    // Released only after OUT_OF_BODY_STOP_MS of CONTINUOUS out-of-body --
+    // the same grace period the video auto-stop below uses -- not on the
+    // first out-of-body frame. A one-frame release used to be enough to open
+    // the gate to a multi-hundred-KB recording upload mid-procedure (measured
+    // on clinic logs: 471 of 1,094 chunk uploads started while frames were
+    // still flowing, each one measurably slowing every frame sent while it
+    // was in flight).
+    if (insideNow) {
+      gateOutsideSinceRef.current = null;
+      if (!liveInferenceReleaseRef.current) {
+        liveInferenceReleaseRef.current = beginLiveInference();
+      }
+    } else if (liveInferenceReleaseRef.current) {
+      if (gateOutsideSinceRef.current === null) {
+        gateOutsideSinceRef.current = Date.now();
+      } else if (Date.now() - gateOutsideSinceRef.current >= OUT_OF_BODY_STOP_MS) {
+        liveInferenceReleaseRef.current();
+        liveInferenceReleaseRef.current = null;
+        gateOutsideSinceRef.current = null;
+      }
     }
 
-    if (!autoRecordEnabledRef.current) { lastInsideRef.current = insideNow; return; }
+    // Auto-record is for live sources only. Replaying a file through the
+    // pipeline looks identical to the gate -- scope goes "inside the body" and
+    // it starts saving -- but the bytes are already on disk, so all it produces
+    // is a duplicate. The manual Record button still works for anyone who
+    // deliberately wants a copy of a replay.
+    const liveSource = captureModeRef.current === "camera" || captureModeRef.current === "screen";
+    if (!autoRecordEnabledRef.current || !liveSource) { lastInsideRef.current = insideNow; return; }
     const prevInside = lastInsideRef.current;
     lastInsideRef.current = insideNow;
     if (prevInside === true && !insideNow) { outsideStartRef.current = Date.now(); autoStoppedRef.current = false; }
@@ -615,7 +917,13 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     if (!want && !autoStoppedRef.current && outsideStartRef.current !== null
         && Date.now() - outsideStartRef.current >= OUT_OF_BODY_STOP_MS) {
       autoStoppedRef.current = true;
-      recorder.stop();
+      recorderRef.current.stop("out-of-body");
+      // Same moment, one level up: this patient is over, so the next captures
+      // and the next recording belong to a new case. Safe to rotate while the
+      // finalize above is still uploading -- useSessionRecorder snapshots the
+      // case id into the session (sess.caseId), so chunks already in flight
+      // keep filing under the case they started in.
+      onCaseEnd?.();
       return;
     }
 
@@ -623,10 +931,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       // Recording needs an account (see RecordingControls.tsx) -- without
       // this check a signed-out operator would see a failed /start POST
       // retried every frame for as long as the scope stays inside the body.
-      if (authUserRef.current) void recorder.start();
-      recorder.resume();
+      if (authUserRef.current) void recorderRef.current.start();
+      recorderRef.current.resume();
     } else {
-      recorder.pause();
+      recorderRef.current.pause();
     }
   }
 
@@ -682,6 +990,79 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // Set false if the canvas path ever fails, which un-hides the <video> again.
   // A combed picture is bad; a black panel mid-procedure is worse.
   const [liveCanvasOk, setLiveCanvasOk] = useState(true);
+
+  // --- display enhancement (operator's view only) -------------------------
+  // The capture-software chain the clinic's own viewer applies and a browser
+  // does not: a choice of deinterlacer, temporal denoise, unsharp, and the
+  // 4:3 correction SD pixels need. All of it runs on the GPU (lib/enhanceGL)
+  // AFTER the frame the model and the recorder already received, so turning
+  // any of it on cannot change a detection or a saved file.
+  const [enhOpen, setEnhOpen] = useState(false);
+  const [denoise, setDenoise] = useState(0);
+  const [sharpen, setSharpen] = useState(0);
+  const [aspect43, setAspect43] = useState(false);
+  // Not persisted (no localStorage) -- see FOV_KEY etc. nearby for the
+  // pattern this deliberately skips. "weave" (no GPU shader work beyond a
+  // flat blit) is the default rather than "adaptive" so a weak clinic PC
+  // never pays for motion-adaptive deinterlacing unless an operator
+  // deliberately turns picture quality up -- see Picture settings. That
+  // per-frame GPU/CPU cost runs on the same main thread that prepares the
+  // next inference frame, so a heavy default here can show up as inference
+  // latency, not just a softer picture.
+  const [deintMode, setDeintMode] = useState<DeintMode>("weave");
+  const [slowNote, setSlowNote] = useState("");
+  const glDeintRef = useRef<GLDeinterlacer | null>(null);
+  const glDeintTriedRef = useRef(false);
+  const costSamplesRef = useRef<number[]>([]);
+  const denoiseRef = useRef(0);
+  const sharpenRef = useRef(0);
+  const deintModeRef = useRef<DeintMode>("weave");
+  useEffect(() => { denoiseRef.current = denoise; }, [denoise]);
+  useEffect(() => { sharpenRef.current = sharpen; }, [sharpen]);
+  useEffect(() => { deintModeRef.current = deintMode; }, [deintMode]);
+  const enhanceCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const glEnhRef = useRef<GLEnhancer | null>(null);
+  const glTriedRef = useRef(false);
+  const enhanceOn = denoise > 0 || sharpen > 0;
+  const enhanceOnRef = useRef(false);
+  useEffect(() => { enhanceOnRef.current = enhanceOn; }, [enhanceOn]);
+
+  // Proc-amp: the card's OWN controls, when its driver exposes them through
+  // the browser. Not a filter -- applyConstraints retunes the analog front
+  // end, so unlike everything above it legitimately affects all three lines.
+  // Absent on most webcams and on many grabber drivers; the UI simply does
+  // not render what is not there.
+  const [procAmpCaps, setProcAmpCaps] = useState<ProcAmpCaps | null>(null);
+  const [procAmp, setProcAmp] = useState<Record<string, number>>({});
+  const [tuneNote, setTuneNote] = useState("");
+  const procAmpRef = useRef<Record<string, number>>({});
+  useEffect(() => { procAmpRef.current = procAmp; }, [procAmp]);
+
+  /** Push one control to the card and remember what we asked for. */
+  const applyProcAmp = useCallback(async (key: string, value: number) => {
+    setProcAmp((p) => ({ ...p, [key]: value }));
+    const track = streamRef.current?.getVideoTracks()[0];
+    try {
+      await track?.applyConstraints({ advanced: [{ [key]: value }] } as MediaTrackConstraints);
+    } catch (err) {
+      console.warn("[proc-amp] rejected", key, err);
+    }
+  }, []);
+
+  /** Set the card's levels from the picture. Runs itself once on connect --
+   *  a clinic should not have to know these controls exist to benefit from
+   *  them -- and stays available as a button afterwards. */
+  const runAutoTune = useCallback(async (caps: ProcAmpCaps) => {
+    setTuneNote(t("Tuning the capture card…"));
+    await autoTuneProcAmp({
+      caps,
+      values: { ...procAmpRef.current },
+      measure: () => measureLevels(liveCanvasRef.current),
+      apply: applyProcAmp,
+      onProgress: (msg) => setTuneNote(msg),
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [applyProcAmp]);
   const interlaceSamplesRef = useRef(0);
   const combPeakRef = useRef(0);
   // The region the FOV was measured INSIDE, in native frame pixels. With a
@@ -780,9 +1161,24 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         const res = await fetch(`${API}/api/recordings`, { credentials: "include" });
         if (!res.ok) return;
         const all: ServerRecording[] = await res.json();
+        // A stitched recording stands in for the fragments it was built from.
+        // Listing both put a single procedure in the picker eight times.
+        const stitched = new Set(all.flatMap((r) => r.joined_from ?? []));
         if (!cancelled) {
-          setRecordings(all.filter((r) => r.status === "complete" && r.duration_ms > 0
-                                          && (r.bytes ?? 0) >= MIN_CLIP_BYTES));
+          // Gate on whether there is usable footage, NOT on how it ended. A
+          // recording cut off mid-procedure ("interrupted"), or one still
+          // draining its backlog ("closing"), holds real playable video all
+          // the same -- and filtering on status alone is what hid 29.5
+          // minutes of clinic capture across 2026-10-14 and 2026-10-21.
+          // duration_ms is only ever written once a real length is known, so
+          // a recording with nothing in it still cannot slip through.
+          setRecordings(all.filter((r) => r.status !== "recording" && r.duration_ms > 0
+                                          && (r.bytes ?? 0) >= MIN_CLIP_BYTES
+                                          // Offering a replay as a source would be
+                                          // offering a copy of something already in
+                                          // this very list.
+                                          && r.source !== "replay"
+                                          && !stitched.has(r.id)));
         }
       } catch { /* leave the list empty */ }
     })();
@@ -824,6 +1220,95 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // first, which is what removes the access step from the clinic's workflow.
   useEffect(() => { void listDevicesQuietly(); }, []);   // eslint-disable-line react-hooks/exhaustive-deps
 
+  /**
+   * Kiosk: get the capture card open, and keep it open, with nobody watching.
+   *
+   * Off by default, and the comments on preselectRemembered and requestDevices
+   * say at length why: on an ordinary machine "first camera in the list" is
+   * whatever the OS enumerated first, and starting it unasked points a webcam
+   * at the room. The clinic PC is the one place with no operator to decide --
+   * it is powered on and expected to be showing the endoscope by the time the
+   * first patient is in the room, and to still be showing it eight hours later.
+   *
+   * One timer chain does three jobs, because they are the same job:
+   *
+   *   open      nothing is streaming -> list devices and start the selected
+   *             one. Retried with backoff rather than attempted once: USB
+   *             enumeration on a cold boot routinely lags the browser by
+   *             several seconds, and a single attempt loses the whole day.
+   *   re-open   the device died (unplugged, driver reset). stopCamera has
+   *             already cleared streamRef, so that is the same "nothing is
+   *             streaming" case and needs no separate path.
+   *   unfreeze  the track is still live but the picture has stopped. Nothing
+   *             else in this file can tell that apart from a quiet procedure,
+   *             so it is measured here, on the one thing that cannot lie:
+   *             whether the <video> element's clock is still moving.
+   *
+   * Camera permission must already have been granted, or the device labels are
+   * blank and there is nothing to recognise. That is a once-per-browser-profile
+   * click -- or, on the clinic PC, a Chrome policy, so it is never clicked.
+   */
+  useEffect(() => {
+    if (!autoStart) return;
+    let cancelled = false;
+    let attempt = 0;
+    let recoveries = 0;
+    let lastTime = -1;
+    let frozenFor = 0;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const tick = async () => {
+      if (cancelled) return;
+
+      if (!streamRef.current && !negotiatingRef.current) {
+        frozenFor = 0;
+        lastTime = -1;
+        // Re-list every round rather than trusting the one listing done at
+        // mount: on a cold boot the card may not have existed yet then.
+        await listDevicesQuietly();
+        if (cancelled) return;
+        const id = selectedDeviceIdRef.current;
+        // A demo clip, a saved recording or a local file is not something to
+        // "start the camera" on; those arrive through handleDeviceChange.
+        if (id && !id.startsWith(DEMO_PREFIX) && !id.startsWith(REC_PREFIX)
+            && !id.startsWith(LOCAL_PREFIX)) {
+          await startStream(id);
+        }
+        if (cancelled) return;
+        attempt = streamRef.current ? 0 : attempt + 1;
+      } else if (streamRef.current && !negotiatingRef.current) {
+        attempt = 0;
+        const now = videoRef.current?.currentTime ?? -1;
+        // The element's clock advances with the stream, so a clock that has
+        // not moved means no frames arrived -- whatever the track says about
+        // itself. Out-of-body does NOT look like this: the gate stops frames
+        // being SENT to the model, it does not stop them arriving.
+        frozenFor = now === lastTime ? frozenFor + KIOSK_WATCH_MS : 0;
+        lastTime = now;
+        if (frozenFor >= KIOSK_FROZEN_MS) {
+          frozenFor = 0;
+          recoveries += 1;
+          if (recoveries > KIOSK_MAX_RECOVERIES) {
+            window.location.reload();
+            return;
+          }
+          setLastError(t("No picture from the capture device — reopening it."));
+          stopCamera();   // the next tick finds nothing streaming and re-opens
+        }
+      }
+
+      if (cancelled) return;
+      timer = setTimeout(() => { void tick(); }, streamRef.current
+        ? KIOSK_WATCH_MS
+        // Backoff while it will not open, capped -- there is nobody here to
+        // reload the page, so this never gives up, it only slows down.
+        : Math.min(WS_RETRY_MAX_MS, WS_RETRY_BASE_MS * 2 ** Math.min(attempt, 4)));
+    };
+
+    void tick();
+    return () => { cancelled = true; if (timer) clearTimeout(timer); };
+  }, [autoStart]);   // eslint-disable-line react-hooks/exhaustive-deps
+
   // Paint the Live panel through the deinterlacer instead of letting the browser
   // show the <video> directly.
   //
@@ -863,12 +1348,49 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
           const w = vw & ~1, h = vh & ~1;
           if (canvas.width !== w) canvas.width = w;
           if (canvas.height !== h) canvas.height = h;
-          if (interlacedRef.current === true) {
+          const mode = deintModeRef.current;
+          if (!glDeintTriedRef.current) {
+            glDeintTriedRef.current = true;
+            glDeintRef.current = createGLDeinterlacer();
+          }
+          // A progressive source needs none of this, whatever the menu says:
+          // every mode here reconstructs rows that are only missing when the
+          // signal is interlaced.
+          const out = interlacedRef.current === true
+            ? glDeintRef.current?.process(video, w, h, mode) : null;
+          if (out) {
+            canvas.getContext("2d")!.drawImage(out.canvas, 0, 0);
+          } else if ((mode === "adaptive" || mode === "legacy") && interlacedRef.current === true) {
             deintRef.current.draw(video, 0, 0, w, h, canvas, w, h, video.currentTime);
           } else {
             const ctx = canvas.getContext("2d")!;
             ctx.imageSmoothingEnabled = true;
             ctx.drawImage(video, 0, 0, w, h, 0, 0, w, h);
+          }
+
+          // Enhancement is a second, independent canvas stacked over this
+          // one: the deinterlaced result stays intact underneath, so
+          // dropping the sliders to zero reveals it again with no rebuild.
+          const enh = enhanceCanvasRef.current;
+          if (enh && enhanceOnRef.current) {
+            if (!glTriedRef.current) {
+              glTriedRef.current = true;
+              glEnhRef.current = createGLEnhancer(enh);
+              if (!glEnhRef.current) console.warn("[enhance] no WebGL2 — enhancement unavailable");
+            }
+            const ms = glEnhRef.current?.process(canvas, w, h,
+              { denoise: denoiseRef.current, sharpen: sharpenRef.current }) ?? 0;
+            // Switches itself off rather than stutter through a procedure:
+            // 15 ms of a 33 ms frame is where the chain starts costing frames
+            // instead of improving them.
+            const s = costSamplesRef.current;
+            s.push(ms);
+            if (s.length > 60) s.shift();
+            if (s.length === 60 && s.slice().sort((a, b) => a - b)[30] > 15) {
+              s.length = 0;
+              setDenoise(0); setSharpen(0);
+              setSlowNote(t("Enhancement switched off — it was too slow on this computer."));
+            }
           }
         } catch (err) {
           console.error("[live] canvas paint failed, falling back to the raw video", err);
@@ -883,7 +1405,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       cancelled = true;
       try { anyVid.cancelVideoFrameCallback?.(handle); } catch { /* already gone */ }
     };
-  }, [showLive, liveCanvasOk, streaming, captureMode]);
+  }, [showLive, liveCanvasOk, streaming, captureMode, enhanceOn]);
 
   const insecure = typeof window !== "undefined" && !window.isSecureContext;
 
@@ -904,99 +1426,163 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     }
   }
 
-  // WebSocket — connect once on mount
+  /**
+   * The inference socket: opened on mount, and re-opened by itself afterwards.
+   *
+   * Reconnecting is enough on its own to resume detection — the capture loop
+   * does NOT exit when the socket goes away, it spins on requestAnimationFrame
+   * waiting for `readyState === OPEN` (see startLoop) and picks straight back
+   * up. So the reconnect path must never touch `scanRef`; only the unmount
+   * cleanup stops the loop.
+   *
+   * `connect` is defined inside the effect so one closure serves every attempt.
+   * Anything that must be CURRENT rather than mount-time is read from a ref —
+   * see wsUrlRef.
+   */
   useEffect(() => {
-    const ws = new WebSocket(WS_URL);
-    wsRef.current = ws;
+    // Set by the cleanup. Distinguishes "the socket dropped" from "this player
+    // is going away", which is the difference between reconnecting and not.
+    let gone = false;
+    let retry = 0;
+    let timer: ReturnType<typeof setTimeout> | null = null;
 
-    ws.onopen  = () => setWsStatus("open");
-    ws.onerror = () => setWsStatus("error");
-    ws.onclose = (e) => { setWsStatus("closed"); setCloseCode(e.code); flushPending(); };
+    const connect = () => {
+      if (gone) return;
+      const ws = new WebSocket(wsUrlRef.current);
+      wsRef.current = ws;
 
-    ws.onmessage = (e) => {
-      let data: unknown;
-      try { data = JSON.parse(e.data); } catch { return; }
+      ws.onopen  = () => { retry = 0; setWsStatus("open"); };
+      ws.onerror = () => setWsStatus("error");
+      ws.onclose = (e) => {
+        setCloseCode(e.code);
+        // Every frame still awaiting a reply is now never going to get one.
+        flushPending();
+        if (gone) { setWsStatus("closed"); return; }
+        setWsStatus("reconnecting");
+        const wait = Math.min(WS_RETRY_MAX_MS, WS_RETRY_BASE_MS * 2 ** retry);
+        retry += 1;
+        timer = setTimeout(connect, wait);
+      };
 
-      // An error reply still answers exactly one request, so it must consume
-      // exactly one queue slot -- otherwise every later reply is off by one.
-      if (data && typeof data === "object" && "error" in data) {
-        const err = (data as { error: string }).error;
-        setLastError(err);
-        const failed = pendingQueueRef.current.shift();
-        if (failed && !failed.done) { failed.done = true; failed.resolve(null); }
-        return;
-      }
+      ws.onmessage = (e) => {
+        let data: unknown;
+        try { data = JSON.parse(e.data); } catch { return; }
 
-      // Front of the queue is this reply's request -- see Pending. Taken before
-      // anything else so an early return cannot leave the queue misaligned.
-      const entry = pendingQueueRef.current.shift();
-
-      const { boxes, timing } = data as { boxes: Box[]; timing: Timing };
-      const g = (data as { timing?: { gate?: GateState } }).timing?.gate;
-      if (g) setGate(g);
-      onActivity?.();
-      msHistory.current.push(timing.modal_ms);
-      if (msHistory.current.length > 10) msHistory.current.shift();
-      const avg = Math.round(msHistory.current.reduce((a, b) => a + b, 0) / msHistory.current.length);
-      // Round trip as the operator actually experiences it: stamped just before
-      // ws.send, read here. timing.modal_ms is server-side only (the name is a
-      // misnomer kept for UI compatibility — on this box there is no Modal, it
-      // is CPU time), so the difference is everything the wire and the browser
-      // cost on top. Clamped at 0: a sub-millisecond LAN can round negative.
-      const rtt = entry ? performance.now() - entry.sentAt : 0;
-      if (rtt > 0) {
-        rttHistory.current.push(rtt);
-        if (rttHistory.current.length > 10) rttHistory.current.shift();
-      }
-      const avgRtt = rttHistory.current.length
-        ? Math.round(rttHistory.current.reduce((a, b) => a + b, 0) / rttHistory.current.length)
-        : 0;
-      receivedCountRef.current += 1;
-      const nowMs = performance.now();
-      if (lastArrivalRef.current) {
-        arrivalHistory.current.push(nowMs - lastArrivalRef.current);
-        if (arrivalHistory.current.length > 20) arrivalHistory.current.shift();
-      }
-      lastArrivalRef.current = nowMs;
-      const avgGap = arrivalHistory.current.length
-        ? arrivalHistory.current.reduce((a, b) => a + b, 0) / arrivalHistory.current.length
-        : 0;
-      const liveFps = avgGap > 0 ? Math.round((1000 / avgGap) * 10) / 10 : 0;
-      setStats((s) => ({
-        sent: s.sent, received: s.received + 1, avgMs: avg,
-        rttMs: avgRtt, netMs: avgRtt ? Math.max(0, avgRtt - avg) : 0, fps: liveFps,
-      }));
-
-      // Best-effort, throttled report so spectator mode can show these same
-      // numbers (see spectate_bus.py's _room_stats) -- fire-and-forget, never
-      // awaited, must never be able to slow this handler down. Throttled
-      // (not per-frame) because nothing downstream needs sub-2s freshness
-      // and a report every inference frame would just be needless traffic.
-      if (caseId !== "no-case") {
-        const now = performance.now();
-        if (now - roomStatsLastPostRef.current > 2000) {
-          roomStatsLastPostRef.current = now;
-          const netMs = avgRtt ? Math.max(0, avgRtt - avg) : 0;
-          const fps = liveFps;
-          void fetch(`${API}/api/spectate/${encodeURIComponent(caseId)}/room-stats`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              sent: sentCountRef.current, received: receivedCountRef.current,
-              avg_ms: avg, rtt_ms: avgRtt, net_ms: netMs, fps,
-            }),
-          }).catch(() => { /* best-effort — never interrupt the live loop over this */ });
+        // An error reply still answers exactly one request, so it must consume
+        // exactly one queue slot -- otherwise every later reply is off by one.
+        if (data && typeof data === "object" && "error" in data) {
+          const err = (data as { error: string }).error;
+          setLastError(err);
+          const failed = pendingQueueRef.current.shift();
+          if (failed && !failed.done) { failed.done = true; failed.resolve(null); }
+          return;
         }
-      }
 
-      // A frame we already timed out on still gets its reply eventually. The
-      // loop has long moved past it, so the data is dropped -- the tombstone's
-      // only job was to keep the queue aligned, and the shift above did that.
-      if (entry && !entry.done) { entry.done = true; entry.resolve({ boxes, timing }); }
+        // Front of the queue is this reply's request -- see Pending. Taken before
+        // anything else so an early return cannot leave the queue misaligned.
+        const entry = pendingQueueRef.current.shift();
+
+        const { boxes, timing } = data as { boxes: Box[]; timing: Timing };
+        const g = (data as { timing?: { gate?: GateState } }).timing?.gate;
+        if (g) setGate(g);
+        onActivity?.();
+        msHistory.current.push(timing.modal_ms);
+        if (msHistory.current.length > 10) msHistory.current.shift();
+        const avg = Math.round(msHistory.current.reduce((a, b) => a + b, 0) / msHistory.current.length);
+        // Round trip as the operator actually experiences it: stamped just before
+        // ws.send, read here. timing.modal_ms is server-side only (the name is a
+        // misnomer kept for UI compatibility — on this box there is no Modal, it
+        // is CPU time), so the difference is everything the wire and the browser
+        // cost on top. Clamped at 0: a sub-millisecond LAN can round negative.
+        const rtt = entry ? performance.now() - entry.sentAt : 0;
+        if (rtt > 0) {
+          rttHistory.current.push(rtt);
+          if (rttHistory.current.length > 10) rttHistory.current.shift();
+        }
+        const avgRtt = rttHistory.current.length
+          ? Math.round(rttHistory.current.reduce((a, b) => a + b, 0) / rttHistory.current.length)
+          : 0;
+        receivedCountRef.current += 1;
+        const nowMs = performance.now();
+        if (lastArrivalRef.current) {
+          arrivalHistory.current.push(nowMs - lastArrivalRef.current);
+          if (arrivalHistory.current.length > 20) arrivalHistory.current.shift();
+        }
+        lastArrivalRef.current = nowMs;
+        const avgGap = arrivalHistory.current.length
+          ? arrivalHistory.current.reduce((a, b) => a + b, 0) / arrivalHistory.current.length
+          : 0;
+        const liveFps = avgGap > 0 ? Math.round((1000 / avgGap) * 10) / 10 : 0;
+        setStats((s) => ({
+          sent: s.sent, received: s.received + 1, avgMs: avg,
+          rttMs: avgRtt, netMs: avgRtt ? Math.max(0, avgRtt - avg) : 0, fps: liveFps,
+        }));
+
+        // Raw samples and their long baselines, for the HUD's spike colouring.
+        // Everything above is untouched: the averages the grid shows and the
+        // room-stats POST sends are computed exactly as before.
+        const curNet = rtt > 0 ? Math.max(0, rtt - timing.modal_ms) : 0;
+        const curFps = avgGap > 0 ? 1000 / avgGap : 0;
+        if (rtt > 0) { rttBase.current.push(rtt); netBase.current.push(curNet); }
+        serverBase.current.push(timing.modal_ms);
+        if (curFps > 0) fpsBase.current.push(curFps);
+        setCur({ rtt, server: timing.modal_ms, net: curNet, fps: curFps });
+
+        // Best-effort, throttled report so spectator mode can show these same
+        // numbers (see spectate_bus.py's _room_stats) -- fire-and-forget, never
+        // awaited, must never be able to slow this handler down. Throttled
+        // (not per-frame) because nothing downstream needs sub-2s freshness
+        // and a report every inference frame would just be needless traffic.
+        if (caseIdRef.current !== "no-case") {
+          const now = performance.now();
+          if (now - roomStatsLastPostRef.current > 2000) {
+            roomStatsLastPostRef.current = now;
+            const netMs = avgRtt ? Math.max(0, avgRtt - avg) : 0;
+            const fps = liveFps;
+            void fetch(`${API}/api/spectate/${encodeURIComponent(caseIdRef.current)}/room-stats`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                sent: sentCountRef.current, received: receivedCountRef.current,
+                avg_ms: avg, rtt_ms: avgRtt, net_ms: netMs, fps,
+                uplink_mbps: uplinkMbpsRef.current ?? 0,
+              }),
+            }).catch(() => { /* best-effort — never interrupt the live loop over this */ });
+          }
+        }
+
+        // A frame we already timed out on still gets its reply eventually. The
+        // loop has long moved past it, so the data is dropped -- the tombstone's
+        // only job was to keep the queue aligned, and the shift above did that.
+        if (entry && !entry.done) { entry.done = true; entry.resolve({ boxes, timing }); }
+      };
+
     };
 
-    return () => { ws.close(); scanRef.current = false; };
+    connect();
+    // Rotating the case id means a new patient and a new spectator room, and
+    // the backend reads case_id from the query string once per connection --
+    // so the only way to move it is a fresh socket. Closing is enough: onclose
+    // schedules the reconnect, which reads the new URL out of wsUrlRef.
+    reopenSocketRef.current = () => { retry = 0; wsRef.current?.close(); };
+
+    return () => {
+      gone = true;
+      if (timer) clearTimeout(timer);
+      reopenSocketRef.current = null;
+      wsRef.current?.close();
+      scanRef.current = false;
+    };
   }, []);
+
+  // Follow a case-id rotation onto a new socket. Skips the first run, which is
+  // the id the socket was just opened with.
+  const lastCaseIdRef = useRef(caseId);
+  useEffect(() => {
+    if (lastCaseIdRef.current === caseId) return;
+    lastCaseIdRef.current = caseId;
+    reopenSocketRef.current?.();
+  }, [caseId]);
 
   // Stop camera tracks on unmount
   useEffect(() => {
@@ -1010,6 +1596,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         liveInferenceReleaseRef.current();
         liveInferenceReleaseRef.current = null;
       }
+      gateOutsideSinceRef.current = null;
+      // Read through the ref: this cleanup runs once with the mount-time
+      // closure, so the state variable here would be the empty first array.
+      for (const s of shotsRef.current) URL.revokeObjectURL(s.url);
     };
   }, []);
 
@@ -1039,6 +1629,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       bbox: [b.bbox[0] * k, b.bbox[1] * k, b.bbox[2] * k, b.bbox[3] * k] as [number, number, number, number],
     }));
     drawBoxes(canvas, source, scaled, (det) => t("polyp  {conf}%", { conf: Math.round(det.conf * 100) }));
+    // Exactly one statement, and nothing that can throw: this runs on the
+    // synchronous settle path inside the scan loop's try/finally, where a
+    // throw stops scanning for the rest of the session.
+    analyzedGenRef.current++;
   }
 
   // The single writer of "what is on screen right now" -- the indicator, the
@@ -1263,6 +1857,24 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     bestRef.current = null;
   }
 
+  /** Keep the frame that was just scored, for the review panel's timeline.
+   *
+   *  The JPEG is the very one the loop already encoded and sent for inference,
+   *  so this is an array push and nothing else: no encode, no re-encode, no
+   *  copy, no decode, no disk I/O, nothing awaited. The clinic PC must not pay
+   *  for a replay feature while it is inferring. Boxes are already in this
+   *  JPEG's own pixel space -- it is the frame they were scored on. */
+  function keepFrame(jpeg: Blob, cap: HTMLCanvasElement, boxes: Box[]) {
+    if (!procedureStartedRef.current || !procStartRef.current) return;
+    frameStoreRef.current.push({
+      atMs: Date.now() - procStartRef.current,
+      jpeg,
+      boxes,
+      w: cap.width,
+      h: cap.height,
+    });
+  }
+
   // Auto-capture — one filed frame per appearance, chosen for being the
   // clearest frame of that appearance rather than the first one. The tier table
   // at the top of this file says why each bar is where it is.
@@ -1301,6 +1913,22 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     episodeHitsRef.current += 1;
     considerBest(cap, hi, boxes);
 
+    // TWO captures per appearance, 2026-10-11 (ADR 0005):
+    //
+    //   "first" -- this frame, filed immediately, no bar to clear. Tier 3 beeps
+    //     on the first drawn box, so anything stricter here means the room
+    //     hears a sound with nothing behind it for a reviewer to look at. And a
+    //     lesion the model glimpsed only once is precisely the one most likely
+    //     to have been missed by eye, which is what this product is for.
+    //   "best"  -- below, unchanged: the clearest frame of the appearance
+    //     (frameScore: sharpness, confidence, apparent size), filed once
+    //     FILE_MIN_MS has passed or the appearance ends, whichever comes first,
+    //     then refreshed while the lesion stays on screen.
+    //
+    // FILE_MIN_HITS still guards "best" only, so a single-frame detection files
+    // exactly one image rather than the same frame twice.
+    if (episodeHitsRef.current === 1) flushBest(now, "first");
+
     const age = now - episodeStartRef.current;
 
     // Tier 2 — the capture. First filing waits for the window to close; after
@@ -1314,15 +1942,51 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   }
 
   /** Tier 2. Hand the best frame of this appearance to the uploader. */
-  function flushBest(now: number) {
+  function flushBest(now: number, kind: "first" | "best" = "best") {
     const best = bestRef.current;
     const canvas = bestCanvasRef.current;
     if (!best || !canvas) return;
-    episodeFiledRef.current = true;
-    lastAutoCaptureRef.current = now;
     const boxes = best.boxes;
-    bestRef.current = null;  // a refresh picks a fresh best, not this one again
-    canvas.toBlob((blob) => { if (blob) sendCapture(blob, boxes); }, "image/jpeg", 0.82);
+    // "first" deliberately leaves the episode bookkeeping alone: the "best"
+    // capture still happens afterwards on its own schedule. Marking the episode
+    // filed here would push the best frame out to the refresh interval instead
+    // of FILE_MIN_MS, and clearing bestRef would stop it being scored at all.
+    if (kind === "best") {
+      episodeFiledRef.current = true;
+      lastAutoCaptureRef.current = now;
+      bestRef.current = null;  // a refresh picks a fresh best, not this one again
+    }
+    const w = canvas.width, h = canvas.height;
+    canvas.toBlob((blob) => {
+      if (!blob) return;
+      sendCapture(blob, boxes, kind, pushShot(blob, boxes, kind, w, h));
+    }, "image/jpeg", 0.82);
+  }
+
+  /** Keep a filed capture on screen, now, without waiting for its upload.
+   *
+   *  Called from the two toBlob callbacks rather than from sendCapture,
+   *  because sendCapture runs TWICE for a deferred capture -- once to park it
+   *  in deferredRef and once again from the finally re-dispatch -- and that
+   *  would file the same frame into the strip twice. */
+  function pushShot(blob: Blob, boxes: Box[], kind: Shot["kind"], w: number, h: number): string {
+    const id = `s${++shotSeqRef.current}`;
+    const url = URL.createObjectURL(blob);
+    setShots((prev) => {
+      const next = [{ id, url, at: Date.now(), kind, boxes, w, h, uploaded: false }, ...prev];
+      // Revoking the evicted URL is what keeps this bounded in memory, but not
+      // while someone is looking at that exact frame enlarged -- the img would
+      // break under them. It is released on unmount either way.
+      for (const gone of next.slice(SHOT_RING)) {
+        if (gone.id !== openShotIdRef.current) URL.revokeObjectURL(gone.url);
+      }
+      return next.slice(0, SHOT_RING);
+    });
+    return id;
+  }
+
+  function markShotUploaded(id: string) {
+    setShots((prev) => prev.map((s) => (s.id === id ? { ...s, uploaded: true } : s)));
   }
 
   /** One upload at a time, with a single holding slot behind it.
@@ -1334,23 +1998,46 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
    *  the PREVIOUS appearance's timestamp, so a lesion that came and went inside
    *  that window was never filed at all. Deferring instead of dropping means
    *  the bookkeeping above can be honest — the capture really will be sent. */
-  function sendCapture(blob: Blob, boxes: Box[]) {
-    if (uploadingRef.current) { deferredRef.current = { blob, boxes }; return; }
+  function sendCapture(blob: Blob, boxes: Box[], kind: "first" | "best", shotId?: string) {
+    // A second deferral overwrites the first, so that blob never reaches the
+    // server. Its strip tile keeps uploaded:false and renders dimmed -- the
+    // strip must not imply a reviewer will find the frame in the queue.
+    if (uploadingRef.current) { deferredRef.current = { blob, boxes, kind, shotId }; return; }
     uploadingRef.current = true;
+    // Read before the upload, not after: a deferred capture can sit behind an
+    // in-flight one for seconds, and the bar has to mark when the frame was
+    // TAKEN, not when it finally got sent.
+    const takenAtMs = procStartRef.current ? Date.now() - procStartRef.current : 0;
     const fd = new FormData();
     fd.append("file", blob, "frame.jpg");
     fd.append("ai_detections", JSON.stringify(boxes));
+    // Which of an appearance's two captures this is -- see maybeAutoCapture.
+    fd.append("capture_kind", kind);
     // No clip. The session recording already holds this moment, so all a
     // reviewer needs is where to seek to — a few bytes instead of the ~250 KB
     // of video that was starving the live frame stream.
-    const at = recorder.mark();
+    const at = recorderRef.current.mark();
     if (at) {
       fd.append("recording_id", at.recordingId);
       fd.append("video_offset_ms", String(at.offsetMs));
     }
     void (async () => {
       try {
-        await fetch(`${API}/api/feedback/${caseId}/auto-capture`, { method: "POST", body: fd });
+        // caseIdRef, not caseId: this runs out of the capture loop's closure,
+        // which predates any rotation. Same hazard as recorderRef above.
+        // The response carries the name the server filed this under, which is
+        // the capture's identity in the review panel. Pairing that name with
+        // the moment it was taken is what lets the timeline put the tick in
+        // the right place, and seek to it exactly.
+        const res = await fetch(`${API}/api/feedback/${caseIdRef.current}/auto-capture`,
+                               { method: "POST", body: fd });
+        if (procStartRef.current) {
+          try {
+            const name = (await res.json())?.filename;
+            if (typeof name === "string" && name) captureAtRef.current.set(name, takenAtMs);
+          } catch { /* not JSON -- the timestamp fallback in atMsOf covers it */ }
+        }
+        if (shotId) markShotUploaded(shotId);
         setFeedbackRefreshKey((k) => k + 1);
       } catch {
         /* best-effort — never interrupt the live loop over this */
@@ -1358,7 +2045,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         uploadingRef.current = false;
         const next = deferredRef.current;
         deferredRef.current = null;
-        if (next) sendCapture(next.blob, next.boxes);
+        if (next) sendCapture(next.blob, next.boxes, next.kind, next.shotId);
       }
     })();
   }
@@ -1394,19 +2081,21 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     const cap = captureCanvas(video, src);
     cap.toBlob(async (blob) => {
       if (!blob) return;
+      const shotId = pushShot(blob, lastBoxesRef.current, "dr", cap.width, cap.height);
       const fd = new FormData();
       fd.append("file", blob, "frame.jpg");
       fd.append("ai_detections", JSON.stringify(lastBoxesRef.current));
       // No clip. The session recording already holds this moment, so all a
       // reviewer needs is where to seek to — a few bytes instead of the ~250 KB
       // of video that was starving the live frame stream.
-      const at = recorder.mark();
+      const at = recorderRef.current.mark();
       if (at) {
         fd.append("recording_id", at.recordingId);
         fd.append("video_offset_ms", String(at.offsetMs));
       }
       try {
         await fetch(`${API}/api/feedback/${caseId}/dr-found/capture`, { method: "POST", body: fd });
+        markShotUploaded(shotId);
         setFeedbackRefreshKey((k) => k + 1);
       } catch { /* best-effort */ }
     }, "image/jpeg", 0.82);
@@ -1415,6 +2104,88 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // A demo clip or a saved recording is a file, so it has a timeline that staff
   // can scrub. A camera or screen share does not — nothing to seek in a stream.
   const seekable = captureMode === "demo" || captureMode === "recording" || captureMode === "local";
+
+  // The bar only grows while a procedure is running, so the heartbeat only
+  // runs then. 1 Hz is enough for a clock measured in minutes.
+  useEffect(() => {
+    if (!streaming || !procedureStarted) return;
+    const id = setInterval(() => setTimelineTick((n) => n + 1), 1000);
+    return () => clearInterval(id);
+  }, [streaming, procedureStarted]);
+
+  /** What the review panel needs to draw and play the timeline. Undefined
+   *  before a procedure starts, which is also how the panel decides to keep
+   *  its thumbnail strips instead. */
+  const timelineSource: TimelineSource | undefined = useMemo(() => {
+    if (!procStartRef.current) return undefined;
+    const store = frameStoreRef.current;
+    const started = procStartRef.current;
+    return {
+      totalMs: Math.max(1000, Date.now() - started),
+      playableFromMs: store.fromMs,
+      atMsOf: (e) => {
+        const exact = captureAtRef.current.get(e.filename);
+        if (exact !== undefined) return exact;
+        // Filed by another device, or before this procedure started. Fall back
+        // to the server's own timestamp, which is seconds-resolution and on
+        // the server's clock -- good enough to place a tick, not good enough
+        // to seek to, which is why the exact map exists at all.
+        const ts = Number(e.timestamp) * 1000;
+        if (!Number.isFinite(ts)) return null;
+        const rel = ts - started;
+        if (rel < -2000 || rel > Date.now() - started + 2000) return null;
+        return Math.max(0, rel);
+      },
+      getFrames: () => store.frames,
+    };
+    // timelineTick is the dependency that matters: it is what makes totalMs
+    // and playableFromMs refresh while the procedure runs.
+  }, [timelineTick, procedureStarted]);
+
+  /** Which case the timeline currently describes, so a rotation can be told
+   *  from a re-render. */
+  const timelineCaseRef = useRef<string | null>(null);
+
+  // Owns the procedure clock -- the timeline's whole axis -- and nothing else
+  // does.
+  //
+  // It cannot live in the Start/Stop handler alone, which is where it started:
+  // `procedureStarted` DEFAULTS TO TRUE, so a session that is simply begun --
+  // kiosk autostart, or picking a test video and never touching that button --
+  // never fires that handler, never got a clock, and the store then silently
+  // kept nothing at all. The replay looked implemented and did nothing.
+  //
+  // It also has to react to the case changing. Kiosk mode rotates the case per
+  // patient without anyone pressing Stop, and without this the previous
+  // patient's frames would still be in the store, on a clock that started
+  // before they arrived.
+  //
+  // Note what this does NOT depend on: recording. The replay plays the frames
+  // the model scored, not the session recording (see lib/frameRing.ts for why
+  // that recording cannot be played from the middle at all), so it works with
+  // saving switched off -- on a test video that is already on disk, for
+  // instance -- and never puts a byte on the link.
+  useEffect(() => {
+    const active = streaming && procedureStarted;
+    if (timelineCaseRef.current !== caseId) {
+      timelineCaseRef.current = caseId;
+      frameStoreRef.current.clear();
+      captureAtRef.current.clear();
+      procStartRef.current = 0;
+    }
+    if (!active) procStartRef.current = 0;
+    else if (!procStartRef.current) procStartRef.current = Date.now();
+    setTimelineTick((n) => n + 1);
+  }, [caseId, streaming, procedureStarted]);
+
+  /** The same frames, for the capture strip's enlarged view -- so clicking a
+   *  tile in fullscreen plays forward from that moment instead of only showing
+   *  it as a still. */
+  const stripReplay: StripReplay | undefined = useMemo(() => {
+    if (!procStartRef.current) return undefined;
+    const started = procStartRef.current;
+    return { getFrames: () => frameStoreRef.current.frames, procStartMs: started };
+  }, [timelineTick, procedureStarted]);
 
   function handleTimeUpdate() {
     if (videoRef.current) setCurTime(videoRef.current.currentTime);
@@ -1537,6 +2308,9 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       result: Promise<{ boxes: Box[]; timing: Timing } | null>;
       cap: HTMLCanvasElement;
       hi: HTMLCanvasElement;
+      /** The JPEG already encoded for the wire. Carried so the review
+       *  timeline can keep it without encoding a second copy. */
+      jpeg: Blob;
     };
     let inFlight: InFlight | null = null;
 
@@ -1553,6 +2327,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         updateBoxes(shown);
         drawAnalyzedFrame(f.cap, f.hi, shown);
         maybeAutoCapture(shown, f.cap, f.hi);
+        keepFrame(f.jpeg, f.cap, shown);
       } else {
         // A timed-out frame is not evidence the lesion left, but it is not
         // evidence it is still there either. maybeAutoCapture is the only writer
@@ -1605,8 +2380,8 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       // panels and the captured feedback frames all share one aspect ratio.
       setAspect(`${srcW}/${srcH}`);
 
-      const scale = INFER_WIDTH / srcW;
-      const capW  = INFER_WIDTH;
+      const scale = inferWidth / srcW;
+      const capW  = inferWidth;
       const capH  = Math.round(srcH * scale);
       const cap   = document.createElement("canvas");
       cap.width   = capW;
@@ -1623,16 +2398,27 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       const capCtx = cap.getContext("2d")!;
       capCtx.imageSmoothingEnabled = true;
       capCtx.imageSmoothingQuality = "high";
-      capCtx.drawImage(video, srcX, srcY, srcW, srcH, 0, 0, capW, capH);
+      if (capH * 2 >= srcH) {
+        // ...but that incidental blend only happens when the shrink is
+        // aggressive. A 640 capture keeps ~427 of 480 lines, the comb would
+        // survive, so larger sizes get the real motion-adaptive treatment,
+        // same as the full-size paths.
+        drawDeinterlaced(video, srcX, srcY, srcW, srcH, cap, capW, capH);
+      } else {
+        capCtx.drawImage(video, srcX, srcY, srcW, srcH, 0, 0, capW, capH);
+      }
       // Grabbed now, from this same video frame, so a filed capture and the boxes
       // drawn on it describe the same instant. See grabCapture.
       const hi = grabCapture(video, srcX, srcY, srcW, srcH);
+      // The gates read a fixed-320 view so a larger model imgsz never moves
+      // their operating points (thresholds were fitted on 320px captures).
+      const gateCap = capW > INFER_WIDTH ? downscaleForGates(cap) : cap;
 
       // Out of body: no JPEG encode, no round trip, no inference. The panel keeps
       // showing the real frame with no boxes, so it stays obvious that the feed is
       // live and the detector is simply not being asked. Paced at roughly the
       // inference cadence rather than spinning a tight while loop.
-      const insideNow = inBody.shouldInfer(cap);
+      const insideNow = inBody.shouldInfer(gateCap);
       applyAutoRecord(insideNow);
       if (!insideNow) {
         await drainInFlight();
@@ -1650,7 +2436,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       // ON by default at level "medium" (useQualityGate.ts), which by the table
       // in lib/frameQuality also rejects ~3.5% of frames a doctor labelled as
       // containing a polyp. That is a real cost, paid before inference runs.
-      if (!quality.shouldInfer(cap)) {
+      if (!quality.shouldInfer(gateCap)) {
         await drainInFlight();
         updateBoxes([]);
         drawAnalyzedFrame(cap, hi, []);
@@ -1672,7 +2458,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       // frame of extra latency between picture and boxes, in exchange for the
       // round trip no longer being serialised against inference.
       const prev = inFlight;
-      inFlight = { result: sent, cap, hi };
+      inFlight = { result: sent, cap, hi, jpeg: blob };
       if (prev) await settle(prev);
     }
 
@@ -1683,6 +2469,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         liveInferenceReleaseRef.current();
         liveInferenceReleaseRef.current = null;
       }
+      gateOutsideSinceRef.current = null;
     }
   }
 
@@ -1692,10 +2479,14 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   /** Put last session's device back in the box, so the clinic's capture card
    *  is already selected and starting it is one click.
    *
-   *  Preselect only, never auto-start: opening a camera stays the operator's
-   *  own gesture, and a remembered choice that has since become the wrong one
-   *  must not begin streaming before they get the chance to change it. This is
-   *  the same reason requestDevices does not start anything either. */
+   *  Preselect only: opening a camera stays the operator's own gesture, and a
+   *  remembered choice that has since become the wrong one must not begin
+   *  streaming before they get the chance to change it. This is the same
+   *  reason requestDevices does not start anything either.
+   *
+   *  The one exception is the `autoStart` prop, which the clinic PC sets
+   *  because there is no operator there to make the gesture. It is opt-in per
+   *  machine and off everywhere else. */
   function preselectRemembered(cams: MediaDeviceInfo[]) {
     if (selectedDeviceId) return;
     try {
@@ -1705,7 +2496,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       // stable per origin and profile, and a cleared profile would otherwise
       // forget a device that is still physically plugged in.
       const hit = cams.find((d) => d.deviceId === id)
-        ?? (label ? cams.find((d) => d.label === label) : undefined);
+        ?? (label ? cams.find((d) => d.label === label) : undefined)
+        // Nothing remembered: a fresh browser profile, which on the clinic PC
+        // is the one occasion nobody is going to open the dropdown.
+        ?? pickCaptureCard(cams);
       if (hit) setSelectedId(hit.deviceId);
     } catch { /* ignore */ }
   }
@@ -1817,6 +2611,21 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         lastFrameSizeRef.current = { w: got?.width ?? 0, h: got?.height ?? 0 };
       }
       setSourceMode({ text: describeMode(got, negotiated.padFraction), padded: negotiated.padded });
+      // Does this driver let the browser retune the card's front end? The
+      // answer differs per device and per driver, so it is asked, not assumed.
+      const track = stream.getVideoTracks()[0];
+      const caps = readProcAmpCaps(track);
+      setProcAmpCaps(caps);
+      if (caps) {
+        const initial = readProcAmpValues(track, caps);
+        setProcAmp(initial);
+        procAmpRef.current = initial;
+        // Wait for the canvas to hold real frames -- auto-tune measures the
+        // picture, and there is nothing to measure before the first paint.
+        setTimeout(() => { void runAutoTune(caps); }, 1200);
+      } else {
+        setTuneNote("");
+      }
       setModeScan(negotiated.tried);
       streamRef.current = stream;
       setActiveStream(stream);
@@ -1825,6 +2634,12 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         video.srcObject = stream;
         await video.play();
       }
+      // Unplugged, or a driver reset. startScreenShare has always watched for
+      // this; the camera path never did, so a dead card left a frozen picture
+      // and nothing else. Handled identically here -- and on the clinic PC the
+      // kiosk watchdog then re-opens it, because stopCamera clears streamRef
+      // and that is exactly what the watchdog looks for.
+      stream.getVideoTracks()[0].addEventListener("ended", stopCamera);
       switchCaptureMode("camera");
       setCameraBusy(false);
       setLastError("");
@@ -2105,7 +2920,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     scanRef.current = false;
     // Close the recording before killing the tracks: stop() flushes the final
     // slice, and a recorder whose source has already died has nothing to flush.
-    recorder.stop();
+    recorderRef.current.stop();
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     setActiveStream(null);
@@ -2131,8 +2946,108 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // keep being drawn into for inference to continue while it's out of sight.
   // One per panel: either can take the screen on its own, and coming back
   // must not disturb the other.
+  /** First click. Decides HOW the doctor window will be placed; the window
+   *  itself is opened by a second click below.
+   *
+   *  Split in two deliberately. getScreenDetails() prompts, and awaiting a
+   *  prompt spends the click's user activation -- a window.open() afterwards
+   *  is at the popup blocker's mercy. The picker gives the open its own fresh
+   *  gesture. Where no prompt is involved the window opens on this click. */
+  function onDoctorScreenClick() {
+    setDoctorNote(null);
+    setDoctorManual(false);
+    if (!canPlaceWindows()) {
+      // Firefox and Safari: no placement API, and no prompt to await, so this
+      // is still the original gesture and the popup is allowed.
+      doctor.open();
+      setDoctorNote(t("This browser can't put a window on a display you choose. Drag the doctor window onto the other monitor, then press Full screen inside it."));
+      return;
+    }
+    if (!hasSecondDisplay()) {
+      doctor.open();
+      setDoctorNote(t("Only one display is connected — the doctor view opened on this one."));
+      return;
+    }
+    void (async () => {
+      const list = await listDisplays();
+      if (!list || list.length < 2) {
+        // Denied or dismissed. Do NOT re-prompt in a loop -- once denied,
+        // getScreenDetails rejects immediately and nothing the page does
+        // changes that. Offer the manual route instead.
+        setDoctorManual(true);
+        setDoctorNote(t("Permission to use the other display wasn't given. You can still open the doctor window here and drag it across, or allow 'Window management' for this site in the browser's site settings."));
+        return;
+      }
+      setDisplays(list);
+      setChosenDisplay(suggestDisplay(list)?.index ?? 0);
+    })();
+  }
+
+  // Only attached once a picker is up, so the permission is already granted
+  // and this never prompts.
+  useEffect(() => {
+    if (!displays) return;
+    let off = () => {};
+    let dead = false;
+    void watchDisplays(() => {
+      setDoctorNote(t("The displays changed — if the doctor window moved, close it and open it again."));
+      void listDisplays().then((l) => { if (l && !dead) setDisplays(l); });
+    }).then((fn) => { if (dead) fn(); else off = fn; });
+    return () => { dead = true; off(); };
+  }, [displays, t]);
+
+  function describeDisplay(d: DoctorDisplay): string {
+    const parts = [`#${d.index + 1}`, `${d.width}×${d.height}`];
+    if (d.label) parts.splice(1, 0, d.label);
+    if (d.isCurrent) parts.push(t("this one"));
+    else if (d.isInternal) parts.push(t("built-in"));
+    if (d.isPrimary) parts.push(t("primary"));
+    return parts.join(" · ");
+  }
+
+  // One object, built once per render, so the in-page grid and the overlay
+  // cannot disagree about what the numbers are.
+  const hudStats: LatencyStats = {
+    sent: stats.sent,
+    received: stats.received,
+    rtt:    { shown: stats.rttMs, cur: cur.rtt,    baseline: rttBase.current.mean,    n: rttBase.current.n },
+    server: { shown: stats.avgMs, cur: cur.server, baseline: serverBase.current.mean, n: serverBase.current.n },
+    net:    { shown: stats.netMs, cur: cur.net,    baseline: netBase.current.mean,    n: netBase.current.n },
+    fps:    { shown: stats.fps,   cur: cur.fps,    baseline: fpsBase.current.mean,    n: fpsBase.current.n },
+    uplinkMbps,
+  };
+
   const detectedFs = useFullscreen();
   const liveFs = useFullscreen();
+
+  /**
+   * Kiosk: give the detected picture the whole screen, unasked.
+   *
+   * On the clinic screen the only thing anyone wants to see is the picture
+   * with the boxes on it; the controls around it are for setting up, not for
+   * a procedure. There is nobody there to press the fullscreen button, so
+   * this presses it.
+   *
+   * requestFullscreen normally needs a user gesture. Two things make that a
+   * non-issue: Chrome's AutomaticFullscreenAllowedForUrls policy grants this
+   * origin the right to ask without one (set by clinic-pc/setup-clinic-pc.cmd),
+   * and useFullscreen already falls back to a CSS full-viewport cover when the
+   * request is refused -- so this degrades to the same view rather than
+   * failing silently.
+   *
+   * Once per mount only. An operator who leaves fullscreen has decided
+   * something, and must not be dragged back in two seconds later.
+   */
+  const autoFsRef = useRef(false);
+  useEffect(() => {
+    if (!autoStart || autoFsRef.current) return;
+    if (!streaming || !showDetected || detectedFs.active) return;
+    autoFsRef.current = true;
+    // A beat after the first frames, so the panel is sized to the real
+    // aspect ratio before it takes the screen (fsBoxStyle reads it).
+    const t = setTimeout(() => detectedFs.toggle(), 1500);
+    return () => clearTimeout(t);
+  }, [autoStart, streaming, showDetected]);   // eslint-disable-line react-hooks/exhaustive-deps
   const panelBox = "relative w-full rounded-xl overflow-hidden border border-gray-800 bg-black";
   // When a screen-share crop is active the Detected panel shows only that region,
   // so the Live panel has to be blown up and offset to the same region — otherwise
@@ -2182,7 +3097,11 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // The panel has to carry the native ratio in overlay mode, otherwise
   // object-contain letterboxes the video inside it and the overlay percentages
   // no longer line up with the picture they are describing.
-  const liveAspect = showFovOverlay && fovFrame ? `${fovFrame.w}/${fovFrame.h}` : aspect;
+  // SD pixels are not square: 720x480 is a 4:3 picture stored in a 3:2 grid,
+  // so an uncorrected panel shows everything slightly too wide. Geometry
+  // only -- no resample, nothing re-encoded.
+  const liveAspect = aspect43 ? "4/3"
+    : showFovOverlay && fovFrame ? `${fovFrame.w}/${fovFrame.h}` : aspect;
   const liveStyle = liveCrop
     ? {
         width: `${100 / liveCrop.w}%`,
@@ -2239,6 +3158,29 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       >
         <div className={panelBox} style={detectedFs.active ? fsBoxStyle(aspect) : { aspectRatio: aspect }}>
           <canvas ref={analyzedRef} className="absolute inset-0 w-full h-full object-contain" />
+          {/* Siblings AFTER the canvas, never a wrapper around it: the canvas
+              must keep its position in this child list or React remounts it
+              and the capture loop draws into a detached element. Overlays
+              rather than layout, so the picture stays exactly the size
+              fsBoxStyle computed -- see CaptureStrip's header comment. */}
+          {detectedFs.active && (
+            <CaptureStrip
+              shots={shots}
+              position={stripPos}
+              openId={openShotId}
+              onOpen={setOpenShotId}
+              onClose={() => setOpenShotId(null)}
+              size={stripSize}
+              replay={stripReplay}
+            />
+          )}
+          {detectedFs.active && (
+            <StripChooser position={stripPos} onChange={setStripPos}
+                          size={stripSize} onSize={setStripSize} />
+          )}
+          {detectedFs.active && hudOn && (
+            <LatencyHud stats={hudStats} compact className="absolute top-3 start-3 z-40" />
+          )}
           {detectedFs.active && (
             <button onClick={detectedFs.toggle} className={fsExitBtnClass}>
               {t("Exit full screen")}
@@ -2295,9 +3237,16 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
             <canvas
               ref={liveCanvasRef}
               className={liveStyle ? "absolute object-contain" : "absolute inset-0 w-full h-full object-contain"}
-              style={liveStyle}
+              style={{ ...(liveStyle ?? {}), opacity: enhanceOn ? 0 : 1 }}
             />
           )}
+          {/* Always mounted so the WebGL context survives the sliders going
+              to zero and back; only its visibility follows them. */}
+          <canvas
+            ref={enhanceCanvasRef}
+            className={liveStyle ? "absolute object-contain" : "absolute inset-0 w-full h-full object-contain"}
+            style={{ ...(liveStyle ?? {}), opacity: enhanceOn ? 1 : 0 }}
+          />
           {/* What the crop discards. The panel is showing the whole
               frame right now (liveCrop is forced to null above), so the
               kept region is outlined and everything outside it is
@@ -2331,6 +3280,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   const wsStatusText =
     wsStatus === "open" ? t("connected") :
     wsStatus === "closed" ? t("closed ({code})", { code: closeCode ?? "" }) :
+    wsStatus === "reconnecting" ? t("reconnecting… ({code})", { code: closeCode ?? "" }) :
     t(wsStatus);
   // A real capture device is selected, as opposed to a demo clip, a saved
   // recording or a local file -- the only case where "start the camera"
@@ -2339,6 +3289,29 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     && !selectedDeviceId.startsWith(DEMO_PREFIX)
     && !selectedDeviceId.startsWith(REC_PREFIX)
     && !selectedDeviceId.startsWith(LOCAL_PREFIX);
+
+  // One <optgroup> per clinic day, newest first. A flat list stops being
+  // usable past the first day of recordings: the operator knows which day they
+  // want, never which case id, and the old label led with a locale date string
+  // on every single row.
+  const recordingDays = useMemo(() => {
+    const byDay = new Map<string, ServerRecording[]>();
+    for (const r of recordings) {
+      const key = clinicDayKey(r);
+      const bucket = byDay.get(key);
+      if (bucket) bucket.push(r);
+      else byDay.set(key, [r]);
+    }
+    return Array.from(byDay.entries())
+      .sort((a, b) => b[0].localeCompare(a[0]))
+      .map(([day, items]) => ({
+        day,
+        // Midday, so a timezone shift can't push the label onto the day before.
+        label: new Date(`${day}T12:00:00`).toLocaleDateString(lang === "fa" ? "fa-IR" : "en-GB",
+                                                             { day: "numeric", month: "long", year: "numeric" }),
+        items: [...items].sort((a, b) => b.started_at - a.started_at),
+      }));
+  }, [recordings, lang]);
 
   const deviceSelect = (
     <div className="flex flex-wrap items-center justify-center gap-2">
@@ -2362,15 +3335,15 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
             <option key={v.file} value={`${DEMO_PREFIX}${v.file}`}>{t(v.label)}</option>
           ))}
         </optgroup>
-        {recordings.length > 0 && (
-          <optgroup label={t("Saved on this server")}>
-            {recordings.map((r) => (
+        {recordingDays.map(({ day, label, items }) => (
+          <optgroup key={day} label={t("Clinic · {day} ({n})", { day: label, n: items.length })}>
+            {items.map((r) => (
               <option key={`${r.case_id}/${r.id}`} value={`${REC_PREFIX}${r.case_id}/${r.id}`}>
-                {describeRecording(r)}
+                {describeRecordingInDay(r)}
               </option>
             ))}
           </optgroup>
-        )}
+        ))}
         {localFile && (
           <optgroup label={t("From this computer")}>
             <option value={`${LOCAL_PREFIX}${localFile.name}`}>{localFile.name}</option>
@@ -2469,7 +3442,6 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
               {t("Your clip: {name}", { name: localFile.name })}
             </span>
           )}
-          {polyp && <span className="text-[#39ff14] font-medium animate-pulse">{t("Polyp detected")}</span>}
           {/* Tier 3 — the same control the spectator view gets, over the same
               behaviour. */}
           <AlertSoundControls alert={alert} />
@@ -2501,28 +3473,9 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         </div>
       )}
 
-      {/* Debug panel */}
-      <div className="bg-gray-900 border border-gray-800 rounded-lg px-3 py-2 font-mono text-xs grid grid-cols-2 gap-x-6 gap-y-0.5">
-        <span className="text-gray-500">{t("Frames sent")}</span>
-        <span className="text-white">{stats.sent}</span>
-        <span className="text-gray-500">{t("Responses back")}</span>
-        <span className="text-white">{stats.received}</span>
-        {/* Round trip split into the half we control and the half we do not. */}
-        <span className="text-gray-500">{t("Round trip (avg)")}</span>
-        <span className={stats.rttMs > 800 ? "text-red-400" : "text-green-400"}>
-          {stats.rttMs > 0 ? t("{ms} ms", { ms: stats.rttMs }) : "—"}
-        </span>
-        <span className="text-gray-500">{t("— of which server")}</span>
-        <span className="text-white">{stats.avgMs > 0 ? t("{ms} ms", { ms: stats.avgMs }) : "—"}</span>
-        <span className="text-gray-500">{t("— of which network")}</span>
-        <span className="text-white">{stats.rttMs > 0 ? t("{ms} ms", { ms: stats.netMs }) : "—"}</span>
-        <span className="text-gray-500">{t("Analysed")}</span>
-        <span className="text-white">{stats.fps > 0 ? t("{fps} fps", { fps: stats.fps.toFixed(1) }) : "—"}</span>
-        {lastError && <>
-          <span className="text-gray-500">{t("Error")}</span>
-          <span className="text-red-400 truncate">{lastError}</span>
-        </>}
-      </div>
+      {/* Debug panel -- same grid as before, now shared with the compact
+          overlay in the fullscreen view so there is one implementation. */}
+      <LatencyHud stats={hudStats} error={lastError} />
 
       {!streaming && (
         <div className="space-y-4 text-center py-16 border-2 border-dashed border-gray-700 rounded-xl">
@@ -2650,6 +3603,14 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
                 resetEpisode();
                 alert.reset();
                 lastAutoCaptureRef.current = 0;
+                // A procedure boundary is a patient boundary. Everything the
+                // timeline holds belongs to whoever just left: the frames are
+                // tens of megabytes, and the ticks would point at moments that
+                // are not on this timeline at all. The clock itself is set by
+                // the effect that owns it, not here -- see timelineCaseRef.
+                frameStoreRef.current.clear();
+                captureAtRef.current.clear();
+                setTimelineTick((n) => n + 1);
               }}
               className={`w-full md:w-auto py-2.5 px-4 rounded-xl text-white font-medium text-sm transition-colors ${
                 procedureStarted
@@ -2696,6 +3657,94 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
             >
               {t("👁 Dr. found a polyp AI missed")}
             </button>
+
+            {/* Off by default and remembered per browser. Deliberately a plain
+                visible checkbox rather than a hidden key: whoever is running
+                the session should be able to turn the numbers on without
+                being told a shortcut, and they only ever draw over the
+                fullscreen view, never the normal page. */}
+            <label className="flex items-center gap-2 text-xs text-gray-400 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={hudOn}
+                onChange={(e) => setHudOn(e.target.checked)}
+                className="accent-blue-500 cursor-pointer"
+              />
+              {t("Show latency numbers on the full-screen view")}
+            </label>
+
+            {/* Two screens, PowerPoint style: the doctor gets a clean picture
+                on one monitor, this page keeps every control on the other. */}
+            <div className="w-full rounded-xl border border-gray-800 bg-gray-900/60 px-3 py-2 space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs text-gray-400">{t("Doctor screen")}</span>
+                {doctor.ready ? (
+                  <button
+                    onClick={() => { doctor.close(); setDisplays(null); setDoctorNote(null); }}
+                    className="text-xs px-2.5 py-1 rounded-md border border-gray-700 text-gray-300 hover:border-gray-500"
+                  >
+                    {t("Close doctor screen")}
+                  </button>
+                ) : (
+                  <button
+                    onClick={onDoctorScreenClick}
+                    className="text-xs px-2.5 py-1 rounded-md border border-blue-700 bg-blue-950/40 text-blue-200 hover:border-blue-500"
+                  >
+                    {t("Open doctor screen")}
+                  </button>
+                )}
+              </div>
+
+              {!doctor.ready && displays && displays.length > 1 && (
+                <div dir="ltr" className="space-y-1">
+                  <p className="text-[11px] text-gray-500" dir={pageDir}>
+                    {t("Which display is the doctor's?")}
+                  </p>
+                  {displays.map((d) => (
+                    <label key={d.index} className="flex items-center gap-2 text-xs text-gray-300 cursor-pointer">
+                      <input
+                        type="radio"
+                        name="doctor-display"
+                        checked={chosenDisplay === d.index}
+                        onChange={() => setChosenDisplay(d.index)}
+                        className="accent-blue-500 cursor-pointer"
+                      />
+                      <span className="font-mono">{describeDisplay(d)}</span>
+                    </label>
+                  ))}
+                  <button
+                    onClick={() => {
+                      const d = displays.find((x) => x.index === chosenDisplay);
+                      if (d) doctor.open({ left: d.left, top: d.top, width: d.width, height: d.height });
+                    }}
+                    className="mt-1 text-xs px-2.5 py-1 rounded-md bg-blue-600 hover:bg-blue-500 text-white"
+                  >
+                    {t("Open doctor view there")}
+                  </button>
+                </div>
+              )}
+
+              {!doctor.ready && doctorManual && (
+                <button
+                  onClick={() => doctor.open()}
+                  className="text-xs px-2.5 py-1 rounded-md border border-gray-700 text-gray-300 hover:border-gray-500"
+                >
+                  {t("Open doctor window here")}
+                </button>
+              )}
+
+              {doctor.ready && (
+                <p className="text-[11px] text-gray-500">
+                  {t("Press Full screen inside the doctor window — a browser won't do that for a window it just opened.")}
+                </p>
+              )}
+              {doctor.error === "blocked" && (
+                <p className="text-[11px] text-red-400">
+                  {t("The browser blocked the second window. Allow pop-ups for this site and try again.")}
+                </p>
+              )}
+              {doctorNote && <p className="text-[11px] text-gray-500">{doctorNote}</p>}
+            </div>
 
             {/* Recording is opt-in: nothing is written to the server until this
                 is pressed, so a session that nobody wants archived leaves nothing. */}
@@ -2864,6 +3913,110 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
               </div>
             )}
 
+            {/* Picture controls. Collapsed by default: during a procedure
+                nobody is adjusting sliders, and an always-open block would
+                push the things that ARE pressed mid-procedure down the page. */}
+            {streaming && (
+              <div className="space-y-2">
+                <button
+                  onClick={() => setEnhOpen(!enhOpen)}
+                  className={`w-full md:w-auto flex items-center gap-2 px-3 py-2 rounded-xl border text-sm transition-colors ${
+                    enhanceOn ? "border-emerald-700 bg-emerald-950/30 text-emerald-300"
+                              : "border-gray-700 bg-gray-900 text-gray-300 hover:border-gray-500"}`}
+                >
+                  <span>🎨</span>
+                  <span>{t("Picture settings")}</span>
+                  <span className="text-xs text-gray-500">
+                    {enhanceOn ? t("on") : enhOpen ? "▾" : "▸"}
+                  </span>
+                </button>
+                {enhOpen && (
+                  <div className="rounded-xl border border-gray-800 bg-gray-900/60 px-3 py-2 space-y-2">
+                    <div className="flex items-center justify-between gap-2 text-xs">
+                      <span className="text-gray-400">{t("Deinterlace")}</span>
+                      <select
+                        value={deintMode}
+                        onChange={(e) => {
+                          setDeintMode(e.target.value as DeintMode);
+                          deintRef.current.reset();
+                          glDeintRef.current?.reset();
+                        }}
+                        className="rounded-md border border-gray-700 bg-gray-800 px-1.5 py-0.5 text-gray-300 text-xs max-w-[12rem]"
+                      >
+                        {DEINT_MODES.map((m) => (
+                          <option key={m.key} value={m.key} title={m.hint}>{t(m.label)}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    {([["Denoise", denoise, setDenoise], ["Sharpen", sharpen, setSharpen]] as const).map(
+                      ([name, value, set]) => (
+                        <div key={name}>
+                          <div className="flex items-center justify-between text-xs">
+                            <span className="text-gray-400">{t(name)}</span>
+                            <span className="font-mono text-gray-200">{Math.round(value * 100)}%</span>
+                          </div>
+                          <input type="range" min={0} max={1} step={0.05} value={value}
+                                 onChange={(e) => set(Number(e.target.value))}
+                                 className="w-full accent-blue-500 cursor-pointer" />
+                        </div>
+                      ))}
+
+                    <label className="flex items-center gap-2 text-xs text-gray-400 cursor-pointer select-none">
+                      <input type="checkbox" checked={aspect43} className="accent-blue-500"
+                             onChange={(e) => setAspect43(e.target.checked)} />
+                      {t("Correct to 4:3 (SD pixels are not square)")}
+                    </label>
+
+                    {procAmpCaps && (
+                      <div className="pt-1 border-t border-gray-800 space-y-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="text-[11px] text-gray-500">
+                            {t("From the capture card itself — these change the signal every part of the app receives.")}
+                          </p>
+                          <button
+                            onClick={() => procAmpCaps && void runAutoTune(procAmpCaps)}
+                            className="text-xs px-2 py-1 rounded-md border border-emerald-800 text-emerald-300 hover:border-emerald-600 whitespace-nowrap"
+                          >
+                            {t("Auto-tune")}
+                          </button>
+                        </div>
+                        <p className="text-[11px] text-gray-600">
+                          {t("Tuned automatically when the card is connected. Adjust only if you want to.")}
+                        </p>
+                        {tuneNote && <p className="text-[11px] text-gray-500 font-mono">{tuneNote}</p>}
+                        {Object.entries(procAmpCaps).map(([k, cap]) => (
+                          <div key={k}>
+                            <div className="flex items-center justify-between text-xs">
+                              <span className="text-gray-400">{t(k)}</span>
+                              <span className="font-mono text-gray-200">{procAmp[k] ?? cap.min}</span>
+                            </div>
+                            <input
+                              type="range" min={cap.min} max={cap.max} step={cap.step || 1}
+                              value={procAmp[k] ?? cap.min}
+                              onChange={(e) => { setTuneNote(""); void applyProcAmp(k, Number(e.target.value)); }}
+                              className="w-full accent-emerald-500 cursor-pointer"
+                            />
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {(denoise > 0 || sharpen > 0) && (
+                      <button onClick={() => { setDenoise(0); setSharpen(0); setSlowNote(""); }}
+                              className="text-xs px-2 py-1 rounded-md border border-gray-700 text-gray-300 hover:border-gray-500">
+                        {t("Turn enhancement off")}
+                      </button>
+                    )}
+                    {slowNote && <p className="text-[11px] text-amber-400">{slowNote}</p>}
+                    <p className="text-[11px] text-gray-600">
+                      {t("Picture settings change what you see, not what is analysed or recorded.")}
+                    </p>
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Shown whenever the source is switchable — with the demo clips in
                 the list that is any time we are not screen-sharing. */}
             {captureMode !== "screen" && deviceSelect}
@@ -2899,7 +4052,11 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
               while streaming so it isn't polling behind the setup screen. */}
           {streaming && (
             <div dir={pageDir} className="min-w-0 xl:order-1 xl:sticky xl:top-4 xl:max-h-[calc(100vh-2rem)] xl:overflow-y-auto">
-              <FeedbackPanel caseId={caseId} refreshSignal={feedbackRefreshKey} />
+              <FeedbackPanel
+                caseId={caseId}
+                refreshSignal={feedbackRefreshKey}
+                timeline={timelineSource}
+              />
             </div>
           )}
         </div>
@@ -2980,8 +4137,37 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
             {t("Source {mode}", { mode: sourceMode.text })}{" · "}
           </span>
         )}
-        {t("Frames scaled to {width}px before sending · one frame in flight at a time · ~{rtt}ms round trip ({server}ms of it server-side)", { width: INFER_WIDTH, rtt: stats.rttMs || 0, server: stats.avgMs || 0 })}
+        {t("Frames scaled to {width}px before sending · one frame in flight at a time · ~{rtt}ms round trip ({server}ms of it server-side)", { width: inferWidth, rtt: stats.rttMs || 0, server: stats.avgMs || 0 })}
       </p>
+
+      {/* Last child, and always written as the same single expression, so its
+          index in this list never shifts -- a sibling that appears and
+          disappears above a ref'd element is how remounts happen here.
+          `ready` is state and `doctorRoot` is only read once it is true, so
+          this cannot render before the container document exists, and it
+          cannot render during SSR because nothing sets `ready` except a
+          click. */}
+      {doctor.ready && doctor.win && doctorRoot(doctor.win) &&
+        createPortal(
+          <DoctorScreen
+            win={doctor.win}
+            mirrorSource={mirrorSource}
+            generation={mirrorGeneration}
+            aspect={aspect}
+            shots={shots}
+            stripPos={stripPos}
+            onStripPos={setStripPos}
+            stripSize={stripSize}
+            onStripSize={setStripSize}
+            openShotId={openShotId}
+            onOpenShot={setOpenShotId}
+            hudStats={hudStats}
+            hudOn={hudOn}
+            stopped={!streaming}
+            replay={stripReplay}
+          />,
+          doctorRoot(doctor.win)!,
+        )}
     </div>
   );
 }

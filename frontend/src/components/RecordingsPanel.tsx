@@ -9,7 +9,7 @@
  * and that is rendered as a sign-in prompt rather than an error.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLanguage } from "@/lib/i18n";
 import { useDurationFix } from "@/lib/useDurationFix";
 import { useAuth } from "@/lib/auth";
@@ -21,7 +21,9 @@ interface Recording {
   id: string;
   case_id: string;
   user: string;
-  source: "camera" | "screen" | "joined";
+  // "replay" is a session recorded while a file was being played back through
+  // the live pipeline, so it is a second copy of footage already on this disk.
+  source: "camera" | "screen" | "joined" | "replay";
   mime: string;
   ext: string;
   width: number;
@@ -32,6 +34,13 @@ interface Recording {
   chunks: number;
   bytes: number;
   status: "recording" | "complete" | "truncated" | "interrupted";
+  /** The day the procedure happened, as YYYY-MM-DD, read off the endoscope's
+   *  burnt-in overlay. Only present on recordings the 2026-10-11 cleanup
+   *  verified; everything else groups by started_at, which is honest for
+   *  anything captured live. */
+  clinic_date?: string;
+  /** Set on a stitched recording: the ids of the fragments it contains. */
+  joined_from?: string[];
 }
 
 const videoUrl = (r: Recording) => `${API}/api/recordings/${r.case_id}/${r.id}/video`;
@@ -53,6 +62,7 @@ export default function RecordingsPanel({
   const [denied, setDenied] = useState(false);
   const [error, setError] = useState("");
   const [videoEl, setVideoEl] = useState<HTMLVideoElement | null>(null);
+  const [showFragments, setShowFragments] = useState(false);
   const busyRef = useRef(false);
 
   useDurationFix(videoEl);
@@ -105,6 +115,45 @@ export default function RecordingsPanel({
     new Date(ts * 1000).toLocaleString(lang === "fa" ? "fa-IR" : "en-GB", {
       dateStyle: "short", timeStyle: "short",
     });
+
+  // Fragments a stitched recording already contains. Shown only on request:
+  // listing a procedure once as a whole and again as its eight pieces is what
+  // made this list unreadable.
+  const stitched = useMemo(
+    () => new Set(items.flatMap((r) => r.joined_from ?? [])),
+    [items],
+  );
+  const hiddenFragments = showFragments ? 0 : items.filter((r) => stitched.has(r.id)).length;
+
+  // Grouped by the day the procedure happened, newest day first. The endoscope
+  // overlay wins where we have it; started_at is the fallback and is correct
+  // for anything recorded live.
+  const groups = useMemo(() => {
+    const visible = showFragments ? items : items.filter((r) => !stitched.has(r.id));
+    const byDay = new Map<string, Recording[]>();
+    for (const r of visible) {
+      let key = r.clinic_date;
+      if (!key) {
+        const d = new Date(r.started_at * 1000);
+        key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+      }
+      const bucket = byDay.get(key);
+      if (bucket) bucket.push(r);
+      else byDay.set(key, [r]);
+    }
+    return Array.from(byDay.entries())
+      .sort((a, b) => b[0].localeCompare(a[0]))
+      .map(([day, rows]) => ({
+        day,
+        // Midday, so a timezone shift can't move the heading to the day before.
+        label: new Date(`${day}T12:00:00`).toLocaleDateString(lang === "fa" ? "fa-IR" : "en-GB",
+                                                             { day: "numeric", month: "long", year: "numeric" }),
+        // Whole procedures above the odds and ends they sit next to.
+        rows: [...rows].sort((a, b) =>
+          (a.source === "joined" ? 0 : 1) - (b.source === "joined" ? 0 : 1)
+          || b.started_at - a.started_at),
+      }));
+  }, [items, stitched, showFragments, lang]);
 
   const statusBadge = (r: Recording) => {
     if (r.status === "recording") return { text: t("recording…"), cls: "text-red-400 border-red-900 bg-red-950/40" };
@@ -180,8 +229,14 @@ export default function RecordingsPanel({
             : t("No sessions have been recorded on this server yet.")}
         </p>
       ) : (
-        <ul className="space-y-2">
-          {items.map((r) => {
+        <div className="space-y-5">
+          {groups.map(({ day, label, rows }) => (
+          <div key={day} className="space-y-2">
+            <h4 className="text-xs uppercase tracking-wide text-gray-500 border-b border-gray-800 pb-1">
+              {t("{day} · {n} recordings", { day: label, n: rows.length })}
+            </h4>
+            <ul className="space-y-2">
+          {rows.map((r) => {
             const badge = statusBadge(r);
             const isOpen = selected?.id === r.id;
             const playable = r.bytes > 0;
@@ -199,7 +254,10 @@ export default function RecordingsPanel({
                     className="flex-1 min-w-0 text-left disabled:cursor-not-allowed"
                   >
                     <div className="flex items-center gap-2">
-                      <span>{r.source === "screen" ? "🖥️" : r.source === "joined" ? "🎬" : "📹"}</span>
+                      <span>{r.source === "screen" ? "🖥️"
+                             : r.source === "joined" ? "🎬"
+                             : r.source === "replay" ? "🔁"
+                             : "📹"}</span>
                       <span className="text-sm text-gray-200 truncate">{when(r.started_at)}</span>
                       <span className={`text-[10px] px-1.5 py-0.5 rounded border flex-shrink-0 ${badge.cls}`}>
                         {badge.text}
@@ -233,7 +291,20 @@ export default function RecordingsPanel({
               </li>
             );
           })}
-        </ul>
+            </ul>
+          </div>
+          ))}
+          {(hiddenFragments > 0 || showFragments) && (
+            <button
+              onClick={() => setShowFragments(!showFragments)}
+              className="text-xs text-gray-600 hover:text-gray-300 transition-colors"
+            >
+              {showFragments
+                ? t("Hide the pieces that were stitched together")
+                : t("Also show {n} pieces that were stitched together", { n: hiddenFragments })}
+            </button>
+          )}
+        </div>
       )}
     </div>
   );

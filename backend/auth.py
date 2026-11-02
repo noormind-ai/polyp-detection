@@ -54,6 +54,40 @@ ITERATIONS = 240_000
 COOKIE_NAME = "polyp_session"
 SESSION_HOURS = int(os.environ.get("POLYP_SESSION_HOURS", "12"))
 
+# Accounts that must not be signed out on a clock.
+#
+# The clinic PC is switched on in the morning and left showing this app in the
+# procedure room, with nobody whose job is to type a password into it. A
+# twelve-hour session there means someone meets a login page part-way through a
+# list. These accounts get a year, and /api/me re-issues the cookie every time
+# the page polls it (see routes/auth.py), so the window only starts running
+# down once the machine has actually stopped being used.
+#
+# Deliberately an allowlist rather than a bigger SESSION_HOURS for everyone: a
+# reviewer's own laptop, which can open patient images, keeps the short one.
+LONG_SESSION_USERS = {
+    u.strip() for u in os.environ.get("POLYP_LONG_SESSION_USERS", "").split(",") if u.strip()
+}
+LONG_SESSION_DAYS = int(os.environ.get("POLYP_LONG_SESSION_DAYS", "365"))
+
+# ---------------------------------------------------------------------------
+# One-click kiosk sign-in. OFF unless POLYP_KIOSK_SIGNIN_USER names an account.
+# ---------------------------------------------------------------------------
+# This is a password-less door into one named account and nothing else, and it
+# exists for one situation: the clinic PC has a mouse and no keyboard, so the
+# login form there cannot be filled in at all. It is a deliberate hole. Turn it
+# on, let that machine through once -- the session it gets lasts a year -- and
+# turn it straight back off. While it is on, anyone who loads /login can press
+# the button, so the window should be minutes, not days.
+KIOSK_SIGNIN_USER = os.environ.get("POLYP_KIOSK_SIGNIN_USER", "").strip()
+
+
+def session_seconds(username: str) -> int:
+    """How long this account's session should live. See LONG_SESSION_USERS."""
+    if username in LONG_SESSION_USERS:
+        return LONG_SESSION_DAYS * 24 * 3600
+    return SESSION_HOURS * 3600
+
 # Signing key for session cookies. If unset, one is generated per process —
 # which means sessions silently stop working across a restart or a second
 # worker, so a real deployment should set it explicitly.
@@ -217,7 +251,7 @@ def check_login(username: str, password: str) -> bool:
 
 
 def issue_session(username: str) -> str:
-    expiry = int(time.time()) + SESSION_HOURS * 3600
+    expiry = int(time.time()) + session_seconds(username)
     payload = f"{username}|{expiry}"
     sig = hmac.new(SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
     return base64.urlsafe_b64encode(f"{payload}|{sig}".encode()).decode()

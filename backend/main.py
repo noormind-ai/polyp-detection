@@ -12,8 +12,8 @@ load_dotenv(Path(__file__).parent / ".env")
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from backend import auth
-from backend.routes import auth as auth_routes, infer, feedback, recordings, spectate
+from backend import auth, db
+from backend.routes import auth as auth_routes, diagnostics, infer, feedback, recordings, spectate
 
 # File logger — writes to logs/backend.log, rotates at 5 MB, keeps 3 files
 Path("logs").mkdir(exist_ok=True)
@@ -35,6 +35,11 @@ if auth.using_default_credentials():
     print(f"WARNING: default account '{auth.DEFAULT_USER}' still has its default "
           "password. Set POLYP_USERS before exposing this publicly.")
 
+# Create the feedback tables if they are not there yet, and apply any column
+# added since this database was first built. Cheap, idempotent, and it means a
+# fresh checkout works without a setup step.
+db.init()
+
 app = FastAPI(title="Polyp Detection API")
 
 # In production the frontend is same-origin (noormind.me/polyp -> noormind.me/api),
@@ -55,6 +60,7 @@ app.include_router(infer.router, prefix="/api")
 app.include_router(feedback.router, prefix="/api")
 app.include_router(recordings.router, prefix="/api")
 app.include_router(spectate.router, prefix="/api")
+app.include_router(diagnostics.router, prefix="/api")
 
 
 @app.get("/health")

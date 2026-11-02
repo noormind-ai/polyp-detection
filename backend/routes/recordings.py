@@ -54,12 +54,10 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 
 from backend.routes.auth import require_user
-from backend.routes.feedback import clip_output_path, list_pending_clip_sources, set_review_clip_status
-from backend.services.review_clips import cut_clip
 
 log = logging.getLogger("recordings")
 
@@ -83,7 +81,14 @@ MAX_CHUNK_MB = 32
 STALE_AFTER_S = 120
 
 ALLOWED_MIME_PREFIXES = ("video/webm", "video/mp4", "video/x-matroska")
-SOURCES = {"camera", "screen"}
+# "replay" is a recording made while a FILE was being played through the live
+# pipeline -- a demo clip, a file off the operator's machine, or another
+# recording already on this server. It is never clinic capture. Before this
+# existed such a session was saved as "camera", leaving the server holding a
+# second copy of footage it already had, indistinguishable in metadata from a
+# real procedure; the only thing that could tell them apart afterwards was the
+# endoscope's burnt-in timestamp disagreeing with the file's own date.
+SOURCES = {"camera", "screen", "replay"}
 
 _SAFE_ID = re.compile(r"^[a-zA-Z0-9_-]+$")
 
@@ -142,7 +147,8 @@ def _decorate(meta: dict) -> dict:
     out = dict(meta)
     path = _video_path(meta)
     out["bytes"] = path.stat().st_size if path.exists() else 0
-    if meta.get("status") == "recording" and time.time() - meta.get("updated_at", 0) > STALE_AFTER_S:
+    if (meta.get("status") in ("recording", "closing")
+            and time.time() - meta.get("updated_at", 0) > STALE_AFTER_S):
         out["status"] = "interrupted"
     return out
 
@@ -209,7 +215,12 @@ async def append_chunk(
     in the stream; it must equal the number of chunks already stored, so a
     duplicate or out-of-order upload is refused instead of corrupting the file."""
     meta = _read_meta(case_id, recording_id)
-    if meta["status"] not in ("recording",):
+    # "closing" accepts chunks on purpose. The client now marks a recording
+    # finished BEFORE draining its backlog, so bytes arriving after that mark
+    # are the normal case, not a late duplicate. Refusing them here is what
+    # made the old ordering unfixable: putChunk treats any 4xx as fatal and
+    # aborts the whole session (see useSessionRecorder.ts).
+    if meta["status"] not in ("recording", "closing"):
         raise HTTPException(status_code=409, detail="recording already stopped")
     if seq != meta["chunks"]:
         # 409, not 400: the client can resolve this (it knows which chunk the
@@ -249,41 +260,49 @@ async def append_chunk(
     return {"chunks": meta["chunks"], "bytes": written + size, "status": meta["status"]}
 
 
-def _generate_review_clips(meta: dict) -> None:
-    """Runs after the HTTP response for /stop has already gone out (see
-    BackgroundTasks below). For every feedback capture filed against this
-    recording, cuts a short clip around its offset so a reviewer gets a
-    playable clip instead of a bare timestamp. Best-effort and idempotent:
-    list_pending_clip_sources already excludes rows already marked "ready",
-    so a retried /stop just re-attempts anything that previously failed."""
-    video_path = _video_path(meta)
-    if not video_path.exists() or video_path.stat().st_size == 0:
-        return
-    for row in list_pending_clip_sources(meta["id"]):
-        try:
-            offset_ms = int(row["video_offset_ms"])
-        except (TypeError, ValueError):
-            continue
-        out_path = clip_output_path(row["case_id"], row["filename"])
-        ok = cut_clip(video_path, offset_ms, out_path)
-        set_review_clip_status(row["case_id"], row["filename"], "ready" if ok else "failed")
-
-
 @router.post("/recordings/{case_id}/{recording_id}/stop")
 async def stop_recording(
     case_id: str,
     recording_id: str,
-    background: BackgroundTasks,
     duration_ms: int = Form(default=0),
+    closing: bool = Form(default=False),
+    stop_reason: str = Form(default=""),
     user: str = Depends(require_user),
 ):
-    """Close the recording. `duration_ms` is measured by the client, because a
-    WebM written in streaming mode carries no duration in its header — without
-    this the player would show an unknown length. Idempotent: stopping an
-    already-stopped recording is not an error, so a retry after a flaky
-    response can't strand it in "recording" forever."""
+    """Close the recording, in two steps.
+
+    `duration_ms` is measured by the client, because a WebM written in
+    streaming mode carries no duration in its header -- without this the
+    player would show an unknown length.
+
+    `closing=True` is the EARLY mark, sent the instant the recording
+    logically ends and BEFORE its backlog has finished uploading. It records
+    the real duration and moves the recording to "closing", which still
+    accepts chunks (see append_chunk). The ordinary call, sent once the drain
+    completes, flips it to "complete".
+
+    That split exists because the drain is deliberately deprioritised behind
+    the next procedure's live inference and can run for many minutes. On
+    2026-10-21 one recording trickled for 11m48s after it had already ended;
+    the browser closed one second after its last chunk landed, and the single
+    stop call queued behind that drain never went out. Six recordings across
+    two clinic days -- 29.5 minutes of footage -- were left unlistable with
+    every byte safely on disk.
+
+    `stop_reason` records what ended it ("manual", "out-of-body", "unmount",
+    "tracks-ended", "stale-sweep"), so a future incident is diagnosable from
+    the metadata rather than by correlating against server logs.
+
+    Idempotent: stopping an already-stopped recording is not an error, so a
+    retry after a flaky response can't strand it in "recording" forever.
+    """
     meta = _read_meta(case_id, recording_id)
-    if meta["status"] == "recording":
+    if stop_reason:
+        meta["stop_reason"] = stop_reason
+    if closing:
+        if meta["status"] == "recording":
+            meta["status"] = "closing"
+    elif meta["status"] in ("recording", "closing"):
         meta["status"] = "complete"
         meta["ended_at"] = int(time.time())
         meta["updated_at"] = meta["ended_at"]
@@ -291,11 +310,9 @@ async def stop_recording(
     # shorten a duration that was already recorded correctly.
     meta["duration_ms"] = max(int(meta.get("duration_ms") or 0), max(duration_ms, 0))
     _write_meta(meta)
-    log.info("recording %s stopped by %s (%d chunks, %s)",
-             recording_id, user, meta["chunks"], meta["status"])
-    # Runs after this response is sent -- cutting clips ffmpeg-at-a-time must
-    # not make the operator wait on Stop before the UI unblocks.
-    background.add_task(_generate_review_clips, meta)
+    log.info("recording %s %s by %s (%d chunks, %s)",
+             recording_id, "closing" if closing else "stopped", user,
+             meta["chunks"], meta["status"])
     return _decorate(meta)
 
 
