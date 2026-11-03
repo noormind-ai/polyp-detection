@@ -31,6 +31,12 @@ export interface LatencyStats {
    *  single measurement rather than a running stream of frames. Null until
    *  the probe resolves, or if it never ran. */
   uplinkMbps?: number | null;
+  /** Time to shrink the raw source frame down to the model's input width
+   *  (LiveCameraPlayer's resizeMsRef) -- a plain number like uplinkMbps, not
+   *  a baseline-tracked Metric, since this exists to answer one question
+   *  ("does a bigger source frame cost more to resize") rather than to be
+   *  watched for spikes. Was previously invisible, folded into `net` below. */
+  resizeMs?: number | null;
 }
 
 /** The hard ceiling above which a round trip is a clinical problem rather than
@@ -129,6 +135,17 @@ export default function LatencyHud({
       <span className={red.net ? "text-red-400" : "text-white"}>
         {stats.rtt.shown > 0 ? ms(stats.net) : "—"}
       </span>
+      {/* Part of "network" above, shown again on its own: the resize-to-320
+          step specifically, so a bigger source frame costing more to shrink
+          shows up as its own number instead of staying hidden inside net. */}
+      {stats.resizeMs != null && (
+        <>
+          <span className="text-gray-500 pl-3">{t("   · of which resize")}</span>
+          <span className="text-gray-400">
+            {stats.resizeMs > 0 ? t("{ms} ms", { ms: Math.round(stats.resizeMs * 10) / 10 }) : "—"}
+          </span>
+        </>
+      )}
       <span className="text-gray-500">{t("Analysed")}</span>
       <span className={red.fps ? "text-red-400" : "text-white"}>
         {stats.fps.shown > 0 ? t("{fps} fps", { fps: stats.fps.shown.toFixed(1) }) : "—"}
