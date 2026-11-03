@@ -404,6 +404,7 @@ export const FA: Record<string, string> = {
     "این صفحه را باز نگه دارید. یا همین حالا در رایانه خود ذخیره کنید؛ بارگذاری در هر صورت ادامه می‌یابد.",
   "Uploading to the server…": "در حال بارگذاری روی سرور…",
   "Uploading… {done} of {total} pieces ({size} sent)": "در حال بارگذاری… {done} از {total} بخش ({size} ارسال شد)",
+  "{n} upload retry so far — the connection dropped at least one request and resent it.": "تا الان {n} بار تلاش دوباره برای بارگذاری — اتصال حداقل یک درخواست را قطع کرد و دوباره ارسال شد.",
   "1 recording still uploading": "۱ ضبط هنوز در حال بارگذاری است",
   "{n} recordings still uploading": "{n} ضبط هنوز در حال بارگذاری هستند",
   "{done} of {total} sent": "{done} از {total} ارسال شد",

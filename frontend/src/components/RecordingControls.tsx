@@ -276,6 +276,17 @@ export default function RecordingControls({
         </div>
       )}
 
+      {/* Diagnostic for the open "upload feels slower than the file size
+          suggests" question: each retry re-sends a whole chunk's bytes
+          without uploadedBytes looking any bigger, since only a successful
+          attempt counts there. A nonzero count here is the first real
+          evidence of that happening, next time it's noticed. */}
+      {recorder.uploadRetries > 0 && (
+        <p className="px-1 text-[11px] text-amber-400">
+          {t("{n} upload retry so far — the connection dropped at least one request and resent it.", { n: recorder.uploadRetries })}
+        </p>
+      )}
+
       {recorder.error && (
         <p className="px-1 text-xs text-red-400 break-words">{recorder.error}</p>
       )}

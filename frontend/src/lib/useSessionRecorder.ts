@@ -136,6 +136,14 @@ export interface SessionRecorder {
    *  means this browser has neither OPFS nor IndexedDB available — a crash
    *  loses everything not yet uploaded, same as before this feature existed. */
   storageKind: ChunkStoreKind | null;
+  /** How many chunk PUTs needed a retry (first attempt failed, second one
+   *  ran) -- each retry re-sends the whole chunk's bytes over the wire
+   *  without the upload looking any bigger in uploadedBytes, since only a
+   *  successful response counts. Added to make "upload feels slower / like
+   *  it's moving more data than the file size suggests" checkable the next
+   *  time it's reported, instead of staying a guess -- see the open
+   *  investigation this came out of. 0 on a clean link. */
+  uploadRetries: number;
   start: () => Promise<void>;
   /** `reason` is recorded against the recording -- see RecSession.stopReason. */
   stop: (reason?: string) => void;
@@ -229,6 +237,7 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen" |
   const [error, setError]       = useState("");
   const [finishedCount, setFinished] = useState(0);
   const [storageKind, setStorageKind] = useState<ChunkStoreKind | null>(null);
+  const [uploadRetries, setUploadRetries] = useState(0);
 
   // start() needs the CURRENT stream even when called through a stale
   // reference (e.g. the auto-record loop in LiveCameraPlayer, whose closure
@@ -340,6 +349,7 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen" |
         // A 4xx is a decision, not a hiccup -- retrying it just loses time.
         if (res.status < 500) throw new Error(await detail(res, `upload failed (${res.status})`));
       } catch (err) {
+        if (attempt === 0 && owns(sess)) setUploadRetries((n) => n + 1);
         if (attempt === 1) {
           sess.aborted = true;
           if (owns(sess)) {
@@ -492,6 +502,7 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen" |
     setWaitingForLink(false);
     setStorageKind(null);
     setLocalBytes(0);
+    setUploadRetries(0);
 
     const track = stream.getVideoTracks()[0];
     const settings = track?.getSettings?.() ?? {};
@@ -726,5 +737,5 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen" |
   return { status, elapsedMs, recordedMs, capturing, uploadedBytes, uploadedChunks, totalChunks,
            pendingChunks, waitingForLink, error, supported,
            storageKind, start, stop, pause, resume,
-           finishedCount, mark, downloadLocal, localBytes };
+           finishedCount, mark, downloadLocal, localBytes, uploadRetries };
 }
