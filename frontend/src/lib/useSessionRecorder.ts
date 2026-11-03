@@ -310,9 +310,17 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen" |
             setUploadedChunks(seq + 1);
             setPendingChunks((n) => Math.max(0, n - 1));
           }
-          // The server closes a recording that hits its size cap; keep
-          // uploading into it and every later chunk 409s.
-          if (data.status && data.status !== "recording") {
+          // "closing" is the server's normal status the instant a recording
+          // ends -- set deliberately so append_chunk keeps accepting the
+          // backlog (see backend/routes/recordings.py's stop_recording). Only
+          // "truncated" (the server actually refused a chunk for hitting its
+          // size cap) is a real error. Checking "!== recording" here instead
+          // of "=== truncated" was the Aban 6 2026-10-28 incident: every
+          // recording's own end sets "closing" moments before its backlog
+          // starts draining, so the FIRST backlog chunk to upload after that
+          // always tripped this check and killed the rest of the upload --
+          // one chunk landing, every time, regardless of capture hardware.
+          if (data.status === "truncated") {
             sess.aborted = true;
             if (owns(sess)) setError("recording reached the server's size limit and was closed");
             // Only the recording still being captured has a MediaRecorder to
