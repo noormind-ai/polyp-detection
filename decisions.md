@@ -36,3 +36,19 @@ image behind it, we decided to file two captures per appearance -- the first
 detected frame immediately with no bar, plus the clearest frame of the window as
 before -- labelled `first`/`best` in a new manifest column
 (documents/adr/0005-detection-gates-off-by-default.md).
+
+## Agent code map generator
+
+In the context of giving an AI assistant a fast, accurate way to find routes
+and components in this repo instead of re-searching it every session, facing
+a choice between a hand-maintained map (drifts the first time it's not
+updated), a tree-sitter generator (the 2026 community standard, but needing
+a new dependency to handle multi-line signatures this codebase's style never
+actually produces), and a live tree-sitter MCP server (no file, so invisible
+to anyone browsing the repo directly), we decided to generate
+`documents/AGENT_MAP.md`'s route/export listing with a small dependency-free
+regex script (`documents/generate_agent_map.py`) to achieve an
+always-regenerable, git-visible index with zero new dependencies, accepting
+that a future style change (e.g. multi-line decorators) could make it
+silently miss entries until the map is noticed to look thin
+(documents/adr/0008-agent-map-regex-generator.md).
