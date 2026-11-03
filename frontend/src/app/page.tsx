@@ -5,6 +5,7 @@ import UploadPanel from "@/components/UploadPanel";
 import WarmupPanel from "@/components/WarmupPanel";
 import VideoPlayer from "@/components/VideoPlayer";
 import LiveCameraPlayer from "@/components/LiveCameraPlayer";
+import UploadQueueStatus from "@/components/UploadQueueStatus";
 import SignInPrompt, { goToLogin } from "@/components/SignInPrompt";
 import RecordingsPanel from "@/components/RecordingsPanel";
 import ReviewCallout from "@/components/ReviewCallout";
@@ -588,6 +589,12 @@ export default function Home() {
           </button>
         </div>
       </div>
+
+      {/* Outside the mode-gated block on purpose: a recording keeps draining
+          in the background after End Session closes its player (see
+          uploadRegistry.ts), so this needs to stay visible on the home
+          screen too, not just inside whichever mode started it. */}
+      <UploadQueueStatus className="mb-4" />
 
       {/* Mode picker — the landing screen. No GPU is running at this point, and
           nothing here starts one; only the two live capture modes do. */}

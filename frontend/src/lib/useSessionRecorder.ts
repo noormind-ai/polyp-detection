@@ -33,6 +33,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { openChunkStore, type ChunkStore, type ChunkStoreKind } from "./chunkStore";
 import { waitUntilInferenceIdle, isLiveInferenceActive } from "./uploadCoordinator";
+import { registerUpload, updateUpload, finishUpload } from "./uploadRegistry";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "";
 
@@ -310,6 +311,10 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen" |
             setUploadedChunks(seq + 1);
             setPendingChunks((n) => Math.max(0, n - 1));
           }
+          // Mirrored into the cross-recording registry regardless of owns():
+          // once this recording is in the registry (finalize() put it there),
+          // it needs updating whether or not a component still owns it.
+          updateUpload(sess.id, { uploadedBytes: data.bytes ?? 0, uploadedChunks: seq + 1 });
           // "closing" is the server's normal status the instant a recording
           // ends -- set deliberately so append_chunk keeps accepting the
           // backlog (see backend/routes/recordings.py's stop_recording). Only
@@ -366,6 +371,10 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen" |
       await Promise.all(sess.pendingWrites);
       const buffered = await sess.store.readAll();
       if (owns(sess)) setTotalChunks(buffered.length);
+      updateUpload(sess.id, {
+        totalChunks: buffered.length,
+        totalBytesEstimate: buffered.reduce((a, b) => a + b.size, 0),
+      });
       for (let i = sess.nextUploadSeq; i < buffered.length && !sess.aborted; i++) {
         await putChunk(sess, buffered[i], i);
         sess.nextUploadSeq = i + 1;
@@ -418,6 +427,16 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen" |
     // "closing" is what keeps the server accepting the rest of the chunks;
     // a plain stop would 409 them, and putChunk treats a 4xx as fatal.
     await markStopped(true);
+
+    // From here on this recording is a background upload job that may
+    // outlive the component that started it -- register it in the
+    // cross-recording registry (see uploadRegistry.ts) before the drain
+    // below so "how many videos are still uploading" is answerable from the
+    // moment that becomes true, not just while this hook instance happens
+    // to still be mounted.
+    const knownSoFar = sess.store ? await sess.store.readAll().catch(() => []) : [];
+    registerUpload(sess.id, sess.caseId, knownSoFar.reduce((a, b) => a + b.size, 0));
+
     // Most of this recording may already be on the server -- pause() fires an
     // opportunistic trickle upload during every out-of-body stretch (see
     // LiveCameraPlayer.tsx), so this just drains whatever's left, resuming
@@ -436,6 +455,7 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen" |
     // in the next page load's orphan-recovery scan. A failed/aborted session
     // deliberately keeps its local copy so that scan can offer to recover it.
     if (!sess.aborted) { await sess.store?.clear().catch(() => {}); }
+    finishUpload(sess.id);
     if (owns(sess)) {
       setStatus(sess.aborted ? "error" : "idle");
       setElapsed(0);
