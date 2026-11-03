@@ -1017,6 +1017,36 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   const denoiseRef = useRef(0);
   const sharpenRef = useRef(0);
   const deintModeRef = useRef<DeintMode>("weave");
+  // Remembers whichever non-"weave" mode was last chosen, so the on/off
+  // toggle below can turn deinterlacing back ON at the algorithm the
+  // operator actually picked, not always back at "adaptive".
+  const lastOnModeRef = useRef<DeintMode>("adaptive");
+  // Per-frame cost of whatever deinterlace path actually ran, zero when
+  // none did (progressive source, or mode is "weave"). Read every 500ms
+  // rather than on every video frame -- same throttling as the recorder's
+  // elapsed clock -- so showing this number costs nothing of its own.
+  const deintMsRef = useRef(0);
+  const [deintMsShown, setDeintMsShown] = useState(0);
+  // Time to produce the INFER_WIDTH-wide canvas from the raw source frame
+  // (the draw/shrink step just below the sourceRect crop, in the main
+  // inference loop) -- separated out so "is a bigger HDMI source frame
+  // slower to shrink than the old analog one" has an actual number instead
+  // of being buried inside the rtt-minus-server "net" figure. Same 500ms
+  // throttle as deintMsShown, read off the same interval.
+  const resizeMsRef = useRef(0);
+  const [resizeMsShown, setResizeMsShown] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => {
+      setDeintMsShown(deintMsRef.current);
+      setResizeMsShown(resizeMsRef.current);
+    }, 500);
+    return () => clearInterval(id);
+  }, []);
+  // Whether the live source actually needs deinterlacing -- null until
+  // sampleInterlace() below decides. Mirrors interlacedRef (a plain ref, not
+  // reactive) purely so this can be shown in the UI; the ref stays the one
+  // the paint loop itself reads.
+  const [interlacedDetected, setInterlacedDetected] = useState<boolean | null>(null);
   useEffect(() => { denoiseRef.current = denoise; }, [denoise]);
   useEffect(() => { sharpenRef.current = sharpen; }, [sharpen]);
   useEffect(() => { deintModeRef.current = deintMode; }, [deintMode]);
@@ -1113,6 +1143,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
 
     if (looksInterlaced(ratio)) {
       interlacedRef.current = true;
+      setInterlacedDetected(true);
       console.info(`[interlace] source is interlaced (comb ratio ${ratio!.toFixed(2)}) — deinterlacing`);
       return;
     }
@@ -1121,12 +1152,14 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     if (ratio === null) return;
     if (++interlaceSamplesRef.current >= INTERLACE_SAMPLE_FRAMES) {
       interlacedRef.current = false;
+      setInterlacedDetected(false);
       console.info(`[interlace] source looks progressive (peak comb ratio ${combPeakRef.current.toFixed(2)}) — drawing frames whole`);
     }
   }
 
   function resetInterlaceDetection() {
     interlacedRef.current = null;
+    setInterlacedDetected(null);
     interlaceSamplesRef.current = 0;
     combPeakRef.current = 0;
     // Motion measured against a different video means nothing.
@@ -1360,12 +1393,20 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
             ? glDeintRef.current?.process(video, w, h, mode) : null;
           if (out) {
             canvas.getContext("2d")!.drawImage(out.canvas, 0, 0);
+            deintMsRef.current = out.ms;
           } else if ((mode === "adaptive" || mode === "legacy") && interlacedRef.current === true) {
+            const t0 = performance.now();
             deintRef.current.draw(video, 0, 0, w, h, canvas, w, h, video.currentTime);
+            deintMsRef.current = performance.now() - t0;
           } else {
             const ctx = canvas.getContext("2d")!;
             ctx.imageSmoothingEnabled = true;
             ctx.drawImage(video, 0, 0, w, h, 0, 0, w, h);
+            // Nothing ran -- either the source is progressive (the common
+            // case on the HDMI card) or the mode is "weave". Either way the
+            // honest cost is zero, not whatever it was before the source
+            // or mode last changed.
+            deintMsRef.current = 0;
           }
 
           // Enhancement is a second, independent canvas stacked over this
@@ -2398,6 +2439,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       const capCtx = cap.getContext("2d")!;
       capCtx.imageSmoothingEnabled = true;
       capCtx.imageSmoothingQuality = "high";
+      const resizeT0 = performance.now();
       if (capH * 2 >= srcH) {
         // ...but that incidental blend only happens when the shrink is
         // aggressive. A 640 capture keeps ~427 of 480 lines, the comb would
@@ -2407,6 +2449,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       } else {
         capCtx.drawImage(video, srcX, srcY, srcW, srcH, 0, 0, capW, capH);
       }
+      // srcW/srcH is the real source frame size (e.g. ~1920-wide on the HDMI
+      // card vs 720-wide on the old analog one) -- this is the number that
+      // answers whether a bigger source costs more to shrink to 320px.
+      resizeMsRef.current = performance.now() - resizeT0;
       // Grabbed now, from this same video frame, so a filed capture and the boxes
       // drawn on it describe the same instant. See grabCapture.
       const hi = grabCapture(video, srcX, srcY, srcW, srcH);
@@ -3015,6 +3061,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     net:    { shown: stats.netMs, cur: cur.net,    baseline: netBase.current.mean,    n: netBase.current.n },
     fps:    { shown: stats.fps,   cur: cur.fps,    baseline: fpsBase.current.mean,    n: fpsBase.current.n },
     uplinkMbps,
+    resizeMs: resizeMsShown,
   };
 
   const detectedFs = useFullscreen();
@@ -3918,26 +3965,66 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
                 push the things that ARE pressed mid-procedure down the page. */}
             {streaming && (
               <div className="space-y-2">
-                <button
-                  onClick={() => setEnhOpen(!enhOpen)}
-                  className={`w-full md:w-auto flex items-center gap-2 px-3 py-2 rounded-xl border text-sm transition-colors ${
-                    enhanceOn ? "border-emerald-700 bg-emerald-950/30 text-emerald-300"
-                              : "border-gray-700 bg-gray-900 text-gray-300 hover:border-gray-500"}`}
-                >
-                  <span>🎨</span>
-                  <span>{t("Picture settings")}</span>
-                  <span className="text-xs text-gray-500">
-                    {enhanceOn ? t("on") : enhOpen ? "▾" : "▸"}
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    onClick={() => setEnhOpen(!enhOpen)}
+                    className={`flex items-center gap-2 px-3 py-2 rounded-xl border text-sm transition-colors ${
+                      enhanceOn ? "border-emerald-700 bg-emerald-950/30 text-emerald-300"
+                                : "border-gray-700 bg-gray-900 text-gray-300 hover:border-gray-500"}`}
+                  >
+                    <span>🎨</span>
+                    <span>{t("Picture settings")}</span>
+                    <span className="text-xs text-gray-500">
+                      {enhanceOn ? t("on") : enhOpen ? "▾" : "▸"}
+                    </span>
+                  </button>
+                  {/* Visible without expanding the panel -- this answers "is it
+                      running right now" at a glance, which is the whole point:
+                      a progressive source (e.g. the HDMI capture card on a clean
+                      signal) shows as off on its own, with no clicking needed. */}
+                  <span
+                    className={`text-[11px] px-2 py-1 rounded-md border whitespace-nowrap ${
+                      interlacedDetected === true && deintMode !== "weave"
+                        ? "border-emerald-700 text-emerald-300"
+                        : "border-gray-700 text-gray-500"
+                    }`}
+                  >
+                    {interlacedDetected === null
+                      ? t("Deinterlace: checking signal…")
+                      : interlacedDetected === false
+                        ? t("Deinterlace: off — progressive signal")
+                        : deintMode === "weave"
+                          ? t("Deinterlace: off")
+                          : t("Deinterlace: on · {ms} ms/frame", { ms: deintMsShown.toFixed(1) })}
                   </span>
-                </button>
+                </div>
                 {enhOpen && (
                   <div className="rounded-xl border border-gray-800 bg-gray-900/60 px-3 py-2 space-y-2">
                     <div className="flex items-center justify-between gap-2 text-xs">
-                      <span className="text-gray-400">{t("Deinterlace")}</span>
+                      <label className="flex items-center gap-1.5 text-gray-400 cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          className="accent-emerald-500"
+                          checked={deintMode !== "weave"}
+                          onChange={(e) => {
+                            if (e.target.checked) {
+                              setDeintMode(lastOnModeRef.current);
+                            } else {
+                              if (deintMode !== "weave") lastOnModeRef.current = deintMode;
+                              setDeintMode("weave");
+                            }
+                            deintRef.current.reset();
+                            glDeintRef.current?.reset();
+                          }}
+                        />
+                        {t("Deinterlace")}
+                      </label>
                       <select
                         value={deintMode}
                         onChange={(e) => {
-                          setDeintMode(e.target.value as DeintMode);
+                          const next = e.target.value as DeintMode;
+                          if (next !== "weave") lastOnModeRef.current = next;
+                          setDeintMode(next);
                           deintRef.current.reset();
                           glDeintRef.current?.reset();
                         }}
@@ -3948,6 +4035,13 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
                         ))}
                       </select>
                     </div>
+                    <p className="text-[11px] text-gray-500">
+                      {interlacedDetected === false
+                        ? t("This signal is progressive — deinterlacing is unnecessary and is not running, whatever is selected above.")
+                        : deintMode === "weave"
+                          ? t("Off — showing the signal as the card sends it.")
+                          : t("Running now, costing ~{ms} ms of every frame.", { ms: deintMsShown.toFixed(1) })}
+                    </p>
 
                     {([["Denoise", denoise, setDenoise], ["Sharpen", sharpen, setSharpen]] as const).map(
                       ([name, value, set]) => (
