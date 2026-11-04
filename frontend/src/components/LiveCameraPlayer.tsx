@@ -25,6 +25,7 @@ import { combRatio, looksInterlaced, createDeinterlacer } from "@/lib/interlace"
 import { drawBoxes, type Box } from "@/lib/drawBoxes";
 import { createGLEnhancer, type GLEnhancer } from "@/lib/enhanceGL";
 import { createGLDeinterlacer, DEINT_MODES, type GLDeinterlacer, type DeintMode } from "@/lib/deinterlaceGL";
+import { JpegEncoder } from "@/lib/jpegEncoder";
 import { readProcAmpCaps, readProcAmpValues, measureLevels, autoTuneProcAmp,
          type ProcAmpCaps } from "@/lib/procAmp";
 import { useFullscreen, fsWrapClass, fsExitBtnClass, fsBoxStyle } from "@/lib/useFullscreen";
@@ -1092,6 +1093,17 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // with identical resize/grab numbers on both.
   const encodeMsRef = useRef(0);
   const [encodeMsShown, setEncodeMsShown] = useState(0);
+  // Moves the encode above off the main thread, onto its own Worker -- see
+  // jpegEncoder.ts for why (Chromium's idle-vs-forced toBlob scheduling was
+  // measured causing 20ms-vs-200ms variance on the same frame, worse on a
+  // busier/weaker machine). Created once per session, lazily, same
+  // tried-guard pattern as glDeintRef below. Falls back to the plain
+  // main-thread path automatically if unsupported -- see the encode call site.
+  const jpegEncoderRef = useRef<JpegEncoder | null>(null);
+  const jpegEncoderTriedRef = useRef(false);
+  useEffect(() => {
+    return () => jpegEncoderRef.current?.terminate();
+  }, []);
   // Two more numbers pulled out of the "net" leftover, same reasoning as
   // resizeMs above: bytesSentRef is the JPEG size THIS tab actually sent
   // (set on the Pending entry at send time), recvMsRef is the server's own
@@ -2636,10 +2648,31 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
 
       // Quality is the AIMD-adjusted value from the last reply, not a
       // constant -- see qualityRef above. Timed -- see encodeMsRef.
+      if (!jpegEncoderTriedRef.current) {
+        jpegEncoderTriedRef.current = true;
+        jpegEncoderRef.current = new JpegEncoder();
+      }
       const encodeT0 = performance.now();
-      const blob: Blob = await new Promise((res) => cap.toBlob((b) => res(b!), "image/jpeg", qualityRef.current));
-      const buf = await blob.arrayBuffer();
+      let buf: ArrayBuffer;
+      if (jpegEncoderRef.current?.ready) {
+        try {
+          buf = await jpegEncoderRef.current.encode(cap, qualityRef.current);
+        } catch {
+          // Worker-side failure on this one frame -- fall back for just this
+          // frame rather than taking the whole encode path down with it.
+          const blob: Blob = await new Promise((res) => cap.toBlob((b) => res(b!), "image/jpeg", qualityRef.current));
+          buf = await blob.arrayBuffer();
+        }
+      } else {
+        const blob: Blob = await new Promise((res) => cap.toBlob((b) => res(b!), "image/jpeg", qualityRef.current));
+        buf = await blob.arrayBuffer();
+      }
       encodeMsRef.current = performance.now() - encodeT0;
+      // Wrapping an already-encoded buffer, not re-encoding -- cheap either
+      // way (worker path or the toBlob fallback both already produced the
+      // JPEG bytes above). Kept as a Blob because keepFrame/frameStoreRef
+      // downstream are typed for one.
+      const blob = new Blob([buf], { type: "image/jpeg" });
 
       // Sent, not awaited. This is the whole point of the pipeline: the wire
       // time for THIS frame now overlaps the settle of the previous one and
