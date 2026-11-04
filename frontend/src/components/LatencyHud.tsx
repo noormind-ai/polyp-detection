@@ -37,6 +37,15 @@ export interface LatencyStats {
    *  ("does a bigger source frame cost more to resize") rather than to be
    *  watched for spikes. Was previously invisible, folded into `net` below. */
   resizeMs?: number | null;
+  /** Size of the JPEG this tab actually sent for the last frame, in bytes.
+   *  Pixel size (320px) is fixed either way -- this is here to check whether
+   *  a more detailed source compresses to more bytes at that same width,
+   *  which the resize-time number above cannot show. */
+  bytesSent?: number | null;
+  /** Server's own direct measurement of how long it waited to receive a
+   *  frame's bytes -- unlike `net` (rtt minus modal_ms, a leftover by
+   *  subtraction), this is a real measurement of one specific thing. */
+  recvMs?: number | null;
 }
 
 /** The hard ceiling above which a round trip is a clinical problem rather than
@@ -143,6 +152,22 @@ export default function LatencyHud({
           <span className="text-gray-500 pl-3">{t("   · of which resize")}</span>
           <span className="text-gray-400">
             {stats.resizeMs > 0 ? t("{ms} ms", { ms: Math.round(stats.resizeMs * 10) / 10 }) : "—"}
+          </span>
+        </>
+      )}
+      {stats.recvMs != null && (
+        <>
+          <span className="text-gray-500 pl-3">{t("   · of which server recv")}</span>
+          <span className="text-gray-400">
+            {stats.recvMs > 0 ? t("{ms} ms", { ms: Math.round(stats.recvMs * 10) / 10 }) : "—"}
+          </span>
+        </>
+      )}
+      {stats.bytesSent != null && (
+        <>
+          <span className="text-gray-500">{t("Sent frame size")}</span>
+          <span className="text-gray-400">
+            {stats.bytesSent > 0 ? t("{kb} KB", { kb: Math.round(stats.bytesSent / 1024 * 10) / 10 }) : "—"}
           </span>
         </>
       )}

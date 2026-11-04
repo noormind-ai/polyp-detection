@@ -572,6 +572,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     resolve: (v: { boxes: Box[]; timing: Timing } | null) => void;
     sentAt: number;
     done: boolean;
+    /** Size of the JPEG this request sent, in bytes -- so "is the bigger
+     *  source producing a bigger file at the same 320px?" has an actual
+     *  number instead of an assumption that same pixels means same bytes. */
+    bytes: number;
   }
   const pendingQueueRef = useRef<Pending[]>([]);
 
@@ -580,7 +584,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
    *  frame be prepared and sent while this one is still being inferred. */
   function sendForInference(ws: WebSocket, buf: ArrayBuffer) {
     return new Promise<{ boxes: Box[]; timing: Timing } | null>((resolve) => {
-      const entry: Pending = { resolve, sentAt: performance.now(), done: false };
+      const entry: Pending = { resolve, sentAt: performance.now(), done: false, bytes: buf.byteLength };
       pendingQueueRef.current.push(entry);
       ws.send(buf);
       sentCountRef.current += 1;
@@ -1035,10 +1039,21 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // throttle as deintMsShown, read off the same interval.
   const resizeMsRef = useRef(0);
   const [resizeMsShown, setResizeMsShown] = useState(0);
+  // Two more numbers pulled out of the "net" leftover, same reasoning as
+  // resizeMs above: bytesSentRef is the JPEG size THIS tab actually sent
+  // (set on the Pending entry at send time), recvMsRef is the server's own
+  // direct measurement of how long it waited to receive those bytes --
+  // a real measurement, unlike net which is rtt minus modal_ms by subtraction.
+  const bytesSentRef = useRef(0);
+  const [bytesSentShown, setBytesSentShown] = useState(0);
+  const recvMsRef = useRef(0);
+  const [recvMsShown, setRecvMsShown] = useState(0);
   useEffect(() => {
     const id = setInterval(() => {
       setDeintMsShown(deintMsRef.current);
       setResizeMsShown(resizeMsRef.current);
+      setBytesSentShown(bytesSentRef.current);
+      setRecvMsShown(recvMsRef.current);
     }, 500);
     return () => clearInterval(id);
   }, []);
@@ -1568,6 +1583,9 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         serverBase.current.push(timing.modal_ms);
         if (curFps > 0) fpsBase.current.push(curFps);
         setCur({ rtt, server: timing.modal_ms, net: curNet, fps: curFps });
+        // Direct measurements, not derived -- see bytesSentRef/recvMsRef above.
+        if (entry) bytesSentRef.current = entry.bytes;
+        recvMsRef.current = timing.recv_ms;
 
         // Best-effort, throttled report so spectator mode can show these same
         // numbers (see spectate_bus.py's _room_stats) -- fire-and-forget, never
@@ -3062,6 +3080,8 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     fps:    { shown: stats.fps,   cur: cur.fps,    baseline: fpsBase.current.mean,    n: fpsBase.current.n },
     uplinkMbps,
     resizeMs: resizeMsShown,
+    bytesSent: bytesSentShown,
+    recvMs: recvMsShown,
   };
 
   const detectedFs = useFullscreen();
