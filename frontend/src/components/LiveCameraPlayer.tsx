@@ -1078,6 +1078,14 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // throttle as deintMsShown, read off the same interval.
   const resizeMsRef = useRef(0);
   const [resizeMsShown, setResizeMsShown] = useState(0);
+  // grabCapture draws a near-full-resolution copy of the SAME native frame,
+  // every loop, unconditionally (for filing later if this frame gets
+  // captured) -- unlike resizeMs above, its cost was never measured, even
+  // though it reads from the same big HDMI source. A slow grabCapture makes
+  // the client late to call send(), which the server can only see as a
+  // recv_ms increase -- it has no way to know why the client was late.
+  const grabMsRef = useRef(0);
+  const [grabMsShown, setGrabMsShown] = useState(0);
   // Two more numbers pulled out of the "net" leftover, same reasoning as
   // resizeMs above: bytesSentRef is the JPEG size THIS tab actually sent
   // (set on the Pending entry at send time), recvMsRef is the server's own
@@ -1120,6 +1128,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     const id = setInterval(() => {
       setDeintMsShown(deintMsRef.current);
       setResizeMsShown(resizeMsRef.current);
+      setGrabMsShown(grabMsRef.current);
       setBytesSentShown(bytesSentRef.current);
       setRecvMsShown(recvMsRef.current);
       setQualityShown(qualityRef.current);
@@ -2577,8 +2586,12 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       // answers whether a bigger source costs more to shrink to 320px.
       resizeMsRef.current = performance.now() - resizeT0;
       // Grabbed now, from this same video frame, so a filed capture and the boxes
-      // drawn on it describe the same instant. See grabCapture.
+      // drawn on it describe the same instant. See grabCapture. Timed
+      // separately from resize above -- this reads from the same big native
+      // frame but was never instrumented, see grabMsRef.
+      const grabT0 = performance.now();
       const hi = grabCapture(video, srcX, srcY, srcW, srcH);
+      grabMsRef.current = performance.now() - grabT0;
       // The gates read a fixed-320 view so a larger model imgsz never moves
       // their operating points (thresholds were fitted on 320px captures).
       const gateCap = capW > INFER_WIDTH ? downscaleForGates(cap) : cap;
@@ -3187,6 +3200,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     fps:    { shown: stats.fps,   cur: cur.fps,    baseline: fpsBase.current.mean,    n: fpsBase.current.n },
     uplinkMbps,
     resizeMs: resizeMsShown,
+    grabMs: grabMsShown,
     bytesSent: bytesSentShown,
     recvMs: recvMsShown,
     quality: qualityShown,

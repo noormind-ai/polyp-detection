@@ -37,6 +37,13 @@ export interface LatencyStats {
    *  ("does a bigger source frame cost more to resize") rather than to be
    *  watched for spikes. Was previously invisible, folded into `net` below. */
   resizeMs?: number | null;
+  /** Time to draw the near-full-resolution filing copy of the same native
+   *  frame (LiveCameraPlayer's grabMsRef) -- runs every loop regardless of
+   *  whether anything gets filed, reads from the same big source resizeMs
+   *  does, and was never measured until a bigger HDMI source made it worth
+   *  checking: a slow client step here shows up as the server's recv_ms
+   *  going up, with nothing in bytesSent or resizeMs explaining why. */
+  grabMs?: number | null;
   /** Size of the JPEG this tab actually sent for the last frame, in bytes.
    *  Pixel size (320px) is fixed either way -- this is here to check whether
    *  a more detailed source compresses to more bytes at that same width,
@@ -159,6 +166,14 @@ export default function LatencyHud({
           <span className="text-gray-500 pl-3">{t("   · of which resize")}</span>
           <span className="text-gray-400">
             {stats.resizeMs > 0 ? t("{ms} ms", { ms: Math.round(stats.resizeMs * 10) / 10 }) : "—"}
+          </span>
+        </>
+      )}
+      {stats.grabMs != null && (
+        <>
+          <span className="text-gray-500 pl-3">{t("   · of which filing-copy grab")}</span>
+          <span className="text-gray-400">
+            {stats.grabMs > 0 ? t("{ms} ms", { ms: Math.round(stats.grabMs * 10) / 10 }) : "—"}
           </span>
         </>
       )}
