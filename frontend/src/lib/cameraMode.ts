@@ -251,18 +251,28 @@ export async function negotiateCameraMode(
     return data ? padGreenFraction(data) : null;
   };
 
+  const ladder = candidateModes(caps);
+
   // The device's own default, measured before we touch anything.
   const firstSettings = track.getSettings();
   const firstPad = await measure();
   tried.push({ label: "default", got: describe(firstSettings), pad: firstPad ?? undefined });
-  if (firstPad !== null && firstPad <= PAD_MAX_FRACTION && !opts.scanAll) {
+  // Clean is not the same as best: a card can hand back an unpadded picture
+  // well below its own native resolution -- measured on an HDMI capture card,
+  // a clean 640x480 default when the device itself does 1920x1080 natively.
+  // Only trust the default outright when it already landed on one of the
+  // ladder's own recognised modes. Membership, not size, on purpose: for an
+  // interlaced SD source "more lines" is not "better" (that is what the
+  // padding check above is for) -- 720x480 must still short-circuit here
+  // exactly as before, since it IS the ladder's own NTSC 480i entry.
+  const matchesLadder = ladder.some((m) => m.width === firstSettings.width && m.height === firstSettings.height);
+  if (firstPad !== null && firstPad <= PAD_MAX_FRACTION && matchesLadder && !opts.scanAll) {
     return { stream, settings: firstSettings, padFraction: firstPad, tried, padded: false };
   }
 
   let best: { mode: ModeCandidate | null; pad: number; settings: MediaTrackSettings } =
     { mode: null, pad: firstPad ?? 1, settings: firstSettings };
 
-  const ladder = candidateModes(caps);
   let i = 0;
   for (const m of ladder) {
     say(m.label, ++i, ladder.length);
