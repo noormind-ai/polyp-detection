@@ -46,6 +46,13 @@ export interface LatencyStats {
    *  frame's bytes -- unlike `net` (rtt minus modal_ms, a leftover by
    *  subtraction), this is a real measurement of one specific thing. */
   recvMs?: number | null;
+  /** Current AIMD-adjusted JPEG quality (0-1). Shown so a lower number has
+   *  a visible reason instead of looking like an unexplained quality drop. */
+  quality?: number | null;
+  /** The operator-set floor this session is trying to protect. Shown next
+   *  to `quality` so "why is quality low" and "why is fps below what I
+   *  asked for" read as the same tradeoff, not two separate mysteries. */
+  targetFps?: number | null;
 }
 
 /** The hard ceiling above which a round trip is a clinical problem rather than
@@ -175,6 +182,23 @@ export default function LatencyHud({
       <span className={red.fps ? "text-red-400" : "text-white"}>
         {stats.fps.shown > 0 ? t("{fps} fps", { fps: stats.fps.shown.toFixed(1) }) : "—"}
       </span>
+      {/* The tradeoff this session is actually making, spelled out: quality
+          is the dial, targetFps is the thing it's protecting. Shown
+          together so a low quality number always has a visible reason. */}
+      {stats.quality != null && (
+        <>
+          <span className="text-gray-500">{t("Send quality")}</span>
+          <span className="text-gray-400">
+            {t("{pct}% (target {fps} fps)", { pct: Math.round(stats.quality * 100), fps: stats.targetFps ?? "—" })}
+          </span>
+        </>
+      )}
+      {stats.quality != null && stats.targetFps != null && stats.fps.shown > 0
+        && stats.fps.shown < stats.targetFps - 1 && (
+        <span className="col-span-2 text-[11px] text-amber-400">
+          {t("Running below the {fps} fps target even at this quality — the uplink can't keep up, not a bug.", { fps: stats.targetFps })}
+        </span>
+      )}
       {stats.uplinkMbps != null && <>
         <span className="text-gray-500">{t("Uplink (measured)")}</span>
         <span className={stats.uplinkMbps < UPLINK_WARN_MBPS ? "text-red-400" : "text-white"}>

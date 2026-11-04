@@ -1,0 +1,128 @@
+ADAPTING JPEG QUALITY TO THE UPLINK, LIKE A VIDEO CALL DOES
+============================================================
+
+GOAL
+----
+Keep the number of frames analyzed per second (fps) steady even when
+the uplink (how fast your device can send data OUT to the internet)
+gets worse mid-session -- instead of always sending the same picture
+quality no matter what the connection is doing right now.
+
+Status: mental model only, nothing coded yet. Three numbers near the
+bottom still need a decision before any code gets written.
+
+
+THE ANALOGY THAT FITS, AND THE ONE THAT DOESN'T
+------------------------------------------------
+Two well-known approaches solve "pick quality dynamically." Only one
+fits us.
+
+1. YouTube-style
+   Picks quality based on how many seconds of video are already
+   pre-loaded and waiting (this pre-loaded video is called a
+   "buffer"). The whole idea only works because the player is
+   allowed to sit a few seconds behind live and wait.
+   WRONG FIT FOR US -- we never want to wait. We want this exact
+   frame's result as fast as possible, not a few seconds of
+   lookahead.
+
+2. Video-call-style (the method WebRTC uses, called
+   "Google Congestion Control", GCC for short)
+   No waiting allowed, the connection quality changes mid-call, and
+   it has to decide what to send RIGHT NOW, this instant. This is
+   our actual problem shape.
+
+
+WHAT GCC DOES, IN PLAIN WORDS
+-------------------------------
+It watches two warning signs, and reacts to whichever one looks
+worse:
+
+  - Is data taking LONGER to arrive than it used to?
+    (This is "delay-based" detection. It's an early warning -- a
+    queue is starting to build up somewhere, before anything has
+    actually gone wrong yet.) [the rec_ms show this?]
+
+  - Is data actually getting LOST and never arriving?
+    (This is "loss-based" detection -- things have already gone
+    wrong, so react harder.) [how can we measure it in our case?]
+
+Then it adjusts quality using one simple rule, nicknamed AIMD
+(stands for "Additive Increase, Multiplicative Decrease" -- don't
+worry about the name, just the rule):
+
+  - When things are calm: creep the quality UP, one small step at a
+    time.
+  - When trouble shows up: drop the quality DOWN by a big step,
+    immediately.
+
+In short: slow to raise it, quick to cut it.
+
+
+MAPPED ONTO WHAT WE ALREADY MEASURE
+-------------------------------------
+GCC looks at individual network packets, which we don't have access
+to [why?] -- we only get one number per picture we send. That's actually
+enough. Here's how each idea becomes something we can use:
+
+  "Is it taking longer than usual?"
+    -> We already measure recv_ms (how long the server waited to
+       fully receive one picture). We compare it to its own
+       "baseline" (the normal/average value for this session so
+       far) -- already built, the on-screen HUD already does this
+       exact comparison for other numbers and calls a sudden jump a
+       "spike".
+
+  "How much data can actually get through right now?"
+    -> This is called throughput: bytes sent divided by how long
+       they took. We smooth it with an EWMA (a kind of running
+       average that pays more attention to the last few pictures
+       than to older ones, so one lucky/unlucky picture can't swing
+       it too much).
+
+  "How much should I send next?"
+    -> A byte budget: the biggest file size we're allowed to send
+       for the next picture, so it still arrives in time.
+
+  "How do I change quality without overreacting?"
+    -> JPEG quality setting, moved by the AIMD rule above: small
+       step up, big step down.
+
+
+THE FORMULA, PER PICTURE SENT
+--------------------------------
+  throughput        = smoothed average of (bytes sent / recv_ms)
+                       -- recalculated continuously, not just once
+                          at the start of the session
+
+  next_byte_budget  = throughput  x  (time we have per picture
+                                       minus time already spent
+                                       resizing and running the
+                                       model) [is there where fps comes in? i want to set a minimal fps and eveything else adopt - i think this is what make snes in our case what do yu think?]
+
+  quality            = the highest picture quality that recently fit
+                        inside next_byte_budget
+
+  then adjust quality:
+    if recv_ms just spiked, or the last picture went over budget
+         -> big step DOWN, right away
+    if several pictures in a row comfortably fit under budget
+         -> small step UP
+
+
+THREE DECISIONS STILL OPEN (need a real number, not a guess)
+---------------------------------------------------------------
+1. Target fps -- how many pictures per second are we trying to keep? [i think minimal 10 fps is good - but i think tunable by user in the page is best option]
+   Default: whatever this session already gets on a good
+   connection, so a good connection never gets worse because of this
+   change.
+
+2. Quality floor and ceiling -- how low/high is quality ever allowed
+   to go?
+   Default: never below 0.4 (risk of hiding a real polyp) and never
+   above 0.85 (pointless extra bytes). [but we need clear log on this - maybe show live calcuated qulity to user - so they know why quality is low or why fps is even lower than what asked]
+
+3. How many good pictures in a row before raising quality again?
+   Default: 10 pictures (about 1 second at 10 fps) -- matches a
+   window size already used elsewhere in the code for similar
+   "what's normal right now" checks. [agree]

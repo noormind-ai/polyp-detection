@@ -55,6 +55,21 @@ const HUD_KEY = "polyp_hud_on";
 // the 10/20-sample display averages, which a spike pollutes in three
 // frames. ~4s of a 15 fps session.
 const BASELINE_N = 60;
+// Operator-tunable floor: the fps we try to keep no matter what the uplink
+// is doing. Quality is the dial that absorbs a bad uplink; fps is the thing
+// that must not quietly degrade. See documents/live-inference-bitrate-adaptation.txt.
+const TARGET_FPS_KEY = "polyp_target_fps";
+const DEFAULT_TARGET_FPS = 10;
+// Never so low it risks hiding a real polyp; never above this because
+// there's nothing to gain once the wire isn't the bottleneck.
+const QUALITY_MIN = 0.4;
+const QUALITY_MAX = 0.85;
+// Deliberately asymmetric (AIMD -- additive increase, multiplicative
+// decrease): earn quality back slowly, lose it immediately. Same shape TCP
+// uses for congestion, and what WebRTC's GCC uses for live video calls.
+const QUALITY_STEP_UP = 0.02;
+const QUALITY_STEP_DOWN_MULT = 0.85;
+const QUALITY_GOOD_STREAK_TARGET = 10;
 const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 // Resolve the socket origin explicitly rather than leaning on a relative
 // WebSocket URL: the spec allows it, but an absolute ws:// is unambiguous and
@@ -1048,12 +1063,40 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   const [bytesSentShown, setBytesSentShown] = useState(0);
   const recvMsRef = useRef(0);
   const [recvMsShown, setRecvMsShown] = useState(0);
+
+  // Operator-set floor (persisted — same remember-the-choice convention as
+  // STRIP_POS_KEY/HUD_KEY above). The ref is what the hot loop reads;
+  // targetFps is only for the slider to display.
+  const targetFpsRef = useRef(DEFAULT_TARGET_FPS);
+  const [targetFps, setTargetFpsState] = useState(DEFAULT_TARGET_FPS);
+  function setTargetFps(v: number) {
+    setTargetFpsState(v);
+    targetFpsRef.current = v;
+    try { localStorage.setItem(TARGET_FPS_KEY, String(v)); } catch { /* private mode */ }
+  }
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(TARGET_FPS_KEY);
+      const v = raw ? Number(raw) : NaN;
+      if (Number.isFinite(v) && v > 0) { setTargetFpsState(v); targetFpsRef.current = v; }
+    } catch { /* private mode */ }
+  }, []);
+
+  // The AIMD state itself. Starts at the ceiling and only drops once a frame
+  // actually misses the fps budget -- see the adjustment next to recvMsRef
+  // above in ws.onmessage. goodStreakRef counts consecutive on-budget
+  // frames; QUALITY_GOOD_STREAK_TARGET of them in a row earns one step back up.
+  const qualityRef = useRef(QUALITY_MAX);
+  const [qualityShown, setQualityShown] = useState(QUALITY_MAX);
+  const goodStreakRef = useRef(0);
+
   useEffect(() => {
     const id = setInterval(() => {
       setDeintMsShown(deintMsRef.current);
       setResizeMsShown(resizeMsRef.current);
       setBytesSentShown(bytesSentRef.current);
       setRecvMsShown(recvMsRef.current);
+      setQualityShown(qualityRef.current);
     }, 500);
     return () => clearInterval(id);
   }, []);
@@ -1586,6 +1629,27 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         // Direct measurements, not derived -- see bytesSentRef/recvMsRef above.
         if (entry) bytesSentRef.current = entry.bytes;
         recvMsRef.current = timing.recv_ms;
+
+        // AIMD quality adjustment -- the fps floor is the anchor: work out
+        // how much of one frame's time budget is left for the wire once
+        // resize and the model have taken their share, and compare that to
+        // what this frame's receive actually cost. Miss it once -> drop
+        // quality now (multiplicative). Clear it QUALITY_GOOD_STREAK_TARGET
+        // times in a row -> earn one small step back (additive). See
+        // documents/live-inference-bitrate-adaptation.txt for why this
+        // shape, not a per-frame search for the "right" quality.
+        const frameBudgetMs = 1000 / targetFpsRef.current;
+        const availableWireMs = Math.max(5, frameBudgetMs - resizeMsRef.current - timing.modal_ms);
+        if (timing.recv_ms > availableWireMs) {
+          qualityRef.current = Math.max(QUALITY_MIN, qualityRef.current * QUALITY_STEP_DOWN_MULT);
+          goodStreakRef.current = 0;
+        } else {
+          goodStreakRef.current += 1;
+          if (goodStreakRef.current >= QUALITY_GOOD_STREAK_TARGET) {
+            qualityRef.current = Math.min(QUALITY_MAX, qualityRef.current + QUALITY_STEP_UP);
+            goodStreakRef.current = 0;
+          }
+        }
 
         // Best-effort, throttled report so spectator mode can show these same
         // numbers (see spectate_bus.py's _room_stats) -- fire-and-forget, never
@@ -2509,7 +2573,9 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         continue;
       }
 
-      const blob: Blob = await new Promise((res) => cap.toBlob((b) => res(b!), "image/jpeg", 0.85));
+      // Quality is the AIMD-adjusted value from the last reply, not a
+      // constant -- see qualityRef above.
+      const blob: Blob = await new Promise((res) => cap.toBlob((b) => res(b!), "image/jpeg", qualityRef.current));
       const buf = await blob.arrayBuffer();
 
       // Sent, not awaited. This is the whole point of the pipeline: the wire
@@ -3082,6 +3148,8 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     resizeMs: resizeMsShown,
     bytesSent: bytesSentShown,
     recvMs: recvMsShown,
+    quality: qualityShown,
+    targetFps,
   };
 
   const detectedFs = useFullscreen();
@@ -3739,6 +3807,27 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
               />
               {t("Show latency numbers on the full-screen view")}
             </label>
+
+            {/* The floor this session tries to protect -- picture quality is
+                the thing that adapts when the uplink is bad, not this. */}
+            <div className="space-y-1">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-gray-400">{t("Target fps (live inference)")}</span>
+                <span className="font-mono text-gray-200">{targetFps}</span>
+              </div>
+              <input
+                type="range"
+                min={3}
+                max={20}
+                step={1}
+                value={targetFps}
+                onChange={(e) => setTargetFps(Number(e.target.value))}
+                className="w-full accent-blue-500 cursor-pointer"
+              />
+              <p className="text-xs text-gray-500">
+                {t("Picture quality adapts automatically to keep up with this. Lower it if the uplink is consistently slow.")}
+              </p>
+            </div>
 
             {/* Two screens, PowerPoint style: the doctor gets a clean picture
                 on one monitor, this page keeps every control on the other. */}
