@@ -69,7 +69,17 @@ const QUALITY_MAX = 0.85;
 // uses for congestion, and what WebRTC's GCC uses for live video calls.
 const QUALITY_STEP_UP = 0.02;
 const QUALITY_STEP_DOWN_MULT = 0.85;
-const QUALITY_GOOD_STREAK_TARGET = 10;
+// How the step UP is decided -- a rolling window, not a hard streak. A
+// strict "N in a row, zero misses" gate gets reset by ordinary jitter before
+// it ever reaches N, which is why quality could get stuck low even on a
+// fine connection. A window tolerates the occasional miss instead.
+const QUALITY_WINDOW_N = 15;
+const QUALITY_GOOD_FRACTION = 0.8;
+// TCP's other well-known phase, "slow start": big jumps while far from the
+// limit, small cautious steps once close to it. If recv_ms is using less
+// than this fraction of the available budget, there's enough margin to
+// just jump straight to the ceiling instead of creeping up 0.02 at a time.
+const QUALITY_BIG_MARGIN_RATIO = 0.5;
 const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 // Resolve the socket origin explicitly rather than leaning on a relative
 // WebSocket URL: the spec allows it, but an absolute ws:// is unambiguous and
@@ -1084,11 +1094,13 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
 
   // The AIMD state itself. Starts at the ceiling and only drops once a frame
   // actually misses the fps budget -- see the adjustment next to recvMsRef
-  // above in ws.onmessage. goodStreakRef counts consecutive on-budget
-  // frames; QUALITY_GOOD_STREAK_TARGET of them in a row earns one step back up.
+  // above in ws.onmessage. qualityWindowRef holds a 1/0 per frame (on-budget
+  // or not) over the last QUALITY_WINDOW_N frames; its mean is "what fraction
+  // of recent frames were fine", read with QUALITY_GOOD_FRACTION as the gate
+  // for stepping back up.
   const qualityRef = useRef(QUALITY_MAX);
   const [qualityShown, setQualityShown] = useState(QUALITY_MAX);
-  const goodStreakRef = useRef(0);
+  const qualityWindowRef = useRef(new Rolling(QUALITY_WINDOW_N));
 
   useEffect(() => {
     const id = setInterval(() => {
@@ -1633,22 +1645,32 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         // AIMD quality adjustment -- the fps floor is the anchor: work out
         // how much of one frame's time budget is left for the wire once
         // resize and the model have taken their share, and compare that to
-        // what this frame's receive actually cost. Miss it once -> drop
-        // quality now (multiplicative). Clear it QUALITY_GOOD_STREAK_TARGET
-        // times in a row -> earn one small step back (additive). See
+        // what this frame's receive actually cost. See
         // documents/live-inference-bitrate-adaptation.txt for why this
         // shape, not a per-frame search for the "right" quality.
         const frameBudgetMs = 1000 / targetFpsRef.current;
         const availableWireMs = Math.max(5, frameBudgetMs - resizeMsRef.current - timing.modal_ms);
-        if (timing.recv_ms > availableWireMs) {
+        const frameWasGood = timing.recv_ms <= availableWireMs;
+        qualityWindowRef.current.push(frameWasGood ? 1 : 0);
+
+        if (!frameWasGood) {
+          // Miss the budget even once -> drop now. Fast to react, same as
+          // GCC/TCP: a single overshoot is cheap to recover from, a slow
+          // reaction to real congestion isn't.
           qualityRef.current = Math.max(QUALITY_MIN, qualityRef.current * QUALITY_STEP_DOWN_MULT);
-          goodStreakRef.current = 0;
-        } else {
-          goodStreakRef.current += 1;
-          if (goodStreakRef.current >= QUALITY_GOOD_STREAK_TARGET) {
-            qualityRef.current = Math.min(QUALITY_MAX, qualityRef.current + QUALITY_STEP_UP);
-            goodStreakRef.current = 0;
-          }
+        } else if (
+          qualityWindowRef.current.n >= QUALITY_WINDOW_N
+          && qualityWindowRef.current.mean >= QUALITY_GOOD_FRACTION
+        ) {
+          // Gate on "mostly good over the recent window", not "zero misses
+          // in a row" -- ordinary jitter can no longer block recovery
+          // forever by resetting a streak counter one frame before it pays off.
+          const bigMargin = timing.recv_ms < availableWireMs * QUALITY_BIG_MARGIN_RATIO;
+          qualityRef.current = bigMargin
+            // Slow-start: comfortably inside budget, no reason to creep --
+            // there's nothing left to probe for, so go straight to the ceiling.
+            ? QUALITY_MAX
+            : Math.min(QUALITY_MAX, qualityRef.current + QUALITY_STEP_UP);
         }
 
         // Best-effort, throttled report so spectator mode can show these same
@@ -3812,7 +3834,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
                 the thing that adapts when the uplink is bad, not this. */}
             <div className="space-y-1">
               <div className="flex items-center justify-between text-xs">
-                <span className="text-gray-400">{t("Target fps (live inference)")}</span>
+                <span className="text-gray-400">{t("Minimum fps to protect (live inference)")}</span>
                 <span className="font-mono text-gray-200">{targetFps}</span>
               </div>
               <input
@@ -3825,7 +3847,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
                 className="w-full accent-blue-500 cursor-pointer"
               />
               <p className="text-xs text-gray-500">
-                {t("Picture quality adapts automatically to keep up with this. Lower it if the uplink is consistently slow.")}
+                {t("A floor, not a target — running faster than this is fine. Picture quality drops automatically only if needed to keep fps from falling below it.")}
               </p>
             </div>
 

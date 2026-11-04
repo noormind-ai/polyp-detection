@@ -8,8 +8,9 @@ the uplink (how fast your device can send data OUT to the internet)
 gets worse mid-session -- instead of always sending the same picture
 quality no matter what the connection is doing right now.
 
-Status: mental model only, nothing coded yet. Three numbers near the
-bottom still need a decision before any code gets written.
+Status: implemented and deployed. LiveCameraPlayer.tsx (the logic) and
+LatencyHud.tsx (the on-screen numbers). This file is the plain-English
+version of what the code does, kept in sync with it.
 
 
 THE ANALOGY THAT FITS, AND THE ONE THAT DOESN'T
@@ -35,94 +36,117 @@ fits us.
 
 WHAT GCC DOES, IN PLAIN WORDS
 -------------------------------
-It watches two warning signs, and reacts to whichever one looks
-worse:
+It watches a warning sign and reacts when it looks worse:
 
   - Is data taking LONGER to arrive than it used to?
-    (This is "delay-based" detection. It's an early warning -- a
-    queue is starting to build up somewhere, before anything has
-    actually gone wrong yet.) [the rec_ms show this?]
+    (This is "delay-based" detection -- an early warning that a
+    queue is starting to build up, before anything has actually
+    gone wrong yet. Our recv_ms, the server's own measurement of how
+    long it waited to receive one picture, is exactly this number.)
 
-  - Is data actually getting LOST and never arriving?
-    (This is "loss-based" detection -- things have already gone
-    wrong, so react harder.) [how can we measure it in our case?]
+GCC also has a second, separate warning sign -- actual data loss.
+We don't have an equivalent, and that's fine, not a gap: we send
+over a WebSocket, which runs on top of TCP. TCP's whole job is to
+guarantee nothing is ever silently lost -- if a piece goes missing,
+it gets automatically re-sent before our code ever sees anything
+wrong. So on our transport, loss doesn't show up as missing data, it
+shows up as extra delay (the resend takes time) -- which recv_ms
+already captures. One detector covers both cases for us.
 
-Then it adjusts quality using one simple rule, nicknamed AIMD
-(stands for "Additive Increase, Multiplicative Decrease" -- don't
-worry about the name, just the rule):
+(This is also why we can't see individual network packets the way
+GCC does -- TCP hides them on purpose. It bundles everything and
+only hands our code the complete picture once it has fully arrived.)
 
-  - When things are calm: creep the quality UP, one small step at a
-    time.
-  - When trouble shows up: drop the quality DOWN by a big step,
-    immediately.
+GCC adjusts using two modes, not one constant step size:
 
-In short: slow to raise it, quick to cut it.
+  - "Slow start": while far from the limit, jump FAST -- you clearly
+    have room, so there's nothing to be cautious about yet.
+  - "Congestion avoidance": once close to the limit, creep up slowly,
+    one small step at a time, and drop FAST the moment trouble shows.
+
+In short: big steps when there's clearly room, small careful steps
+near the edge, fast drops always.
 
 
 MAPPED ONTO WHAT WE ALREADY MEASURE
 -------------------------------------
-GCC looks at individual network packets, which we don't have access
-to [why?] -- we only get one number per picture we send. That's actually
-enough. Here's how each idea becomes something we can use:
+We don't have per-packet data like GCC does -- we have one number per
+frame. That's enough. Here's the translation:
 
   "Is it taking longer than usual?"
-    -> We already measure recv_ms (how long the server waited to
-       fully receive one picture). We compare it to its own
-       "baseline" (the normal/average value for this session so
-       far) -- already built, the on-screen HUD already does this
-       exact comparison for other numbers and calls a sudden jump a
-       "spike".
+    -> recv_ms, compared each frame against a budget worked out from
+       the fps floor you set (see FORMULA below).
 
-  "How much data can actually get through right now?"
-    -> This is called throughput: bytes sent divided by how long
-       they took. We smooth it with an EWMA (a kind of running
-       average that pays more attention to the last few pictures
-       than to older ones, so one lucky/unlucky picture can't swing
-       it too much).
+  "Is there a lot of room, a little room, or none?"
+    -> the gap between recv_ms and that budget. A big gap is treated
+       like GCC's slow-start (jump to the ceiling); a small gap gets
+       the cautious small step.
 
-  "How much should I send next?"
-    -> A byte budget: the biggest file size we're allowed to send
-       for the next picture, so it still arrives in time.
-
-  "How do I change quality without overreacting?"
-    -> JPEG quality setting, moved by the AIMD rule above: small
-       step up, big step down.
+  "How do I change quality without overreacting to one noisy frame?"
+    -> a rolling window of the last 15 frames' pass/fail, not a
+       strict streak. See "WHY A WINDOW, NOT A STREAK" below.
 
 
 THE FORMULA, PER PICTURE SENT
 --------------------------------
-  throughput        = smoothed average of (bytes sent / recv_ms)
-                       -- recalculated continuously, not just once
-                          at the start of the session
+  frame_budget_ms   = 1000 / target_fps
+                       -- target_fps is the floor you set on the page
+                          (default 10, a slider, your choice -- NOT a
+                          speed cap. Running faster than this is fine
+                          and expected; it's the minimum being
+                          protected, not a target to match exactly)
 
-  next_byte_budget  = throughput  x  (time we have per picture
-                                       minus time already spent
-                                       resizing and running the
-                                       model) [is there where fps comes in? i want to set a minimal fps and eveything else adopt - i think this is what make snes in our case what do yu think?]
+  available_wire_ms = frame_budget_ms - resize_ms - server_ms
+                       -- what's left for the network after resizing
+                          the picture and running the model
 
-  quality            = the highest picture quality that recently fit
-                        inside next_byte_budget
+  this picture is "good" if recv_ms <= available_wire_ms
 
-  then adjust quality:
-    if recv_ms just spiked, or the last picture went over budget
-         -> big step DOWN, right away
-    if several pictures in a row comfortably fit under budget
-         -> small step UP
+  if NOT good:
+      quality drops immediately (big multiplicative step down)
+
+  if good:
+      record it in a 15-picture rolling window
+      if at least 80% of that window was "good":
+          if recv_ms is under HALF of available_wire_ms (lots of room)
+              -> jump quality straight to the ceiling (slow-start)
+          else
+              -> small step up (the cautious climb)
 
 
-THREE DECISIONS STILL OPEN (need a real number, not a guess)
----------------------------------------------------------------
-1. Target fps -- how many pictures per second are we trying to keep? [i think minimal 10 fps is good - but i think tunable by user in the page is best option]
-   Default: whatever this session already gets on a good
-   connection, so a good connection never gets worse because of this
-   change.
+WHY A WINDOW, NOT A STREAK
+-----------------------------
+The first version required 10 good pictures IN A ROW, zero misses,
+before raising quality even once. In practice there's always some
+ordinary jitter -- if even 1 picture in every 8 or 9 goes slightly
+over budget (completely normal, not a real problem), the count got
+reset to zero right before it would have paid off. Quality could get
+stuck low indefinitely even on a perfectly fine connection, which is
+what showed up in testing as "it doesn't increase at all" -- not a
+slow climb, but a climb that could never finish.
 
-2. Quality floor and ceiling -- how low/high is quality ever allowed
-   to go?
-   Default: never below 0.4 (risk of hiding a real polyp) and never
-   above 0.85 (pointless extra bytes). [but we need clear log on this - maybe show live calcuated qulity to user - so they know why quality is low or why fps is even lower than what asked]
+Looking at "what fraction of the last 15 were fine" instead of "were
+ALL of the last 10 fine" means a little jitter can no longer block
+recovery forever. The same idea already exists elsewhere in this file
+for other numbers (rtt/net/server), which use a rolling average rather
+than a single raw sample for exactly this reason.
 
-3. How many good pictures in a row before raising quality again?
-   Default: 10 pictures (about 1 second at 10 fps) -- matches a
-   window size already used elsewhere in the code for similar
-   "what's normal right now" checks. [agree]
+
+ON-SCREEN TRANSPARENCY
+-------------------------
+The debug HUD shows current send quality next to the target fps, so
+a lower quality number always has a visible reason instead of looking
+like an unexplained drop. If fps is still below target even at the
+current quality, a note explains that the uplink can't keep up right
+now -- that's the floor doing its job, not a bug.
+
+
+OPEN QUESTION, NOT YET AN ISSUE
+-----------------------------------
+Quality decreases happen on the very first miss. If that also turns
+out to be too jumpy in practice (reacting to single harmless blips the
+same way the old streak-based increase did), the same window-based
+tolerance used for the increase side could be applied to the decrease
+side too. Not changed yet because nothing observed so far suggests
+it's a problem -- fast reaction to a real slowdown is the point, and
+changing this without a reason to would be guessing.
