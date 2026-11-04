@@ -1086,6 +1086,12 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // recv_ms increase -- it has no way to know why the client was late.
   const grabMsRef = useRef(0);
   const [grabMsShown, setGrabMsShown] = useState(0);
+  // The JPEG encode itself (cap.toBlob) -- the other step between resize/grab
+  // and send() that was never measured. Can be hardware-accelerated on one
+  // machine's GPU driver and fall back to a slow software path on another's,
+  // with identical resize/grab numbers on both.
+  const encodeMsRef = useRef(0);
+  const [encodeMsShown, setEncodeMsShown] = useState(0);
   // Two more numbers pulled out of the "net" leftover, same reasoning as
   // resizeMs above: bytesSentRef is the JPEG size THIS tab actually sent
   // (set on the Pending entry at send time), recvMsRef is the server's own
@@ -1129,6 +1135,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       setDeintMsShown(deintMsRef.current);
       setResizeMsShown(resizeMsRef.current);
       setGrabMsShown(grabMsRef.current);
+      setEncodeMsShown(encodeMsRef.current);
       setBytesSentShown(bytesSentRef.current);
       setRecvMsShown(recvMsRef.current);
       setQualityShown(qualityRef.current);
@@ -2628,9 +2635,11 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       }
 
       // Quality is the AIMD-adjusted value from the last reply, not a
-      // constant -- see qualityRef above.
+      // constant -- see qualityRef above. Timed -- see encodeMsRef.
+      const encodeT0 = performance.now();
       const blob: Blob = await new Promise((res) => cap.toBlob((b) => res(b!), "image/jpeg", qualityRef.current));
       const buf = await blob.arrayBuffer();
+      encodeMsRef.current = performance.now() - encodeT0;
 
       // Sent, not awaited. This is the whole point of the pipeline: the wire
       // time for THIS frame now overlaps the settle of the previous one and
@@ -3201,6 +3210,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     uplinkMbps,
     resizeMs: resizeMsShown,
     grabMs: grabMsShown,
+    encodeMs: encodeMsShown,
     bytesSent: bytesSentShown,
     recvMs: recvMsShown,
     quality: qualityShown,

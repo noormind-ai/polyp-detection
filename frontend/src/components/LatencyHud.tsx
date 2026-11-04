@@ -44,6 +44,11 @@ export interface LatencyStats {
    *  checking: a slow client step here shows up as the server's recv_ms
    *  going up, with nothing in bytesSent or resizeMs explaining why. */
   grabMs?: number | null;
+  /** Time to JPEG-encode the resized frame (cap.toBlob). Can be hardware-
+   *  accelerated on one machine and a slow software fallback on another,
+   *  with identical resizeMs/grabMs on both -- the third unmeasured client
+   *  step, after resize and the filing-copy grab. */
+  encodeMs?: number | null;
   /** Size of the JPEG this tab actually sent for the last frame, in bytes.
    *  Pixel size (320px) is fixed either way -- this is here to check whether
    *  a more detailed source compresses to more bytes at that same width,
@@ -174,6 +179,14 @@ export default function LatencyHud({
           <span className="text-gray-500 pl-3">{t("   · of which filing-copy grab")}</span>
           <span className="text-gray-400">
             {stats.grabMs > 0 ? t("{ms} ms", { ms: Math.round(stats.grabMs * 10) / 10 }) : "—"}
+          </span>
+        </>
+      )}
+      {stats.encodeMs != null && (
+        <>
+          <span className="text-gray-500 pl-3">{t("   · of which JPEG encode")}</span>
+          <span className="text-gray-400">
+            {stats.encodeMs > 0 ? t("{ms} ms", { ms: Math.round(stats.encodeMs * 10) / 10 }) : "—"}
           </span>
         </>
       )}
