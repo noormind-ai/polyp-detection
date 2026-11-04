@@ -152,11 +152,21 @@ const SPEEDS = [0.1, 0.25, 0.5, 0.7, 1, 1.5, 2];
 // or the operator's own file starts at 1x. Must be a member of SPEEDS or no
 // button renders as selected.
 const DEMO_SPEED = 0.7;
-// How many of the first frames of a session are measured to find the picture
-// area. The border does not move, so this is a fixed startup cost, not a
-// per-frame one. Several rather than one because the union of several frames
-// cannot be fooled by a single dark frame — see lib/fov.ts.
+// How many USABLE frames (ones detectFovRect could read a picture out of) are
+// measured to find the picture area. The border does not move, so this is a
+// fixed startup cost, not a per-frame one. Several rather than one because the
+// union of several frames cannot be fooled by a single dark frame — see
+// lib/fov.ts. Deliberately a count of successes, not of tries: a capture card
+// still locking onto its incoming signal emits black frames for its first
+// moment on air, and a black frame must not spend this budget, or a session
+// that starts during that window gets no crop for its entire length.
 const FOV_SAMPLE_FRAMES = 8;
+// Escape hatch for the above: if a source NEVER produces a usable frame (dead
+// cable, lens cap, a signal that genuinely never locks), sampling must still
+// stop eventually rather than probing every frame of an hour-long procedure.
+// 6s is several times the slowest lock-on observed on our own capture card and
+// short enough that giving up still happens well inside the opening seconds.
+const FOV_SAMPLE_TIMEOUT_MS = 6000;
 // How many frames to spend deciding whether the source is interlaced before
 // concluding it is not. Far more generous than the FOV budget above, and for a
 // different reason: a border shows up in any frame, but comb only appears where
@@ -1005,6 +1015,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   const [fovRect, setFovRectState] = useState<Rect | null>(null);
   const fovRectRef  = useRef<Rect | null>(null);
   const fovSamplesRef = useRef(0);
+  // Wall-clock, not frame count — see FOV_SAMPLE_TIMEOUT_MS. 0 means "not
+  // sampling yet", which is also safely in the past, so a stray call before
+  // the first reset cannot be mistaken for "still within budget".
+  const fovDeadlineRef = useRef(0);
   // Whether this source is interlaced, and how far we have got towards knowing.
   // Null means "not decided yet", and while it is null nothing is deinterlaced
   // -- the safe default, since treating a progressive source as interlaced
@@ -1239,6 +1253,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   function resetFovDetection() {
     fovRectRef.current = null;
     fovSamplesRef.current = 0;
+    fovDeadlineRef.current = Date.now() + FOV_SAMPLE_TIMEOUT_MS;
     fovBaseRef.current = null;
     setFovBase(null);
     setFovRectState(null);
@@ -1852,12 +1867,13 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     return r;
   }
 
-  // Measure the picture area from the first frames of the session, then leave
-  // it alone. Cheap (a 160px-wide probe) and it stops after FOV_SAMPLE_FRAMES,
-  // so this costs nothing for the rest of the procedure.
+  // Measure the picture area from the first USABLE frames of the session,
+  // then leave it alone. Cheap (a 160px-wide probe) and it stops after
+  // FOV_SAMPLE_FRAMES successes (or FOV_SAMPLE_TIMEOUT_MS, whichever comes
+  // first), so this costs nothing for the rest of the procedure.
   function sampleFov(video: HTMLVideoElement) {
     if (fovSamplesRef.current >= FOV_SAMPLE_FRAMES) return;
-    fovSamplesRef.current += 1;
+    if (Date.now() > fovDeadlineRef.current) return;
     const vw = video.videoWidth, vh = video.videoHeight;
     if (!vw || !vh) return;
     // Measure INSIDE the operator's crop, never on the whole signal.
@@ -1891,6 +1907,9 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       found = detectFovRect(video, vw, vh);
     }
     if (!found) return;
+    // Only a usable read spends the budget — see the comment on
+    // FOV_SAMPLE_FRAMES for why a black/unreadable frame must not.
+    fovSamplesRef.current += 1;
     const merged = unionRect(fovRectRef.current, found);
     fovRectRef.current = merged;
     fovBaseRef.current = base;
