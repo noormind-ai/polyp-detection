@@ -3582,6 +3582,25 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       }));
   }, [recordings, lang]);
 
+  // The date/duration string per recording (describeRecordingInDay) is cheap
+  // on its own, but this component re-renders at inference rate (every HUD
+  // stats update, several times a second during a live session) and this
+  // JSX was being rebuilt from scratch -- every option, every optgroup --
+  // on every single one of those renders, even though recordingDays itself
+  // only changes when the server's recording list actually changes. Measured
+  // live via a Chrome CPU profile: this was over 60% of all main-thread time
+  // during a session, not the inference loop. t is now stable (see
+  // lib/i18n.tsx) so this memo can actually hold across unrelated renders.
+  const recordingOptgroups = useMemo(() => recordingDays.map(({ day, label, items }) => (
+    <optgroup key={day} label={t("Clinic · {day} ({n})", { day: label, n: items.length })}>
+      {items.map((r) => (
+        <option key={`${r.case_id}/${r.id}`} value={`${REC_PREFIX}${r.case_id}/${r.id}`}>
+          {describeRecordingInDay(r)}
+        </option>
+      ))}
+    </optgroup>
+  )), [recordingDays, t]);
+
   const deviceSelect = (
     <div className="flex flex-wrap items-center justify-center gap-2">
       <select
@@ -3604,15 +3623,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
             <option key={v.file} value={`${DEMO_PREFIX}${v.file}`}>{t(v.label)}</option>
           ))}
         </optgroup>
-        {recordingDays.map(({ day, label, items }) => (
-          <optgroup key={day} label={t("Clinic · {day} ({n})", { day: label, n: items.length })}>
-            {items.map((r) => (
-              <option key={`${r.case_id}/${r.id}`} value={`${REC_PREFIX}${r.case_id}/${r.id}`}>
-                {describeRecordingInDay(r)}
-              </option>
-            ))}
-          </optgroup>
-        ))}
+        {recordingOptgroups}
         {localFile && (
           <optgroup label={t("From this computer")}>
             <option value={`${LOCAL_PREFIX}${localFile.name}`}>{localFile.name}</option>

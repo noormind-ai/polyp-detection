@@ -1,5 +1,5 @@
 "use client";
-import { createContext, useContext, useEffect, useState, ReactNode } from "react";
+import { createContext, useContext, useEffect, useState, useCallback, useMemo, ReactNode } from "react";
 import { FA } from "./translations";
 
 type Lang = "fa" | "en";
@@ -42,20 +42,35 @@ export function LanguageProvider({ children }: { children: ReactNode }) {
     document.documentElement.dir = lang === "fa" ? "rtl" : "ltr";
   }, [lang]);
 
-  const toggleLang = () => {
-    const next: Lang = lang === "fa" ? "en" : "fa";
-    setLang(next);
-    localStorage.setItem("polyp_lang", next);
-  };
+  // Stable across renders (useCallback) so that any consumer using t or
+  // toggleLang as a dependency -- useMemo, useCallback, React.memo -- can
+  // actually skip work instead of recomputing every render just because
+  // these were new function references each time. See the recordings
+  // dropdown in LiveCameraPlayer.tsx for why this mattered in practice: its
+  // option list is pure JSX work keyed off t, and without this fix every
+  // unrelated HUD state update (multiple times a second during live
+  // inference) silently forced the whole list to be rebuilt.
+  const toggleLang = useCallback(() => {
+    setLang((prev) => {
+      const next: Lang = prev === "fa" ? "en" : "fa";
+      localStorage.setItem("polyp_lang", next);
+      return next;
+    });
+  }, []);
 
-  const t = (key: string, vars?: Record<string, string | number>) => {
+  const t = useCallback((key: string, vars?: Record<string, string | number>) => {
     let s = lang === "fa" && FA[key] ? FA[key] : key;
     if (vars) for (const k in vars) s = s.split(`{${k}}`).join(String(vars[k]));
     return s;
-  };
+  }, [lang]);
+
+  // Same reasoning one level up: without this, the context value object
+  // itself is a new reference every render regardless of t/toggleLang being
+  // stable, which still breaks React.memo on any direct context consumer.
+  const value = useMemo(() => ({ lang, toggleLang, t }), [lang, toggleLang, t]);
 
   return (
-    <LanguageContext.Provider value={{ lang, toggleLang, t }}>
+    <LanguageContext.Provider value={value}>
       {children}
     </LanguageContext.Provider>
   );
