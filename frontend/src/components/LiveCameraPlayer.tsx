@@ -1767,9 +1767,26 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         // what this frame's receive actually cost. See
         // documents/live-inference-bitrate-adaptation.txt for why this
         // shape, not a per-frame search for the "right" quality.
+        //
+        // Reads curNet (rtt - modal_ms), NOT timing.recv_ms, despite the doc
+        // above and the original design assuming recv_ms was a clean
+        // network signal (modelled on WebRTC's GCC). It is not: the server
+        // stamps its receive-wait timer right after finishing the PREVIOUS
+        // frame's reply (backend/routes/infer.py's _stream_frames loop), so
+        // recv_ms measures the full gap until the NEXT frame's bytes show
+        // up -- which includes however long THIS client took to resize,
+        // gate, and encode that frame, not just wire time. A slow encode
+        // (the client being CPU-bound) and a slow network are indistinguishable
+        // to a receiver that is just waiting on a socket; the server cannot
+        // tell them apart, and recv_ms inherits that confusion. curNet does
+        // not have this problem -- entry.sentAt is stamped immediately
+        // before THIS frame's own send(), so rtt (and curNet = rtt minus
+        // the server's own reported processing time) is scoped to exactly
+        // one request/reply pair, the way a correct latency measurement
+        // should be, not to the gap between unrelated frames.
         const frameBudgetMs = 1000 / targetFpsRef.current;
         const availableWireMs = Math.max(5, frameBudgetMs - resizeMsRef.current - timing.modal_ms);
-        const frameWasGood = timing.recv_ms <= availableWireMs;
+        const frameWasGood = curNet <= availableWireMs;
         qualityWindowRef.current.push(frameWasGood ? 1 : 0);
 
         if (!frameWasGood) {
@@ -1784,7 +1801,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
           // Gate on "mostly good over the recent window", not "zero misses
           // in a row" -- ordinary jitter can no longer block recovery
           // forever by resetting a streak counter one frame before it pays off.
-          const bigMargin = timing.recv_ms < availableWireMs * QUALITY_BIG_MARGIN_RATIO;
+          const bigMargin = curNet < availableWireMs * QUALITY_BIG_MARGIN_RATIO;
           qualityRef.current = bigMargin
             // Slow-start: comfortably inside budget, no reason to creep --
             // there's nothing left to probe for, so go straight to the ceiling.
