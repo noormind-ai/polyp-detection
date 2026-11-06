@@ -203,12 +203,22 @@ export function createGLDeinterlacer(): GLDeinterlacer | null {
   let sized = { w: 0, h: 0 };
   let hasPrev = false;
 
+  // Only yadif/bwdif's temporal clamp (FRAG's uHasPrev branch) ever reads
+  // texPrev -- weave/bob/blend/adaptive's shader branches never call prv().
+  // Uploading a full native-resolution frame to the GPU as "history" for a
+  // mode that will never read it was pure waste, paid every single video
+  // frame regardless of mode. Measured as a real, large cost on the clinic
+  // PC's weak GPU once real (not static) content was used to test it.
+  const NEEDS_PREV: Partial<Record<DeintMode, true>> = { yadif: true, bwdif: true };
+
   return {
     process(video, w, h, mode) {
       // The original CPU deinterlacer is not one of these shaders; returning
       // null hands the frame back to the caller's fallback path, which is
-      // exactly that implementation.
-      if (!w || !h || mode === "legacy") return null;
+      // exactly that implementation. "weave" means no processing by
+      // definition -- same reasoning, same fallback, instead of paying for a
+      // full GPU upload-and-shader pass just to copy the pixel unchanged.
+      if (!w || !h || mode === "legacy" || mode === "weave") return null;
       const t0 = performance.now();
       if (sized.w !== w || sized.h !== h) {
         canvas.width = w; canvas.height = h;
@@ -222,6 +232,8 @@ export function createGLDeinterlacer(): GLDeinterlacer | null {
       gl.bindTexture(gl.TEXTURE_2D, texCur);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
 
+      const needsPrev = !!NEEDS_PREV[mode];
+
       gl.useProgram(prog);
       gl.uniform1i(gl.getUniformLocation(prog, "uCur"), 0);
       gl.activeTexture(gl.TEXTURE1);
@@ -229,16 +241,21 @@ export function createGLDeinterlacer(): GLDeinterlacer | null {
       gl.uniform1i(gl.getUniformLocation(prog, "uPrev"), 1);
       gl.uniform1i(gl.getUniformLocation(prog, "uMode"), MODE_ID[mode]);
       gl.uniform1i(gl.getUniformLocation(prog, "uH"), h);
-      gl.uniform1i(gl.getUniformLocation(prog, "uHasPrev"), hasPrev ? 1 : 0);
+      gl.uniform1i(gl.getUniformLocation(prog, "uHasPrev"), (needsPrev && hasPrev) ? 1 : 0);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
 
       // History is the SOURCE frame, not the output: the temporal clamp asks
       // "what did the signal show here last time", and feeding it our own
-      // interpolation instead would make it agree with itself forever.
-      gl.activeTexture(gl.TEXTURE1);
-      gl.bindTexture(gl.TEXTURE_2D, texPrev);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
-      hasPrev = true;
+      // interpolation instead would make it agree with itself forever. Only
+      // worth uploading at all for the one or two modes that will read it.
+      if (needsPrev) {
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, texPrev);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+        hasPrev = true;
+      } else {
+        hasPrev = false;
+      }
 
       return { canvas, ms: Math.round((performance.now() - t0) * 100) / 100 };
     },
