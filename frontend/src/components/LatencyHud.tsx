@@ -49,6 +49,17 @@ export interface LatencyStats {
    *  with identical resizeMs/grabMs on both -- the third unmeasured client
    *  step, after resize and the filing-copy grab. */
   encodeMs?: number | null;
+  /** encodeMs split into its four real pieces -- see jpegEncoder.ts's
+   *  EncodeTiming for the full reasoning. bitmapMs and returnWaitMs are
+   *  main-thread cost (createImageBitmap, and the wait after the worker
+   *  already replied); handoffMs is mostly message-passing overhead;
+   *  workerEncodeMs is the actual compression, isolated on its own thread
+   *  -- the one number an encode-only benchmark run with nothing else
+   *  competing for the CPU would measure. */
+  bitmapMs?: number | null;
+  handoffMs?: number | null;
+  workerEncodeMs?: number | null;
+  returnWaitMs?: number | null;
   /** Size of the JPEG this tab actually sent for the last frame, in bytes.
    *  Pixel size (320px) is fixed either way -- this is here to check whether
    *  a more detailed source compresses to more bytes at that same width,
@@ -187,6 +198,40 @@ export default function LatencyHud({
           <span className="text-gray-500 pl-3">{t("   · of which JPEG encode")}</span>
           <span className="text-gray-400">
             {stats.encodeMs > 0 ? t("{ms} ms", { ms: Math.round(stats.encodeMs * 10) / 10 }) : "—"}
+          </span>
+        </>
+      )}
+      {/* The breakdown of the row above -- which of the four pieces is
+          actually costly, instead of one lumped number. */}
+      {stats.bitmapMs != null && (
+        <>
+          <span className="text-gray-500 pl-6">{t("      · bitmap copy (main thread)")}</span>
+          <span className="text-gray-400">
+            {stats.bitmapMs > 0 ? t("{ms} ms", { ms: Math.round(stats.bitmapMs * 10) / 10 }) : "—"}
+          </span>
+        </>
+      )}
+      {stats.handoffMs != null && (
+        <>
+          <span className="text-gray-500 pl-6">{t("      · handoff to worker")}</span>
+          <span className="text-gray-400">
+            {stats.handoffMs > 0 ? t("{ms} ms", { ms: Math.round(stats.handoffMs * 10) / 10 }) : "—"}
+          </span>
+        </>
+      )}
+      {stats.workerEncodeMs != null && (
+        <>
+          <span className="text-gray-500 pl-6">{t("      · worker compression")}</span>
+          <span className="text-gray-400">
+            {stats.workerEncodeMs > 0 ? t("{ms} ms", { ms: Math.round(stats.workerEncodeMs * 10) / 10 }) : "—"}
+          </span>
+        </>
+      )}
+      {stats.returnWaitMs != null && (
+        <>
+          <span className="text-gray-500 pl-6">{t("      · wait for main thread")}</span>
+          <span className="text-gray-400">
+            {stats.returnWaitMs > 0 ? t("{ms} ms", { ms: Math.round(stats.returnWaitMs * 10) / 10 }) : "—"}
           </span>
         </>
       )}

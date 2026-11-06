@@ -18,8 +18,12 @@
 let canvas = null;
 let ctx = null;
 
+// Timed in two pieces so a slow number has a visible cause instead of one
+// lumped "encode" figure -- see jpegEncoder.ts for the main-thread half
+// (bitmap copy, and the wait after this worker already replied).
 self.onmessage = async (e) => {
-  const { id, bitmap, quality } = e.data;
+  const { id, bitmap, quality, sentAt } = e.data;
+  const workerStart = performance.now();
   try {
     if (!canvas || canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
       canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
@@ -29,7 +33,18 @@ self.onmessage = async (e) => {
     bitmap.close();
     const blob = await canvas.convertToBlob({ type: "image/jpeg", quality });
     const buf = await blob.arrayBuffer();
-    self.postMessage({ id, buf }, [buf]);
+    const workerDone = performance.now();
+    self.postMessage({
+      id,
+      buf,
+      // Time from the main thread handing this message off to this worker
+      // actually starting on it -- message-passing plus however long this
+      // thread had to wait its turn for a CPU core.
+      handoffMs: workerStart - sentAt,
+      // The real compression work, isolated from everything above and from
+      // whatever happens after postMessage below.
+      workerEncodeMs: workerDone - workerStart,
+    }, [buf]);
   } catch (err) {
     self.postMessage({ id, error: String(err) });
   }

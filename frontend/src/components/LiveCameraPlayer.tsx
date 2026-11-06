@@ -1093,6 +1093,18 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // with identical resize/grab numbers on both.
   const encodeMsRef = useRef(0);
   const [encodeMsShown, setEncodeMsShown] = useState(0);
+  // encodeMs above split into its four real pieces -- see jpegEncoder.ts's
+  // EncodeTiming. bitmapMs/returnWaitMs are main-thread cost; handoffMs is
+  // mostly message-passing; workerEncodeMs is the actual compression, the
+  // one number an isolated encode-only benchmark would measure.
+  const bitmapMsRef = useRef(0);
+  const [bitmapMsShown, setBitmapMsShown] = useState(0);
+  const handoffMsRef = useRef(0);
+  const [handoffMsShown, setHandoffMsShown] = useState(0);
+  const workerEncodeMsRef = useRef(0);
+  const [workerEncodeMsShown, setWorkerEncodeMsShown] = useState(0);
+  const returnWaitMsRef = useRef(0);
+  const [returnWaitMsShown, setReturnWaitMsShown] = useState(0);
   // Moves the encode above off the main thread, onto its own Worker -- see
   // jpegEncoder.ts for why (Chromium's idle-vs-forced toBlob scheduling was
   // measured causing 20ms-vs-200ms variance on the same frame, worse on a
@@ -1148,6 +1160,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       setResizeMsShown(resizeMsRef.current);
       setGrabMsShown(grabMsRef.current);
       setEncodeMsShown(encodeMsRef.current);
+      setBitmapMsShown(bitmapMsRef.current);
+      setHandoffMsShown(handoffMsRef.current);
+      setWorkerEncodeMsShown(workerEncodeMsRef.current);
+      setReturnWaitMsShown(returnWaitMsRef.current);
       setBytesSentShown(bytesSentRef.current);
       setRecvMsShown(recvMsRef.current);
       setQualityShown(qualityRef.current);
@@ -2656,16 +2672,32 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       let buf: ArrayBuffer;
       if (jpegEncoderRef.current?.ready) {
         try {
-          buf = await jpegEncoderRef.current.encode(cap, qualityRef.current);
+          const result = await jpegEncoderRef.current.encode(cap, qualityRef.current);
+          buf = result.buf;
+          bitmapMsRef.current = result.timing.bitmapMs;
+          handoffMsRef.current = result.timing.handoffMs;
+          workerEncodeMsRef.current = result.timing.workerEncodeMs;
+          returnWaitMsRef.current = result.timing.returnWaitMs;
         } catch {
           // Worker-side failure on this one frame -- fall back for just this
-          // frame rather than taking the whole encode path down with it.
+          // frame rather than taking the whole encode path down with it. No
+          // worker to report a breakdown, so only the total (below) is real.
+          const toBlobT0 = performance.now();
           const blob: Blob = await new Promise((res) => cap.toBlob((b) => res(b!), "image/jpeg", qualityRef.current));
           buf = await blob.arrayBuffer();
+          bitmapMsRef.current = 0;
+          handoffMsRef.current = 0;
+          workerEncodeMsRef.current = performance.now() - toBlobT0;
+          returnWaitMsRef.current = 0;
         }
       } else {
+        const toBlobT0 = performance.now();
         const blob: Blob = await new Promise((res) => cap.toBlob((b) => res(b!), "image/jpeg", qualityRef.current));
         buf = await blob.arrayBuffer();
+        bitmapMsRef.current = 0;
+        handoffMsRef.current = 0;
+        workerEncodeMsRef.current = performance.now() - toBlobT0;
+        returnWaitMsRef.current = 0;
       }
       encodeMsRef.current = performance.now() - encodeT0;
       // Wrapping an already-encoded buffer, not re-encoding -- cheap either
@@ -3244,6 +3276,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     resizeMs: resizeMsShown,
     grabMs: grabMsShown,
     encodeMs: encodeMsShown,
+    bitmapMs: bitmapMsShown,
+    handoffMs: handoffMsShown,
+    workerEncodeMs: workerEncodeMsShown,
+    returnWaitMs: returnWaitMsShown,
     bytesSent: bytesSentShown,
     recvMs: recvMsShown,
     quality: qualityShown,
