@@ -623,6 +623,24 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       const entry: Pending = { resolve, sentAt: performance.now(), done: false, bytes: buf.byteLength };
       pendingQueueRef.current.push(entry);
       ws.send(buf);
+      // bufferedAmount right after send() is the size of THIS frame (nothing
+      // has had a chance to drain yet) -- the question is how long it takes
+      // to get back to whatever it was before this send, i.e. how long the
+      // browser's own send pipeline took to actually push these bytes out,
+      // independent of anything the server sees. Capped: a send that never
+      // drains (socket stalled/closing) must not poll forever.
+      const drainT0 = performance.now();
+      const preExisting = Math.max(0, ws.bufferedAmount - buf.byteLength);
+      let polls = 0;
+      const pollDrain = () => {
+        polls += 1;
+        if (ws.bufferedAmount <= preExisting || polls > 200) {
+          sendDrainMsRef.current = performance.now() - drainT0;
+          return;
+        }
+        setTimeout(pollDrain, 2);
+      };
+      pollDrain();
       sentCountRef.current += 1;
       setStats((st) => ({ ...st, sent: st.sent + 1 }));
       setTimeout(() => {
@@ -1125,6 +1143,45 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   const [bytesSentShown, setBytesSentShown] = useState(0);
   const recvMsRef = useRef(0);
   const [recvMsShown, setRecvMsShown] = useState(0);
+  // Answers a question recv_ms alone cannot: when the server sees a slow
+  // arrival, is that genuinely the network, or is the CLIENT too busy to
+  // have actually pushed the bytes out yet? ws.send() handing data to the
+  // browser is not the same moment as the browser actually putting it on
+  // the wire -- bufferedAmount is the standard, real way to see the gap:
+  // non-zero means bytes are still queued client-side, waiting their turn.
+  // Polled rather than event-based because the WebSocket API has no event
+  // for "buffer drained" -- this is the only way to observe it.
+  const sendDrainMsRef = useRef(0);
+  const [sendDrainMsShown, setSendDrainMsShown] = useState(0);
+  // Standard browser signal for "something blocked the main thread" --
+  // PerformanceObserver's "longtask" entries fire for any task over 50ms,
+  // emitted by the browser itself with no polling or profiling session
+  // needed. This is what actually answers "is the CPU the reason quality
+  // dropped" in real time, for every real session, not just ones someone
+  // happens to be watching with DevTools open (which has its own overhead,
+  // so a recorded profile is never quite the undisturbed number either).
+  const longTaskCountRef = useRef(0);
+  const longTaskMsRef = useRef(0);
+  const [longTaskCountShown, setLongTaskCountShown] = useState(0);
+  const [longTaskMsShown, setLongTaskMsShown] = useState(0);
+  useEffect(() => {
+    if (typeof PerformanceObserver === "undefined") return;
+    let obs: PerformanceObserver;
+    try {
+      obs = new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) {
+          longTaskCountRef.current += 1;
+          longTaskMsRef.current = entry.duration;
+        }
+      });
+      obs.observe({ type: "longtask", buffered: true });
+    } catch {
+      // "longtask" isn't supported in every browser -- the HUD fields just
+      // stay at zero rather than breaking the session over it.
+      return;
+    }
+    return () => obs.disconnect();
+  }, []);
 
   // Operator-set floor (persisted — same remember-the-choice convention as
   // STRIP_POS_KEY/HUD_KEY above). The ref is what the hot loop reads;
@@ -1166,6 +1223,9 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       setReturnWaitMsShown(returnWaitMsRef.current);
       setBytesSentShown(bytesSentRef.current);
       setRecvMsShown(recvMsRef.current);
+      setSendDrainMsShown(sendDrainMsRef.current);
+      setLongTaskCountShown(longTaskCountRef.current);
+      setLongTaskMsShown(longTaskMsRef.current);
       setQualityShown(qualityRef.current);
     }, 500);
     return () => clearInterval(id);
@@ -3282,6 +3342,9 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     returnWaitMs: returnWaitMsShown,
     bytesSent: bytesSentShown,
     recvMs: recvMsShown,
+    sendDrainMs: sendDrainMsShown,
+    longTaskCount: longTaskCountShown,
+    longTaskMs: longTaskMsShown,
     quality: qualityShown,
     targetFps,
   };
@@ -3536,6 +3599,9 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
                 {t("Red is dropped before inference — {pct}% of the frame", { pct: Math.round(fovTrim * 100) })}
               </p>
             </div>
+          )}
+          {liveFs.active && hudOn && (
+            <LatencyHud stats={hudStats} compact className="absolute top-3 start-3 z-40" />
           )}
           {liveFs.active && (
             <button onClick={liveFs.toggle} className={fsExitBtnClass}>

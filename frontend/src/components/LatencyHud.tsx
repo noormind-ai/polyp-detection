@@ -69,6 +69,23 @@ export interface LatencyStats {
    *  frame's bytes -- unlike `net` (rtt minus modal_ms, a leftover by
    *  subtraction), this is a real measurement of one specific thing. */
   recvMs?: number | null;
+  /** How long after ws.send() the browser's own outgoing buffer actually
+   *  drained (WebSocket.bufferedAmount polled back to its pre-send level).
+   *  Separates two things recvMs alone cannot: a slow arrival the SERVER
+   *  reports could be a genuinely slow network, or it could be that this
+   *  tab was too CPU-busy to have finished pushing the bytes out yet. A
+   *  high sendDrainMs here, especially correlated with recvMs, points at
+   *  the second case -- quality dropping for a reason that lowering quality
+   *  cannot fix. */
+  sendDrainMs?: number | null;
+  /** Count and most recent duration of browser "longtask" events (main
+   *  thread blocked 50ms+) since this session started. A standard signal,
+   *  not app-specific -- fires for ANY cause, including ones outside this
+   *  code (a browser extension's own listener, for example). Zero means
+   *  the main thread genuinely has not been the problem, which is itself
+   *  useful: it rules out a whole category instead of leaving it unknown. */
+  longTaskCount?: number | null;
+  longTaskMs?: number | null;
   /** Current AIMD-adjusted JPEG quality (0-1). Shown so a lower number has
    *  a visible reason instead of looking like an unexplained quality drop. */
   quality?: number | null;
@@ -243,6 +260,14 @@ export default function LatencyHud({
           </span>
         </>
       )}
+      {stats.sendDrainMs != null && (
+        <>
+          <span className="text-gray-500 pl-3">{t("   · client send-buffer drain")}</span>
+          <span className="text-gray-400">
+            {stats.sendDrainMs > 0 ? t("{ms} ms", { ms: Math.round(stats.sendDrainMs * 10) / 10 }) : "—"}
+          </span>
+        </>
+      )}
       {stats.bytesSent != null && (
         <>
           <span className="text-gray-500">{t("Sent frame size")}</span>
@@ -271,6 +296,22 @@ export default function LatencyHud({
         <span className="col-span-2 text-[11px] text-amber-400">
           {t("Running below the {fps} fps target even at this quality — the uplink can't keep up, not a bug.", { fps: stats.targetFps })}
         </span>
+      )}
+      {/* "Uplink can't keep up" above is the AIMD's own explanation, and it
+          only ever looks at recv_ms -- it has no way to know whether the
+          main thread, not the network, is the real reason. This is that
+          second, independent check: longtask is a browser-level signal, not
+          something this app computed, so if it is non-zero while quality is
+          dropping, that is direct evidence against "it's the network". */}
+      {stats.longTaskCount != null && (
+        <>
+          <span className="text-gray-500">{t("Main thread blocked")}</span>
+          <span className={stats.longTaskCount > 0 ? "text-amber-400" : "text-gray-400"}>
+            {stats.longTaskCount > 0
+              ? t("{n}x, longest {ms} ms", { n: stats.longTaskCount, ms: Math.round(stats.longTaskMs ?? 0) })
+              : t("never (this session)")}
+          </span>
+        </>
       )}
       {stats.uplinkMbps != null && <>
         <span className="text-gray-500">{t("Uplink (measured)")}</span>
