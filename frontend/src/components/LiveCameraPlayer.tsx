@@ -1634,10 +1634,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       }
       if (canvas && vw && vh) {
         try {
-          // Whole frame, not sourceRect: the panel's crop is applied in CSS
-          // (liveStyle) exactly as it was for the <video>, so the canvas must
-          // carry the same full-frame geometry for that crop to still line up.
-          // Even dimensions keep field parity stable -- see evenScanlines.
+          // Whole frame, not sourceRect: the Live panel always shows the full
+          // frame now (no crop applied to its own display), so the canvas
+          // must carry the same full-frame geometry as the <video> it stands
+          // in for. Even dimensions keep field parity stable -- see evenScanlines.
           const w = vw & ~1, h = vh & ~1;
           if (canvas.width !== w) canvas.width = w;
           if (canvas.height !== h) canvas.height = h;
@@ -3507,35 +3507,24 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     fovApplied && manualCrop ? intersectRect(manualCrop, fovNorm!)
     : fovApplied ? fovNorm
     : manualCrop;
-  // While the overlay is up the whole frame is shown instead, because the point
-  // of the overlay is to see the part that normally gets dropped.
+  // Live shows the FULL, uncropped frame, always -- no oversize-and-clip CSS
+  // trick (liveStyle used to blow the element up and offset it so an
+  // overflow:hidden wrapper simulated a crop). That technique needed several
+  // numbers to agree exactly (the box's assigned aspect ratio, the oversize
+  // percentage, the offset, and the element's own native ratio) and kept
+  // breaking in ways a real pixel crop (what the Detected panel does, and
+  // what sourceRect()/analyzedCrop still describe for the model) never could.
+  // analyzedCrop/manualCrop/fovNorm above are unaffected -- "Select capture
+  // region" and the model still use exactly what they always did; only the
+  // Live panel's own display stopped pretending to show that same region.
   //
-  // Deliberately just analyzedCrop, nothing extra: an earlier version also
-  // force-trimmed a hardcoded bottom band here as a guaranteed fallback for
-  // this deployment's capture card, before manual crop was available for
-  // camera mode. That meant the Live panel, the operator's own drawn region,
-  // and what the server actually analyzed could all show a different crop —
-  // three sources of truth instead of one. Now that "Select capture region"
-  // (manualCrop, above) covers this case directly and visibly, the Live
-  // panel shows exactly analyzedCrop, the same composition sourceRect() uses
-  // for what gets sent to the model. One crop, everywhere.
-  const liveCrop = showFovOverlay ? null : analyzedCrop;
-  // The panel has to carry the native ratio in overlay mode, otherwise
-  // object-contain letterboxes the video inside it and the overlay percentages
-  // no longer line up with the picture they are describing.
   // SD pixels are not square: 720x480 is a 4:3 picture stored in a 3:2 grid,
   // so an uncorrected panel shows everything slightly too wide. Geometry
-  // only -- no resample, nothing re-encoded.
+  // only -- no resample, nothing re-encoded. liveFrameSize (live, not the
+  // one-time fovFrame) keeps the box's shape matching the actual current
+  // frame even if the source renegotiates resolution mid-session.
   const liveAspect = aspect43 ? "4/3"
-    : showFovOverlay && fovFrame ? `${fovFrame.w}/${fovFrame.h}` : aspect;
-  const liveStyle = liveCrop
-    ? {
-        width: `${100 / liveCrop.w}%`,
-        height: `${100 / liveCrop.h}%`,
-        left: `${(-liveCrop.x * 100) / liveCrop.w}%`,
-        top: `${(-liveCrop.y * 100) / liveCrop.h}%`,
-      }
-    : undefined;
+    : liveFrameSize ? `${liveFrameSize.w}/${liveFrameSize.h}` : aspect;
   const toggleBtn = "text-xs px-2 py-0.5 rounded-md border border-gray-800 text-gray-500 hover:text-gray-300 hover:border-gray-600 transition-colors flex-shrink-0";
   const transportBtn = "px-2.5 py-1 rounded-md bg-gray-800 hover:bg-gray-700 text-gray-300 font-mono transition-colors";
 
@@ -3651,35 +3640,34 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
             onPause={() => setPaused(true)}
             onLoadedMetadata={handleLoadedMetadata}
             onDurationChange={handleLoadedMetadata}
-            className={liveStyle ? "absolute object-contain" : "absolute inset-0 w-full h-full object-contain"}
+            className="absolute inset-0 w-full h-full object-contain"
             // Hidden, not removed: opacity only. display:none or visibility
             // would stop the element producing frames, and the capture loop
             // reads from it. Revealed again if the canvas path ever fails.
-            style={{ ...(liveStyle ?? {}), opacity: (liveCanvasOk && canvasNeeded) ? 0 : 1 }}
+            style={{ opacity: (liveCanvasOk && canvasNeeded) ? 0 : 1 }}
           />
           {/* The Live picture the operator actually sees: the same frames,
-              deinterlaced. Same classes and same CSS crop as the <video> above,
-              so the panel composition is unchanged. Hidden (not unmounted) when
-              nothing needs processing -- the <video> above shows instead, at
-              zero per-frame cost instead of a plain copy-draw every frame. */}
+              deinterlaced. Same classes as the <video> above, so the panel
+              composition is unchanged. Hidden (not unmounted) when nothing
+              needs processing -- the <video> above shows instead, at zero
+              per-frame cost instead of a plain copy-draw every frame. */}
           {liveCanvasOk && (
             <canvas
               ref={liveCanvasRef}
-              className={liveStyle ? "absolute object-contain" : "absolute inset-0 w-full h-full object-contain"}
-              style={{ ...(liveStyle ?? {}), opacity: (canvasNeeded && !enhanceOn) ? 1 : 0 }}
+              className="absolute inset-0 w-full h-full object-contain"
+              style={{ opacity: (canvasNeeded && !enhanceOn) ? 1 : 0 }}
             />
           )}
           {/* Always mounted so the WebGL context survives the sliders going
               to zero and back; only its visibility follows them. */}
           <canvas
             ref={enhanceCanvasRef}
-            className={liveStyle ? "absolute object-contain" : "absolute inset-0 w-full h-full object-contain"}
-            style={{ ...(liveStyle ?? {}), opacity: enhanceOn ? 1 : 0 }}
+            className="absolute inset-0 w-full h-full object-contain"
+            style={{ opacity: enhanceOn ? 1 : 0 }}
           />
-          {/* What the crop discards. The panel is showing the whole
-              frame right now (liveCrop is forced to null above), so the
-              kept region is outlined and everything outside it is
-              washed red by an outsized ring shadow the panel clips. */}
+          {/* What the crop discards. The panel always shows the whole frame
+              now, so the kept region is outlined and everything outside it
+              is washed red by an outsized ring shadow the panel clips. */}
           {showFovOverlay && fovNorm && (
             <div className="absolute inset-0 pointer-events-none">
               <div
