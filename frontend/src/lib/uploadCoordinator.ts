@@ -47,6 +47,38 @@ export function isLiveInferenceActive(): boolean {
   return liveCount > 0;
 }
 
+// KNOWN GAP (2026-11-07, not yet fixed -- see useSessionRecorder.ts pause()
+// and LiveCameraPlayer.tsx's applyAutoRecord for the two callers involved):
+//
+// Observed in practice: procedure 1 ends and finalize() is draining its
+// backlog in the background. Procedure 2 starts in the same tab -- correctly
+// blocks procedure 1's backlog (liveCount > 0), per design. But then
+// procedure 2 itself goes out of body for a SHORT stretch (under its own
+// getOutOfBodyStopMs() threshold): no frames are sent during that stretch
+// (the in-body gate drops them before they'd ever reach a websocket), so the
+// link is genuinely idle right then -- yet procedure 1's backlog still does
+// NOT resume, because procedure 2's own liveInferenceReleaseRef hold is
+// deliberately NOT released until its full (user-tunable) threshold passes.
+// That threshold is calibrated for "is this a new patient yet", which is the
+// right question for procedure 2's OWN pause/stop/finalize decision -- but
+// it is the WRONG question for "can some other already-queued recording use
+// this instant", which should be near-immediate, not patient-threshold-slow.
+//
+// This file conflates those two questions into one signal (liveCount). A
+// real fix needs two separate things, not a tweak to this one:
+//   1. A fast, non-debounced "are frames actually being sent RIGHT NOW"
+//      signal (toggles the moment a send loop starts/stops, no grace period)
+//      that gates whether ANY pending recording's backlog may send a chunk
+//      this instant -- independent of any patient-boundary decision.
+//   2. An actual queue/ordering among multiple pending backlogs. Today, if
+//      N recordings are all blocked on waitForZero() and the gate opens, ALL
+//      of their waiters resolve at once (see the `pending.forEach` below) and
+//      they race their next PUT concurrently -- fine at N=1, untested and
+//      uncoordinated at N>1 (procedure 1's tail end overlapping an orphan
+//      recovery upload, say).
+// Until this is split, a short out-of-body dip mid-procedure will keep
+// starving any older backlog even though nothing is actually being sent.
+
 function waitForZero(): Promise<void> {
   if (liveCount === 0) return Promise.resolve();
   return new Promise((resolve) => waiters.add(resolve));
