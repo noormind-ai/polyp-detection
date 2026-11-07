@@ -750,7 +750,12 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // state above.
   const confMinRef = useRef(initialConf);
   const [showDetected, setShowDetected]   = useState(true);
-  const [showLive, setShowLive]           = useState(true);
+  // Default off: the live preview's GPU/CPU cost measurably slows JPEG encode
+  // and FPS on weak hardware (Intel N100 clinic PC) -- see decisions.md and
+  // documents/live-preview-gpu-contention.md. Root cause not yet fixed, so
+  // defaulting off avoids the cost for anyone who doesn't need the preview;
+  // still one click to turn back on.
+  const [showLive, setShowLive]           = useState(false);
   const msHistory = useRef<number[]>([]);
   // Client-side round trip, so the panel can split what the server spent from
   // what the wire cost. The send timestamp lives on each queue entry rather

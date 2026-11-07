@@ -37,6 +37,20 @@ detected frame immediately with no bar, plus the clearest frame of the window as
 before -- labelled `first`/`best` in a new manifest column
 (documents/adr/0005-detection-gates-off-by-default.md).
 
+## Live preview panel defaults off (GPU contention, root cause open)
+
+In the context of live polyp detection on noormind-iran, facing JPEG encode
+measured at 100-170ms on the clinic PC's weak integrated GPU (Intel N100)
+during live use against 17-22ms for the same operation in isolation, with the
+live preview panel being the single most effective lever found to restore
+fast encode and better FPS, we decided to default the live preview panel off
+(`showLive` starts `false`) to achieve zero preview-related cost for the
+common case while the GPU-contention root cause is still being investigated,
+accepting that operators who want the preview must opt in every session (not
+persisted), and that this is a mitigation, not a fix — the open question of
+why encode can still be slow even with the preview off is unresolved
+(documents/adr/0010-live-preview-gpu-contention.md).
+
 ## Agent code map generator
 
 In the context of giving an AI assistant a fast, accurate way to find routes
