@@ -1327,6 +1327,16 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // Native frame size the rect was measured against — needed to express it as a
   // fraction for the overlay, and not the same as the analyzed `aspect`.
   const [fovFrame, setFovFrame] = useState<{ w: number; h: number } | null>(null);
+  // Current source resolution, re-read every loop iteration -- unlike
+  // fovFrame above, which freezes once FOV sampling finishes. manualCrop's
+  // validity check (cropValidFor's fw/fh comparison) needs a LIVE reading:
+  // sourceRect() -- what the Detected panel and the model actually use --
+  // already reads video.videoWidth/videoHeight fresh every frame. Before this,
+  // the Live panel's manualCrop compared against frozen fovFrame instead, so
+  // if the source renegotiated to a different resolution mid-session, Live
+  // could keep applying an old crop fraction to a new, differently-sized
+  // frame -- wrong and inconsistent -- while Detected stayed correct.
+  const [liveFrameSize, setLiveFrameSize] = useState<{ w: number; h: number } | null>(null);
   // On by default, but the operator can turn it off — a processor we have not
   // seen could confuse the detector, and being able to switch it off in the
   // room beats having to redeploy.
@@ -2706,6 +2716,9 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       // Both of the draws below ask whether this source is interlaced, so the
       // answer has to be as up to date as it can be before either runs.
       sampleInterlace(video);
+      // Live, not just at FOV-sample time -- see liveFrameSize above.
+      setLiveFrameSize((prev) => (prev && prev.w === video.videoWidth && prev.h === video.videoHeight
+        ? prev : { w: video.videoWidth, h: video.videoHeight }));
 
       const { x: srcX, y: srcY, w: srcW, h: srcH } = sourceRect(video);
       // Size the panels to the region actually being analyzed, so the two live
@@ -3472,7 +3485,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // Only the crop drawn for the mode actually running right now -- see the
   // cropRect declaration for why a stale rect from a different mode must
   // never leak in just because it's the last thing stored.
-  const manualCrop = cropValidFor(cropRect, captureMode, fovFrame?.w ?? 0, fovFrame?.h ?? 0);
+  const manualCrop = cropValidFor(cropRect, captureMode, liveFrameSize?.w ?? 0, liveFrameSize?.h ?? 0);
   // Same composition the capture loop does, in normalized space, so the Live
   // panel frames exactly the region the model is being given.
   const analyzedCrop =
