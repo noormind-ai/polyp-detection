@@ -1249,6 +1249,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   const enhanceOn = denoise > 0 || sharpen > 0;
   const enhanceOnRef = useRef(false);
   useEffect(() => { enhanceOnRef.current = enhanceOn; }, [enhanceOn]);
+  // Mirrors the `needed` check in the paint loop above (imperative, reads
+  // refs) so the <video>/<canvas> opacity swap in the JSX below agrees with
+  // what the loop actually drew -- state, not refs, because this drives render.
+  const canvasNeeded = (interlacedDetected === true && deintMode !== "weave") || enhanceOn;
 
   // Proc-amp: the card's OWN controls, when its driver exposes them through
   // the browser. Not a filter -- applyConstraints retunes the analog front
@@ -1566,6 +1570,19 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       if (cancelled) return;
       const canvas = liveCanvasRef.current;
       const vw = video.videoWidth, vh = video.videoHeight;
+      // Nothing to do: progressive source (or deinterlace off) and no
+      // enhancement active -- the canvas would just be an expensive copy of
+      // the <video> element, measured at 50-75ms/frame on the clinic PC's
+      // weak GPU. Skip the draw and let the browser show <video> directly
+      // (see the opacity swap below); re-checked every frame since either
+      // condition can flip at runtime without this effect re-mounting.
+      const needed = (interlacedRef.current === true && deintModeRef.current !== "weave")
+        || enhanceOnRef.current;
+      if (!needed) {
+        deintMsRef.current = 0;
+        handle = anyVid.requestVideoFrameCallback!(paint);
+        return;
+      }
       if (canvas && vw && vh) {
         try {
           // Whole frame, not sourceRect: the panel's crop is applied in CSS
@@ -3582,16 +3599,18 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
             // Hidden, not removed: opacity only. display:none or visibility
             // would stop the element producing frames, and the capture loop
             // reads from it. Revealed again if the canvas path ever fails.
-            style={{ ...(liveStyle ?? {}), opacity: liveCanvasOk ? 0 : 1 }}
+            style={{ ...(liveStyle ?? {}), opacity: (liveCanvasOk && canvasNeeded) ? 0 : 1 }}
           />
           {/* The Live picture the operator actually sees: the same frames,
               deinterlaced. Same classes and same CSS crop as the <video> above,
-              so the panel composition is unchanged. */}
+              so the panel composition is unchanged. Hidden (not unmounted) when
+              nothing needs processing -- the <video> above shows instead, at
+              zero per-frame cost instead of a plain copy-draw every frame. */}
           {liveCanvasOk && (
             <canvas
               ref={liveCanvasRef}
               className={liveStyle ? "absolute object-contain" : "absolute inset-0 w-full h-full object-contain"}
-              style={{ ...(liveStyle ?? {}), opacity: enhanceOn ? 0 : 1 }}
+              style={{ ...(liveStyle ?? {}), opacity: (canvasNeeded && !enhanceOn) ? 1 : 0 }}
             />
           )}
           {/* Always mounted so the WebGL context survives the sliders going
