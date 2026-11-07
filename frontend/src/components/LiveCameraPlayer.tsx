@@ -16,7 +16,7 @@ import QualityGateNotice from "./QualityGateNotice";
 import FilterBankNotice, { type GateState } from "./FilterBankNotice";
 import { useTemporalGate } from "@/lib/useTemporalGate";
 import TemporalGateNotice from "./TemporalGateNotice";
-import { useSessionRecorder } from "@/lib/useSessionRecorder";
+import { useSessionRecorder, getOutOfBodyStopMs } from "@/lib/useSessionRecorder";
 import { useAuth } from "@/lib/auth";
 import { beginLiveInference } from "@/lib/uploadCoordinator";
 import { detectFovRect, unionRect, intersectRect, trimmedFraction, NEGLIGIBLE_TRIM, type Rect } from "@/lib/fov";
@@ -131,7 +131,12 @@ const KIOSK_MAX_RECOVERIES = 3;
 // procedure actually ending (finalize + upload) rather than a brief
 // withdrawal (pause, ready to resume the same recording). Past the threshold
 // the recording is finalized and the next re-entry opens a NEW one, so this
-// is what decides whether one procedure is one video or several.
+// is what decides whether one procedure is one video or several. The SAME
+// number also gates when uploadCoordinator.ts's bandwidth hold releases (see
+// applyAutoRecord below) -- one user-tunable value for both, read fresh via
+// getOutOfBodyStopMs() (useSessionRecorder.ts) rather than a hardcoded
+// constant, so there is exactly one "is this a new patient yet" clock, not
+// two that can disagree.
 //
 // Was 5s, on the reasoning that anything shorter is "just a brief withdrawal"
 // and anything longer is probably the next patient. The clinic sessions of
@@ -142,9 +147,9 @@ const KIOSK_MAX_RECOVERIES = 3;
 // bouncing in and out rather than the scope leaving: one held 0.3s of video
 // inside 5.5s of wall clock, i.e. it was called out-of-body for most of its
 // life. Either way a 5s fuse fires mid-procedure, cutting footage.
-// 1 minute out is the user's call and is still well short of the gap between
-// two patients (minutes), which is the case this threshold exists to separate.
-const OUT_OF_BODY_STOP_MS = 60_000;
+// 1 minute out was the user's original call, now the default rather than a
+// fixed value -- still well short of the gap between two patients (minutes),
+// which is the case this threshold exists to separate.
 // Same ladder RealtimePlayer offers, so the two players behave alike. Only
 // meaningful for a file-backed source; a camera runs at whatever rate it runs.
 const SPEEDS = [0.1, 0.25, 0.5, 0.7, 1, 1.5, 2];
@@ -270,7 +275,7 @@ const DEMO_PREFIX = "demo:";
 const REC_PREFIX = "rec:";
 // Smallest saved recording the picker offers. The list had grown to 45 entries,
 // most of them seconds long -- wreckage from when a brief withdrawal from the
-// body finalized the recording and started a new one (see OUT_OF_BODY_STOP_MS),
+// body finalized the recording and started a new one (see getOutOfBodyStopMs),
 // plus four with a duration but zero bytes, which 404 on play. Replaying any of
 // them is pointless, and they buried the handful of real procedures.
 //
@@ -879,7 +884,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   const [recordOverride, setRecordOverrideState] = useState<"auto" | "on" | "off">("auto");
   const lastInsideRef = useRef<boolean | null>(null);
   // When the current out-of-body stretch started (null while inside), and
-  // whether it's already been auto-stopped -- see OUT_OF_BODY_STOP_MS above.
+  // whether it's already been auto-stopped -- see applyAutoRecord below.
   const outsideStartRef = useRef<number | null>(null);
   const autoStoppedRef = useRef(false);
   // Bandwidth-arbitration hold for this session's own frame-sending activity
@@ -921,6 +926,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // (the normal case: insertion happens before Start is ever clicked) would
   // otherwise never record anything until someone remembers to press Record.
   function applyAutoRecord(insideNow: boolean) {
+    // Read once per call (not twice below) so the gate-release check and the
+    // auto-stop check always agree on the same threshold within one frame,
+    // even if the user moves the slider mid-procedure.
+    const oobStopMs = getOutOfBodyStopMs();
     // Bandwidth-arbitration signal: tracks whether THIS session is actually
     // sending frames right now, not just "a live session is open" -- runs
     // unconditionally, even if autoRecordEnabled is off, because it answers
@@ -931,10 +940,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     // previous patient) use that window instead of purely waiting for Stop.
     // See uploadCoordinator.ts.
     //
-    // Released only after OUT_OF_BODY_STOP_MS of CONTINUOUS out-of-body --
-    // the same grace period the video auto-stop below uses -- not on the
-    // first out-of-body frame. A one-frame release used to be enough to open
-    // the gate to a multi-hundred-KB recording upload mid-procedure (measured
+    // Released only after oobStopMs of CONTINUOUS out-of-body -- the same
+    // grace period the video auto-stop below uses -- not on the first
+    // out-of-body frame. A one-frame release used to be enough to open the
+    // gate to a multi-hundred-KB recording upload mid-procedure (measured
     // on clinic logs: 471 of 1,094 chunk uploads started while frames were
     // still flowing, each one measurably slowing every frame sent while it
     // was in flight).
@@ -946,7 +955,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     } else if (liveInferenceReleaseRef.current) {
       if (gateOutsideSinceRef.current === null) {
         gateOutsideSinceRef.current = Date.now();
-      } else if (Date.now() - gateOutsideSinceRef.current >= OUT_OF_BODY_STOP_MS) {
+      } else if (Date.now() - gateOutsideSinceRef.current >= oobStopMs) {
         liveInferenceReleaseRef.current();
         liveInferenceReleaseRef.current = null;
         gateOutsideSinceRef.current = null;
@@ -978,7 +987,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     // fresh one auto-starts the instant the scope goes back in, via the
     // ordinary `want` branch below -- no separate code path needed for that.
     if (!want && !autoStoppedRef.current && outsideStartRef.current !== null
-        && Date.now() - outsideStartRef.current >= OUT_OF_BODY_STOP_MS) {
+        && Date.now() - outsideStartRef.current >= oobStopMs) {
       autoStoppedRef.current = true;
       recorderRef.current.stop("out-of-body");
       // Same moment, one level up: this patient is over, so the next captures
@@ -997,7 +1006,12 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       if (authUserRef.current) void recorderRef.current.start();
       recorderRef.current.resume();
     } else {
-      recorderRef.current.pause();
+      // No trickle here: an upload attempt fired on every out-of-body frame
+      // sat blocked behind the exact same oobStopMs threshold anyway (see
+      // the gate-release block above), so it was a no-op "waitingForLink"
+      // flicker on every brief withdrawal, never an actual head start.
+      // Uploading now starts cleanly, once, at the auto-stop branch above.
+      recorderRef.current.pause({ trickle: false });
     }
   }
 
@@ -3628,6 +3642,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
             ref={videoRef}
             muted
             playsInline
+            disablePictureInPicture
             loop={captureMode === "demo" || captureMode === "recording"}
             onTimeUpdate={handleTimeUpdate}
             onSeeked={handleSeeked}
