@@ -19,6 +19,8 @@ import { useAuth } from "@/lib/auth";
 import {
   SessionRecorder, getRecordingBps, setRecordingBps, mbPerMinute,
   MIN_RECORDING_BPS, MAX_RECORDING_BPS,
+  getOutOfBodyStopMs, setOutOfBodyStopMs,
+  MIN_OUT_OF_BODY_STOP_MS, MAX_OUT_OF_BODY_STOP_MS,
 } from "@/lib/useSessionRecorder";
 
 /** mm:ss, or h:mm:ss once a procedure runs past the hour. */
@@ -62,6 +64,8 @@ export default function RecordingControls({
   // first render would make the server HTML and the client disagree.
   const [bps, setBpsState] = useState(8_000_000);
   useEffect(() => { setBpsState(getRecordingBps()); }, []);
+  const [oobStopMs, setOobStopMsState] = useState(60_000);
+  useEffect(() => { setOobStopMsState(getOutOfBodyStopMs()); }, []);
 
   // Nothing at all until auth has answered — flashing "sign in to record" at
   // someone who IS signed in is worse than a moment of empty space.
@@ -196,6 +200,40 @@ export default function RecordingControls({
           {recording
             ? t("Quality changes take effect when the next recording starts.")
             : t("1.2 = the old setting · 8 = the clinic's own still-image quality · above 12 mostly stores noise.")}
+        </p>
+      </div>
+
+      {/* How long the scope has to stay out of the body before auto-record
+          treats it as the patient being done -- stops the recording, releases
+          the upload, and the next re-entry starts a fresh one. Shorter means
+          a short break (repositioning, between-step pause) is more likely to
+          get cut into its own short clip; longer means waiting longer before
+          the finished video starts uploading. Takes effect on the very next
+          check, no restart needed. */}
+      <div className="px-1 space-y-1">
+        <div className="flex items-center justify-between text-[11px]">
+          <span className="text-gray-500">{t("Out-of-body wait before treating it as a new patient")}</span>
+          <span className="font-mono text-gray-300">
+            {oobStopMs >= 60_000
+              ? t("{min} min", { min: (oobStopMs / 60_000).toFixed(oobStopMs % 60_000 === 0 ? 0 : 1) })
+              : t("{s}s", { s: Math.round(oobStopMs / 1000) })}
+          </span>
+        </div>
+        <input
+          type="range"
+          min={MIN_OUT_OF_BODY_STOP_MS}
+          max={MAX_OUT_OF_BODY_STOP_MS}
+          step={5_000}
+          value={oobStopMs}
+          onChange={(e) => {
+            const v = Number(e.target.value);
+            setOobStopMsState(v);
+            setOutOfBodyStopMs(v);
+          }}
+          className="w-full accent-blue-500 cursor-pointer"
+        />
+        <p className="text-[11px] text-gray-600">
+          {t("Nothing uploads during a short out-of-body gap -- the recording just waits. Past this many seconds, it stops, uploads, and the next re-entry starts a new recording.")}
         </p>
       </div>
 

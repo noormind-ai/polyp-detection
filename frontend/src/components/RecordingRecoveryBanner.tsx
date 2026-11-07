@@ -9,17 +9,20 @@
  * recordings nobody finished uploading, cross-checks each against the
  * server (a recording the server already has marked complete/truncated needs
  * no recovery -- its local copy is just leftover from a normal session that
- * hasn't been cleared yet), and offers the two safe actions: save it to disk,
- * or discard it. It deliberately does not offer to resume the upload
- * automatically -- that would need to replicate useSessionRecorder's own
- * retry/abort bookkeeping outside of a live hook instance, for a case (a
- * browser that crashed and was reopened) rare enough not to be worth it yet.
+ * hasn't been cleared yet), and offers three actions: save it to disk,
+ * finish uploading it, or discard it.
+ *
+ * Still never resumed automatically on mount -- only an explicit click
+ * drives drainOrphanToServer() (recordingUpload.ts). That keeps a browser
+ * that was reopened from silently spending someone's bandwidth the moment
+ * the page loads; the operator decides when.
  */
 
 import { useEffect, useState } from "react";
 import { useLanguage } from "@/lib/i18n";
 import { useAuth } from "@/lib/auth";
 import { listOrphanedRecordings, readOrphanBlobs, forgetRecording, type OrphanedRecording } from "@/lib/chunkStore";
+import { drainOrphanToServer, type DrainProgress } from "@/lib/recordingUpload";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "";
 
@@ -32,6 +35,8 @@ export default function RecordingRecoveryBanner() {
   const { user } = useAuth();
   const [items, setItems] = useState<Recoverable[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
+  const [progress, setProgress] = useState<DrainProgress | null>(null);
+  const [uploadError, setUploadError] = useState<{ recordingId: string; message: string } | null>(null);
 
   useEffect(() => {
     if (!user) return;
@@ -90,6 +95,23 @@ export default function RecordingRecoveryBanner() {
     }
   }
 
+  async function upload(item: Recoverable) {
+    setBusy(item.recordingId);
+    setUploadError(null);
+    setProgress(null);
+    try {
+      await drainOrphanToServer(item.caseId, item.recordingId, setProgress);
+      setItems((cur) => cur.filter((i) => i.recordingId !== item.recordingId));
+    } catch (err) {
+      // Left in the list on failure (same as not having clicked it) -- the
+      // chunks are still sitting in local storage, nothing lost, retryable.
+      setUploadError({ recordingId: item.recordingId, message: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setBusy(null);
+      setProgress(null);
+    }
+  }
+
   async function discard(item: Recoverable) {
     setBusy(item.recordingId);
     try {
@@ -106,26 +128,40 @@ export default function RecordingRecoveryBanner() {
         {t("⚠ Found {count} unfinished recording(s) from a previous session that never finished uploading.", { count: items.length })}
       </p>
       {items.map((item) => (
-        <div key={item.recordingId} className="flex items-center justify-between gap-2">
-          <span className="font-mono text-amber-300/80">
-            {item.caseId} / {item.recordingId} ({(item.bytes / (1024 * 1024)).toFixed(1)} MB)
-          </span>
-          <div className="flex gap-1.5">
-            <button
-              type="button" disabled={busy === item.recordingId}
-              onClick={() => void download(item)}
-              className="rounded-lg border border-amber-600/60 px-2 py-1 hover:bg-amber-800/30 disabled:opacity-40"
-            >
-              {t("⬇ Save to computer")}
-            </button>
-            <button
-              type="button" disabled={busy === item.recordingId}
-              onClick={() => void discard(item)}
-              className="rounded-lg border border-gray-700 px-2 py-1 text-gray-400 hover:text-white disabled:opacity-40"
-            >
-              {t("Discard")}
-            </button>
+        <div key={item.recordingId} className="space-y-1">
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-mono text-amber-300/80">
+              {item.caseId} / {item.recordingId} ({(item.bytes / (1024 * 1024)).toFixed(1)} MB)
+            </span>
+            <div className="flex gap-1.5">
+              <button
+                type="button" disabled={busy === item.recordingId}
+                onClick={() => void upload(item)}
+                className="rounded-lg border border-emerald-600/60 px-2 py-1 hover:bg-emerald-800/30 disabled:opacity-40"
+              >
+                {busy === item.recordingId && progress
+                  ? t("Uploading {done}/{total}…", { done: progress.uploadedChunks, total: progress.totalChunks })
+                  : t("⬆ Upload to server")}
+              </button>
+              <button
+                type="button" disabled={busy === item.recordingId}
+                onClick={() => void download(item)}
+                className="rounded-lg border border-amber-600/60 px-2 py-1 hover:bg-amber-800/30 disabled:opacity-40"
+              >
+                {t("⬇ Save to computer")}
+              </button>
+              <button
+                type="button" disabled={busy === item.recordingId}
+                onClick={() => void discard(item)}
+                className="rounded-lg border border-gray-700 px-2 py-1 text-gray-400 hover:text-white disabled:opacity-40"
+              >
+                {t("Discard")}
+              </button>
+            </div>
           </div>
+          {uploadError?.recordingId === item.recordingId && busy !== item.recordingId && (
+            <p className="text-red-400">{t("Upload failed: {error}", { error: uploadError.message })}</p>
+          )}
         </div>
       ))}
     </div>

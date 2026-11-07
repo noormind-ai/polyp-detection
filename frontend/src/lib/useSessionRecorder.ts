@@ -34,6 +34,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { openChunkStore, type ChunkStore, type ChunkStoreKind } from "./chunkStore";
 import { waitUntilInferenceIdle, isLiveInferenceActive } from "./uploadCoordinator";
 import { registerUpload, updateUpload, finishUpload } from "./uploadRegistry";
+import { uploadChunkToServer } from "./recordingUpload";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "";
 
@@ -85,6 +86,32 @@ export function setRecordingBps(bps: number) {
  *  before anyone commits a procedure to disk. */
 export function mbPerMinute(bps: number): number {
   return Math.round((bps / 8 / 1e6) * 60);
+}
+
+/** How long a continuous out-of-body stretch has to last before LiveCameraPlayer's
+ *  auto-record treats it as the procedure actually ending (stop + finalize +
+ *  upload, next re-entry opens a new recording) rather than a brief withdrawal.
+ *  The SAME number also gates uploadCoordinator.ts's bandwidth-arbitration hold
+ *  for this session -- deliberately one shared value, not two: the user's call,
+ *  so that "wait, then stop everything and upload" reads as one clean event
+ *  instead of an upload quietly (and uselessly, since the gate doesn't open
+ *  until this same moment anyway) trying every single out-of-body frame. */
+export const MIN_OUT_OF_BODY_STOP_MS = 15_000;
+export const MAX_OUT_OF_BODY_STOP_MS = 600_000;
+const OUT_OF_BODY_STORAGE_KEY = "polyp_out_of_body_stop_ms";
+const DEFAULT_OUT_OF_BODY_STOP_MS = 60_000;
+
+export function getOutOfBodyStopMs(): number {
+  try {
+    const v = Number(localStorage.getItem(OUT_OF_BODY_STORAGE_KEY));
+    if (Number.isFinite(v) && v >= MIN_OUT_OF_BODY_STOP_MS && v <= MAX_OUT_OF_BODY_STOP_MS) return v;
+  } catch { /* SSR or storage blocked -- the default is fine */ }
+  return DEFAULT_OUT_OF_BODY_STOP_MS;
+}
+
+export function setOutOfBodyStopMs(ms: number) {
+  const clamped = Math.max(MIN_OUT_OF_BODY_STOP_MS, Math.min(MAX_OUT_OF_BODY_STOP_MS, Math.round(ms)));
+  try { localStorage.setItem(OUT_OF_BODY_STORAGE_KEY, String(clamped)); } catch { /* ignore */ }
 }
 
 /** Read at MediaRecorder creation, not module load: MediaRecorder's bitrate is
@@ -150,7 +177,11 @@ export interface SessionRecorder {
   /** Pauses capture without ending the session — no data is recorded while
    *  paused. Auto-driven by in-body/out-of-body by default; also callable
    *  directly for a manual override. */
-  pause: () => void;
+  /** `{ trickle: false }` skips the opportunistic drain-while-paused attempt
+   *  (see pause()'s own comment) -- used by the automatic out-of-body path,
+   *  which has its own tunable threshold for when uploading is allowed to
+   *  start. Omit it (or pass nothing) for a manual pause, same as before. */
+  pause: (opts?: { trickle?: boolean }) => void;
   resume: () => void;
   /** Bumped once a recording finishes, so a list can refresh itself. */
   finishedCount: number;
@@ -309,58 +340,49 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen" |
     await waitUntilInferenceIdle();
     setWaitingForLink(false);
     if (sess.aborted) return;
-    const url = `${API}/api/recordings/${sess.caseId}/${sess.id}/chunk?seq=${seq}`;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const res = await fetch(url, { method: "PUT", body: blob, credentials: "include" });
-        if (res.ok) {
-          const data = await res.json();
-          if (owns(sess)) {
-            setUploaded(data.bytes ?? 0);
-            setUploadedChunks(seq + 1);
-            setPendingChunks((n) => Math.max(0, n - 1));
-          }
-          // Mirrored into the cross-recording registry regardless of owns():
-          // once this recording is in the registry (finalize() put it there),
-          // it needs updating whether or not a component still owns it.
-          updateUpload(sess.id, { uploadedBytes: data.bytes ?? 0, uploadedChunks: seq + 1 });
-          // "closing" is the server's normal status the instant a recording
-          // ends -- set deliberately so append_chunk keeps accepting the
-          // backlog (see backend/routes/recordings.py's stop_recording). Only
-          // "truncated" (the server actually refused a chunk for hitting its
-          // size cap) is a real error. Checking "!== recording" here instead
-          // of "=== truncated" was the Aban 6 2026-10-28 incident: every
-          // recording's own end sets "closing" moments before its backlog
-          // starts draining, so the FIRST backlog chunk to upload after that
-          // always tripped this check and killed the rest of the upload --
-          // one chunk landing, every time, regardless of capture hardware.
-          if (data.status === "truncated") {
-            sess.aborted = true;
-            if (owns(sess)) setError("recording reached the server's size limit and was closed");
-            // Only the recording still being captured has a MediaRecorder to
-            // stop -- stopping it on behalf of an older session would cut the
-            // procedure that is actually running.
-            if (activeRef.current === sess) {
-              try { recorderRef.current?.stop(); } catch { /* already stopped */ }
-            }
-          }
-          return;
+    try {
+      // The actual PUT-with-retry mechanics live in recordingUpload.ts,
+      // shared with resuming an orphaned recording (RecordingRecoveryBanner.tsx).
+      const result = await uploadChunkToServer(sess.caseId, sess.id, blob, seq, {
+        onRetry: () => { if (owns(sess)) setUploadRetries((n) => n + 1); },
+      });
+      if (owns(sess)) {
+        setUploaded(result.bytes);
+        setUploadedChunks(result.chunks);
+        setPendingChunks((n) => Math.max(0, n - 1));
+      }
+      // Mirrored into the cross-recording registry regardless of owns():
+      // once this recording is in the registry (finalize() put it there),
+      // it needs updating whether or not a component still owns it.
+      updateUpload(sess.id, { uploadedBytes: result.bytes, uploadedChunks: result.chunks });
+      // "closing" is the server's normal status the instant a recording
+      // ends -- set deliberately so append_chunk keeps accepting the
+      // backlog (see backend/routes/recordings.py's stop_recording). Only
+      // "truncated" (the server actually refused a chunk for hitting its
+      // size cap) is a real error. Checking "!== recording" here instead
+      // of "=== truncated" was the Aban 6 2026-10-28 incident: every
+      // recording's own end sets "closing" moments before its backlog
+      // starts draining, so the FIRST backlog chunk to upload after that
+      // always tripped this check and killed the rest of the upload --
+      // one chunk landing, every time, regardless of capture hardware.
+      if (result.status === "truncated") {
+        sess.aborted = true;
+        if (owns(sess)) setError("recording reached the server's size limit and was closed");
+        // Only the recording still being captured has a MediaRecorder to
+        // stop -- stopping it on behalf of an older session would cut the
+        // procedure that is actually running.
+        if (activeRef.current === sess) {
+          try { recorderRef.current?.stop(); } catch { /* already stopped */ }
         }
-        // A 4xx is a decision, not a hiccup -- retrying it just loses time.
-        if (res.status < 500) throw new Error(await detail(res, `upload failed (${res.status})`));
-      } catch (err) {
-        if (attempt === 0 && owns(sess)) setUploadRetries((n) => n + 1);
-        if (attempt === 1) {
-          sess.aborted = true;
-          if (owns(sess)) {
-            setError(err instanceof Error ? err.message : String(err));
-            setStatus("error");
-          }
-          if (activeRef.current === sess) {
-            try { recorderRef.current?.stop(); } catch { /* already stopped */ }
-          }
-          return;
-        }
+      }
+    } catch (err) {
+      sess.aborted = true;
+      if (owns(sess)) {
+        setError(err instanceof Error ? err.message : String(err));
+        setStatus("error");
+      }
+      if (activeRef.current === sess) {
+        try { recorderRef.current?.stop(); } catch { /* already stopped */ }
       }
     }
   }, [owns]);
@@ -596,19 +618,26 @@ export function useSessionRecorder(caseId: string, source: "camera" | "screen" |
     }
   }, [caseId, source, finalize]);
 
-  const pause = useCallback(() => {
+  const pause = useCallback((opts?: { trickle?: boolean }) => {
     const rec = recorderRef.current;
     if (!rec || rec.state !== "recording") return;
     recordedMsRef.current += Date.now() - segmentStartRef.current;
     capturingRef.current = false;
     setCapturing(false);
     try { rec.pause(); } catch { /* already not recording */ }
-    // Opportunistic trickle: this pause is very possibly an out-of-body
-    // stretch, during which the live-inference loop isn't sending frames at
-    // all (see LiveCameraPlayer.tsx's applyAutoRecord) -- the link is
-    // genuinely free right now, not just "eventually, at Stop". Fire-and-
-    // forget: if frames resume before this gets far, putChunk's own
-    // waitUntilInferenceIdle gate holds the next chunk rather than competing.
+    // Opportunistic trickle, default on (the manual Pause button in
+    // RecordingControls.tsx relies on this): the link is genuinely free
+    // right now, not just "eventually, at Stop". LiveCameraPlayer.tsx's
+    // auto out-of-body pause passes { trickle: false } instead -- it has its
+    // own, user-tunable threshold (getOutOfBodyStopMs()) for when a backlog
+    // is actually allowed to use the link (see uploadCoordinator.ts), and an
+    // attempt fired on every single out-of-body frame sat blocked behind
+    // that same threshold anyway, doing nothing for however long it took to
+    // elapse -- not a real head start, just a no-op "waitingForLink" flicker
+    // on every brief withdrawal. Fire-and-forget: if frames resume before
+    // this gets far, putChunk's own waitUntilInferenceIdle gate holds the
+    // next chunk rather than competing.
+    if (opts?.trickle === false) return;
     const sess = activeRef.current;
     if (sess) void uploadPending(sess);
   }, [uploadPending]);

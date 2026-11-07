@@ -710,6 +710,13 @@ export const FA: Record<string, string> = {
   "{mbps} Mbps · ~{mb} MB/min": "{mbps} مگابیت بر ثانیه · حدود {mb} مگابایت در دقیقه",
   "1.2 = the old setting · 8 = the clinic's own still-image quality · above 12 mostly stores noise.": "۱٫۲ = تنظیم قبلی · ۸ = کیفیت تصاویر ثابت خود کلینیک · بالاتر از ۱۲ بیشتر نویز ذخیره می‌کند.",
 
+  // --- Out-of-body wait slider (RecordingControls) ---
+  "Out-of-body wait before treating it as a new patient": "زمان انتظار خارج از بدن قبل از شمارش به‌عنوان بیمار جدید",
+  "{min} min": "{min} دقیقه",
+  "{s}s": "{s} ثانیه",
+  "Nothing uploads during a short out-of-body gap -- the recording just waits. Past this many seconds, it stops, uploads, and the next re-entry starts a new recording.":
+    "در یک وقفه کوتاه خارج از بدن چیزی بارگذاری نمی‌شود — ضبط فقط منتظر می‌ماند. پس از این مدت، ضبط متوقف، بارگذاری و با ورود بعدی، ضبط تازه‌ای آغاز می‌شود.",
+
   // --- Live picture controls (enhancement + proc-amp) ---
   "Picture settings": "تنظیمات تصویر",
   " · enhancement on": " · بهبود روشن",
