@@ -27,7 +27,7 @@ import { createGLEnhancer, type GLEnhancer } from "@/lib/enhanceGL";
 import { createGLDeinterlacer, DEINT_MODES, type GLDeinterlacer, type DeintMode } from "@/lib/deinterlaceGL";
 import { JpegEncoder } from "@/lib/jpegEncoder";
 import { readProcAmpCaps, readProcAmpValues, measureLevels, autoTuneProcAmp,
-         type ProcAmpCaps } from "@/lib/procAmp";
+         type ProcAmpCaps, type Levels } from "@/lib/procAmp";
 import { useFullscreen, fsWrapClass, fsExitBtnClass, fsBoxStyle } from "@/lib/useFullscreen";
 import { useAlertSound } from "@/lib/useAlertSound";
 import AlertSoundControls from "./AlertSoundControls";
@@ -1051,8 +1051,11 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // Owns the frame history the motion test needs, so it is per-component and
   // reset whenever the source changes. See lib/interlace.ts.
   const deintRef = useRef(createDeinterlacer());
-  // The Live panel paints through this canvas rather than showing the <video>
-  // directly -- see the effect below. Null until the element mounts.
+  // The Live panel paints through this canvas when deinterlace or enhancement
+  // is actually active; otherwise the <video> element is shown directly and
+  // this canvas is left unpainted -- see the effect below. Null until the
+  // element mounts. Never assume this holds a current frame -- see
+  // measureFromVideo for why auto-tune no longer reads it.
   const liveCanvasRef = useRef<HTMLCanvasElement | null>(null);
   // Set false if the canvas path ever fails, which un-hides the <video> again.
   // A combed picture is bad; a black panel mid-procedure is worse.
@@ -1284,7 +1287,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     await autoTuneProcAmp({
       caps,
       values: { ...procAmpRef.current },
-      measure: () => measureLevels(liveCanvasRef.current),
+      measure: () => {
+        const video = videoRef.current;
+        return video ? measureFromVideo(video) : null;
+      },
       apply: applyProcAmp,
       onProgress: (msg) => setTuneNote(msg),
     });
@@ -1299,6 +1305,25 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   const fovBaseRef = useRef<Rect | null>(null);
   // Scratch canvas for measuring the picture area inside the crop.
   const fovProbeRef = useRef<HTMLCanvasElement | null>(null);
+  // Auto-tune's own scratch canvas, drawn fresh from `video` at measurement
+  // time -- it used to read liveCanvasRef, which was a safe assumption back
+  // when that canvas was painted every frame unconditionally. Now that the
+  // Live panel skips painting it whenever nothing needs processing (the
+  // common case, deinterlace off), that canvas can sit at its default
+  // 300x150 size, fully untouched -- measureLevels read that as a flat black
+  // frame and auto-tune spent its whole pass budget nudging brightness up
+  // against a picture that was never really there, visibly overexposing the
+  // real capture signal. Decoupled here so it can never regress again.
+  const tuneProbeRef = useRef<HTMLCanvasElement | null>(null);
+  function measureFromVideo(video: HTMLVideoElement): Levels | null {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw || !vh) return null;
+    const probe = tuneProbeRef.current ?? (tuneProbeRef.current = document.createElement("canvas"));
+    if (probe.width !== vw) probe.width = vw;
+    if (probe.height !== vh) probe.height = vh;
+    probe.getContext("2d")!.drawImage(video, 0, 0, vw, vh);
+    return measureLevels(probe);
+  }
   // Native frame size the rect was measured against — needed to express it as a
   // fraction for the overlay, and not the same as the analyzed `aspect`.
   const [fovFrame, setFovFrame] = useState<{ w: number; h: number } | null>(null);
@@ -2977,8 +3002,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         const initial = readProcAmpValues(track, caps);
         setProcAmp(initial);
         procAmpRef.current = initial;
-        // Wait for the canvas to hold real frames -- auto-tune measures the
-        // picture, and there is nothing to measure before the first paint.
+        // Wait for the video to be decoding real frames -- auto-tune measures
+        // straight from the <video> element itself (measureFromVideo), not
+        // from any display canvas, so it works regardless of what the Live
+        // panel is currently painting.
         setTimeout(() => { void runAutoTune(caps); }, 1200);
       } else {
         setTuneNote("");
