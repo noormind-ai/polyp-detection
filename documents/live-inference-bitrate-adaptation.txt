@@ -74,11 +74,11 @@ We don't have per-packet data like GCC does -- we have one number per
 frame. That's enough. Here's the translation:
 
   "Is it taking longer than usual?"
-    -> recv_ms, compared each frame against a budget worked out from
-       the fps floor you set (see FORMULA below).
+    -> current_fps (the real, measured picture arrival rate), compared
+       against the fps floor you set (see FORMULA below).
 
   "Is there a lot of room, a little room, or none?"
-    -> the gap between recv_ms and that budget. A big gap is treated
+    -> how far current_fps is above the floor. A big gap is treated
        like GCC's slow-start (jump to the ceiling); a small gap gets
        the cautious small step.
 
@@ -89,18 +89,18 @@ frame. That's enough. Here's the translation:
 
 THE FORMULA, PER PICTURE SENT
 --------------------------------
-  frame_budget_ms   = 1000 / target_fps
-                       -- target_fps is the floor you set on the page
-                          (default 10, a slider, your choice -- NOT a
-                          speed cap. Running faster than this is fine
-                          and expected; it's the minimum being
-                          protected, not a target to match exactly)
+  Updated 2026-11-07 -- the version below (budget computed from
+  target_fps, checked against one picture's own round trip) turned out
+  to be the wrong signal and was replaced. See "WHY THE BUDGET VERSION
+  WAS WRONG" further down for what broke and why.
 
-  available_wire_ms = frame_budget_ms - resize_ms - server_ms
-                       -- what's left for the network after resizing
-                          the picture and running the model
+  current_fps = the REAL, measured rate pictures are actually arriving
+                 at right now (gap between one arrival and the next)
 
-  this picture is "good" if recv_ms <= available_wire_ms
+  this picture is "good" if current_fps >= target_fps
+                       -- i.e. are we actually hitting the floor you
+                          set, not "would one frame's round trip have
+                          fit inside a slot computed from it"
 
   if NOT good:
       quality drops immediately (big multiplicative step down)
@@ -108,10 +108,44 @@ THE FORMULA, PER PICTURE SENT
   if good:
       record it in a 15-picture rolling window
       if at least 80% of that window was "good":
-          if recv_ms is under HALF of available_wire_ms (lots of room)
+          if current_fps is at least 1.5x the floor (lots of room)
               -> jump quality straight to the ceiling (slow-start)
           else
               -> small step up (the cautious climb)
+
+
+WHY THE BUDGET VERSION WAS WRONG
+-----------------------------------
+The original formula computed a time slot per picture (1000/target_fps),
+subtracted resize and server time, and checked whether THIS picture's
+own round trip fit in what was left. That assumes pictures are sent one
+at a time, each waiting for the last reply before the next picture even
+starts being prepared.
+
+That is not how the capture loop works. A picture is sent and the NEXT
+one starts being resized and encoded immediately, without waiting for
+the reply -- the round trip for picture N overlaps the preparation of
+picture N+1 on purpose, so the camera keeps up even while a reply is
+still in flight. That overlap means the real achievable rate is NOT
+bounded by "resize + server + wire time, all added up, must fit in one
+slot" -- it's bounded by whichever single step is slowest, running
+continuously.
+
+In practice this meant: at a 10fps floor, resize + server time alone
+could eat nearly the whole 100ms slot, leaving almost nothing for the
+wire -- so almost any round trip "missed the budget", even while
+pictures were genuinely arriving faster than 10 per second. Quality got
+driven to its floor (40%) for a connection that was never actually the
+problem. Meanwhile setting the floor very low (1-2fps) made the slot so
+large that nothing ever missed, so quality sat pinned at its ceiling
+(85%) regardless of the real connection -- the number stopped meaning
+anything either way.
+
+The fix: judge the picture rate itself (current_fps), which already
+reflects the overlap above, against the floor you actually asked for.
+This is also closer to how WebRTC's GCC really works -- it reacts to an
+outcome/trend over a window of samples, not to one request's round trip
+checked against an assumed time slot.
 
 
 WHY A WINDOW, NOT A STREAK

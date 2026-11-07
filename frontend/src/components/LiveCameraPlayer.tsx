@@ -77,10 +77,10 @@ const QUALITY_STEP_DOWN_MULT = 0.85;
 const QUALITY_WINDOW_N = 15;
 const QUALITY_GOOD_FRACTION = 0.8;
 // TCP's other well-known phase, "slow start": big jumps while far from the
-// limit, small cautious steps once close to it. If recv_ms is using less
-// than this fraction of the available budget, there's enough margin to
+// limit, small cautious steps once close to it. If actual delivered fps is
+// comfortably above (this many times) the floor, there's enough margin to
 // just jump straight to the ceiling instead of creeping up 0.02 at a time.
-const QUALITY_BIG_MARGIN_RATIO = 0.5;
+const QUALITY_BIG_MARGIN_RATIO = 1.5;
 const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 // Resolve the socket origin explicitly rather than leaning on a relative
 // WebSocket URL: the spec allows it, but an absolute ws:// is unambiguous and
@@ -1832,36 +1832,37 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         if (entry) bytesSentRef.current = entry.bytes;
         recvMsRef.current = timing.recv_ms;
 
-        // AIMD quality adjustment -- the fps floor is the anchor: work out
-        // how much of one frame's time budget is left for the wire once
-        // resize and the model have taken their share, and compare that to
-        // what this frame's receive actually cost. See
-        // documents/live-inference-bitrate-adaptation.txt for why this
-        // shape, not a per-frame search for the "right" quality.
+        // AIMD quality adjustment -- the fps floor is the anchor, and now so
+        // is the signal: react to whether the ACTUAL delivered fps (curFps)
+        // meets that floor, not to one frame's round trip checked against a
+        // synthetic per-frame budget.
         //
-        // Reads curNet (rtt - modal_ms), NOT timing.recv_ms, despite the doc
-        // above and the original design assuming recv_ms was a clean
-        // network signal (modelled on WebRTC's GCC). It is not: the server
-        // stamps its receive-wait timer right after finishing the PREVIOUS
-        // frame's reply (backend/routes/infer.py's _stream_frames loop), so
-        // recv_ms measures the full gap until the NEXT frame's bytes show
-        // up -- which includes however long THIS client took to resize,
-        // gate, and encode that frame, not just wire time. A slow encode
-        // (the client being CPU-bound) and a slow network are indistinguishable
-        // to a receiver that is just waiting on a socket; the server cannot
-        // tell them apart, and recv_ms inherits that confusion. curNet does
-        // not have this problem -- entry.sentAt is stamped immediately
-        // before THIS frame's own send(), so rtt (and curNet = rtt minus
-        // the server's own reported processing time) is scoped to exactly
-        // one request/reply pair, the way a correct latency measurement
-        // should be, not to the gap between unrelated frames.
-        const frameBudgetMs = 1000 / targetFpsRef.current;
-        const availableWireMs = Math.max(5, frameBudgetMs - resizeMsRef.current - timing.modal_ms);
-        const frameWasGood = curNet <= availableWireMs;
+        // Previous version computed availableWireMs = 1/targetFps - resize -
+        // modal_ms, as if resize, server, and wire time all had to fit
+        // serially inside one frame's time slot, and flagged a "miss" the
+        // instant a single frame's rtt (curNet) exceeded that. But the
+        // capture loop pipelines frames on purpose (sendForInference is
+        // fired without awaiting, see the loop below) -- this frame's wire
+        // time overlaps the next frame's resize/encode, so the real sustained
+        // rate isn't bounded by that serial sum. The old check was punishing
+        // quality for "misses" that never cost a real frame: at
+        // targetFps=10, resize+server alone could eat nearly the whole
+        // 100ms budget, so almost any rtt tripped it regardless of whether
+        // the pipeline was actually keeping up (it measurably was -- quality
+        // sat at its floor while the HUD's own fps readout stayed above 10).
+        //
+        // curFps already reflects the pipeline's real output rate (it's the
+        // gap between consecutive arrivals, computed above), so comparing it
+        // straight to the floor is both simpler and correct. See
+        // documents/live-inference-bitrate-adaptation.txt and WebRTC's GCC,
+        // which this is modelled on: GCC judges an outcome over a window of
+        // samples too, never a single request's round trip against an
+        // assumed time slot.
+        const frameWasGood = curFps >= targetFpsRef.current;
         qualityWindowRef.current.push(frameWasGood ? 1 : 0);
 
         if (!frameWasGood) {
-          // Miss the budget even once -> drop now. Fast to react, same as
+          // Miss the floor even once -> drop now. Fast to react, same as
           // GCC/TCP: a single overshoot is cheap to recover from, a slow
           // reaction to real congestion isn't.
           qualityRef.current = Math.max(QUALITY_MIN, qualityRef.current * QUALITY_STEP_DOWN_MULT);
@@ -1872,9 +1873,9 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
           // Gate on "mostly good over the recent window", not "zero misses
           // in a row" -- ordinary jitter can no longer block recovery
           // forever by resetting a streak counter one frame before it pays off.
-          const bigMargin = curNet < availableWireMs * QUALITY_BIG_MARGIN_RATIO;
+          const bigMargin = curFps >= targetFpsRef.current * QUALITY_BIG_MARGIN_RATIO;
           qualityRef.current = bigMargin
-            // Slow-start: comfortably inside budget, no reason to creep --
+            // Slow-start: comfortably above the floor, no reason to creep --
             // there's nothing left to probe for, so go straight to the ceiling.
             ? QUALITY_MAX
             : Math.min(QUALITY_MAX, qualityRef.current + QUALITY_STEP_UP);
