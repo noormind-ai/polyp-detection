@@ -1324,7 +1324,6 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // actual inference socket during calibration -- not startLoop, which still
   // doesn't run until confirmed -- purely to pay down whatever that cost
   // turns out to be before the operator is looking at a live procedure.
-  const [warmupNote, setWarmupNote] = useState("");
   const [warmupMs, setWarmupMs] = useState<number | null>(null);
   const [warmupReady, setWarmupReadyState] = useState(false);
   // The calibration tick loop below is a plain recursive closure, not
@@ -1333,6 +1332,19 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   const warmupReadyRef = useRef(false);
   const setWarmupReady = (v: boolean) => { warmupReadyRef.current = v; setWarmupReadyState(v); };
   const warmupStartedRef = useRef(false);
+
+  // The calibration checklist: tuning, framing (FOV + interlace), AI speed
+  // (warmupReady above). "Start" stays disabled until all three are true --
+  // deliberately no way to skip ahead, manually or by accident. Once all
+  // three are true, a short countdown (below) starts on its own.
+  const [tuneDone, setTuneDone] = useState(false);
+  const [framingDone, setFramingDone] = useState(false);
+  const calibrationReady = tuneDone && framingDone && warmupReady;
+  // null = not counting down yet. Only for a human operator -- the kiosk
+  // (autoStart) has nobody to watch a countdown, so it confirms the moment
+  // calibrationReady is true (see the effect below).
+  const [countdown, setCountdown] = useState<number | null>(null);
+  const COUNTDOWN_SECONDS = 3;
 
   /** Push one control to the card and remember what we asked for. */
   const applyProcAmp = useCallback(async (key: string, value: number) => {
@@ -1362,6 +1374,16 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [applyProcAmp]);
+
+  /** The checklist's own entry point for a manual redo -- flips the item
+   *  back to "waiting" (pausing the countdown if one was running, see
+   *  calibrationReady) and back to done once the real tune settles again. */
+  function redoAutoTune() {
+    if (!procAmpCaps) return;
+    setTuneDone(false);
+    void runAutoTune(procAmpCaps).then(() => setTuneDone(true));
+  }
+
   const interlaceSamplesRef = useRef(0);
   const combPeakRef = useRef(0);
   // The region the FOV was measured INSIDE, in native frame pixels. With a
@@ -1519,7 +1541,6 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   async function runModelWarmup() {
     const start = Date.now();
     let streak = 0;
-    setWarmupNote(t("Warming up the AI model…"));
     for (let i = 0; i < WARMUP_MAX_PROBES; i++) {
       if (phaseRef.current !== "calibrating") return;
       if (Date.now() - start > WARMUP_MAX_MS) break;
@@ -1541,7 +1562,6 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       }
     }
     setWarmupReady(true);
-    setWarmupNote(t("AI model ready."));
   }
 
   /** Observe-only pass over incoming frames while picture-tuning and crop
@@ -1555,9 +1575,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   function runCalibrationLoop() {
     calibStartRef.current = Date.now();
     warmupStartedRef.current = false;
-    setWarmupNote("");
     setWarmupMs(null);
     setWarmupReady(false); // also resets warmupReadyRef -- see setWarmupReady above
+    setFramingDone(false);
+    setCountdown(null);
     const tick = () => {
       if (phaseRef.current !== "calibrating") return;
       const video = videoRef.current;
@@ -1575,12 +1596,19 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       }
       const fovConcluded = fovSamplesRef.current >= FOV_SAMPLE_FRAMES || Date.now() > fovDeadlineRef.current;
       const interlaceConcluded = interlacedRef.current !== null;
-      if (fovConcluded && interlaceConcluded && !warmupStartedRef.current) {
-        warmupStartedRef.current = true;
-        void runModelWarmup();
+      if (fovConcluded && interlaceConcluded) {
+        setFramingDone(true);
+        if (!warmupStartedRef.current) {
+          warmupStartedRef.current = true;
+          void runModelWarmup();
+        }
       }
-      const timedOut = Date.now() - calibStartRef.current > CALIBRATION_AUTOSTART_MS;
-      if (autoStart && ((fovConcluded && interlaceConcluded && warmupReadyRef.current) || timedOut)) {
+      // Pure backstop, not the happy path -- see the calibrationReady effect
+      // below for how an attended operator (and a kiosk under normal
+      // conditions) actually proceeds. This only fires if something above
+      // never concludes at all (e.g. a signal that never locks), so an
+      // unattended clinic PC still cannot wait forever.
+      if (autoStart && Date.now() - calibStartRef.current > CALIBRATION_AUTOSTART_MS) {
         confirmCalibration();
         return;
       }
@@ -1590,11 +1618,21 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   }
 
   /** The operator has seen the tuned picture and the detected crop and is
-   *  happy with both (or the kiosk watchdog decided the same thing on its
-   *  own -- see runCalibrationLoop). Only now does the model start seeing
-   *  frames. */
+   *  happy with both (or the countdown/kiosk watchdog decided the same
+   *  thing on its own -- see the calibrationReady effect below). Only now
+   *  does the model start seeing frames. */
   function confirmCalibration() {
     setPhase("live");
+    setCountdown(null);
+    // Calibrating forces these on so there's something to look at while
+    // tuning/framing (see the effect below) -- that was never meant to
+    // carry into Live, which keeps its own original default (hidden,
+    // because showLive's own cost is real on weak hardware -- see its
+    // declaration). An operator who wants the picture during the actual
+    // procedure clicks "Show", exactly as before this screen existed.
+    setShowLive(false);
+    setShowFovOverlay(false);
+    setEnhOpen(false);
     startLoop();
   }
 
@@ -1602,8 +1640,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // detected crop -- force both into view rather than leaving it to defaults
   // the operator would otherwise have to click through (showLive defaults
   // off to save CPU on weak hardware, enhOpen/showFovOverlay default
-  // collapsed). Only ever turns these ON; it never turns them back off on
-  // its own, so an operator's own "Hide" click during Live still sticks.
+  // collapsed). confirmCalibration above is what turns them back off again.
   useEffect(() => {
     if (phase === "calibrating") {
       setShowLive(true);
@@ -1611,6 +1648,29 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       setEnhOpen(true);
     }
   }, [phase]);   // eslint-disable-line react-hooks/exhaustive-deps
+
+  // "Start" stays disabled until all three checklist items are true -- no
+  // way to skip ahead. Once they are, a human operator gets a short
+  // countdown (visible, cancellable by clicking Start) rather than an
+  // instant jump to Live; the kiosk (autoStart) has nobody to watch a
+  // countdown, so it proceeds the moment this is true.
+  useEffect(() => {
+    if (phase !== "calibrating" || !calibrationReady) {
+      // Covers a redo mid-countdown (e.g. "Redo auto-tune" clicked at 2s left)
+      // -- without this the displayed number would freeze instead of
+      // disappearing, even though nothing is actually still counting down.
+      setCountdown(null);
+      return;
+    }
+    if (autoStart) { confirmCalibration(); return; }
+    setCountdown(COUNTDOWN_SECONDS);
+    const id = setInterval(() => setCountdown((c) => (c === null ? null : c - 1)), 1000);
+    return () => clearInterval(id);
+  }, [phase, calibrationReady, autoStart]);   // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (countdown === 0) confirmCalibration();
+  }, [countdown]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     try {
@@ -3223,9 +3283,11 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         // straight from the <video> element itself (measureFromVideo), not
         // from any display canvas, so it works regardless of what the Live
         // panel is currently painting.
-        setTimeout(() => { void runAutoTune(caps); }, 1200);
+        setTimeout(() => { void runAutoTune(caps).then(() => setTuneDone(true)); }, 1200);
       } else {
         setTuneNote("");
+        // Nothing this device exposes to tune -- that step is trivially done.
+        setTuneDone(true);
       }
       setModeScan(negotiated.tried);
       streamRef.current = stream;
@@ -4230,25 +4292,37 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
                 {t("🎛 Calibrating — tuning the picture and finding the frame")}
               </p>
               <p className="text-xs text-gray-500">
-                {t("This runs once, before anything is sent to the AI, so the live session starts at full speed. Review the picture below, then continue.")}
+                {t("This runs once, before anything is sent to the AI, so the live session starts at full speed.")}
               </p>
-              {tuneNote && <p className="text-[11px] text-gray-500 font-mono">{tuneNote}</p>}
-              {warmupNote && (
-                <p className={`text-[11px] font-mono ${warmupReady ? "text-emerald-400" : "text-amber-400"}`}>
-                  {warmupNote}{warmupMs !== null ? ` (${warmupMs} ms)` : ""}
-                </p>
-              )}
+            </div>
+            {/* The checklist: what the operator is actually waiting on, and
+                why. Each line is independent -- redoing one does not reset
+                the others -- except that resetting a line that was already
+                ✓ pauses the countdown below until it's ✓ again (see
+                calibrationReady). */}
+            <div dir="ltr" className="space-y-1">
+              <p className={`text-xs font-mono ${tuneDone ? "text-emerald-400" : "text-amber-400"}`}>
+                {tuneDone ? "✓" : "…"} {t("Tuning the picture")}{tuneNote ? ` — ${tuneNote}` : ""}
+              </p>
+              <p className={`text-xs font-mono ${framingDone ? "text-emerald-400" : "text-amber-400"}`}>
+                {framingDone ? "✓" : "…"} {t("Finding the frame")}
+                {framingDone && fovWorthIt ? ` — ${t("{pct}% border found", { pct: Math.round(fovTrim * 100) })}` : ""}
+              </p>
+              <p className={`text-xs font-mono ${warmupReady ? "text-emerald-400" : "text-amber-400"}`}>
+                {warmupReady ? "✓" : "…"} {t("Checking AI speed")}
+                {warmupMs !== null ? ` — ${warmupMs} ms` : ""}
+              </p>
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <button
-                onClick={() => procAmpCaps && void runAutoTune(procAmpCaps)}
+                onClick={redoAutoTune}
                 disabled={!procAmpCaps}
                 className="text-xs px-2.5 py-1.5 rounded-md border border-emerald-800 text-emerald-300 hover:border-emerald-600 disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 {t("↻ Redo auto-tune")}
               </button>
               <button
-                onClick={resetFovDetection}
+                onClick={() => { resetFovDetection(); setFramingDone(false); }}
                 className="text-xs px-2.5 py-1.5 rounded-md border border-emerald-800 text-emerald-300 hover:border-emerald-600"
               >
                 {t("↻ Redo framing")}
@@ -4260,7 +4334,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
                 {manualCrop ? t("Change capture region") : t("Adjust crop manually")}
               </button>
               <button
-                onClick={() => { warmupStartedRef.current = false; setWarmupReady(false); setWarmupNote(""); setWarmupMs(null); }}
+                onClick={() => { warmupStartedRef.current = false; setWarmupReady(false); setWarmupMs(null); }}
                 className="text-xs px-2.5 py-1.5 rounded-md border border-gray-700 text-gray-300 hover:border-gray-500"
               >
                 {t("↻ Re-check AI speed")}
@@ -4268,13 +4342,16 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
             </div>
             <button
               onClick={confirmCalibration}
-              className="w-full md:w-auto py-2.5 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-sm transition-colors"
+              disabled={!calibrationReady}
+              className="w-full md:w-auto py-2.5 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-sm transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:bg-gray-700"
             >
-              {t("✓ Looks good — start live session")}
+              {!calibrationReady ? t("Waiting for calibration to finish…")
+                : countdown !== null ? t("▶ Start now ({n})", { n: countdown })
+                : t("▶ Start now")}
             </button>
-            {!warmupReady && (
+            {calibrationReady && countdown !== null && (
               <p className="text-[11px] text-gray-500">
-                {t("You can start now, or wait a few seconds for the AI speed check above to finish first.")}
+                {t("Starting on its own in {n}s — click Start now to go immediately.", { n: countdown })}
               </p>
             )}
           </div>
