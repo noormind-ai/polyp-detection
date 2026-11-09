@@ -33,6 +33,17 @@ export const FA: Record<string, string> = {
   "srv": "سرور",
   "net": "شبکه",
   "fps": "فریم",
+  "rcv": "دریافت",
+  "enc": "انکود",
+  "sent": "ارسال",
+  "qual": "کیفیت",
+  "res": "وضوح",
+  "{pct}%": "{pct}٪",
+  "{width}px": "{width} پیکسل",
+  "{kb} KB": "{kb} کیلوبایت",
+  "Minimum send quality (floor)": "حداقل کیفیت ارسال (کف)",
+  "The JPEG quality the picture never drops below, even on a bad uplink. Lower risks a blockier image; higher risks missing the fps floor above instead.":
+    "کیفیت JPEG که تصویر هرگز از آن پایین‌تر نمی‌رود، حتی روی یک آپ‌لینک ضعیف. کم کردن آن ریسک تصویر بلوکی‌تر دارد؛ زیاد کردن آن ریسک نرسیدن به کف فریم‌بر‌ثانیهٔ بالا را دارد.",
 
   // --- Captured-frame strip over the fullscreen picture (CaptureStrip) ---
   "Captured frames": "فریم‌های ثبت‌شده",
@@ -767,6 +778,20 @@ export const FA: Record<string, string> = {
   "Tuned automatically when the card is connected. Adjust only if you want to.": "هنگام اتصال کارت به‌طور خودکار تنظیم می‌شود. فقط در صورت تمایل تغییر دهید.",
 
   "Motion-adaptive (original)": "تطبیقی با حرکت (نسخهٔ اولیه)",
+
+  // --- Calibrating step (before live camera starts) ---
+  "🎛 Calibrating — tuning the picture and finding the frame": "🎛 کالیبراسیون — تنظیم تصویر و یافتن قاب تصویر",
+  "This runs once, before anything is sent to the AI, so the live session starts at full speed. Review the picture below, then continue.":
+    "این فقط یک‌بار و پیش از ارسال هر چیزی به هوش مصنوعی انجام می‌شود، تا جلسهٔ زنده با سرعت کامل شروع شود. تصویر زیر را بررسی کنید و سپس ادامه دهید.",
+  "↻ Redo auto-tune": "↻ تکرار تنظیم خودکار",
+  "↻ Redo framing": "↻ تکرار یافتن قاب تصویر",
+  "Adjust crop manually": "تنظیم دستی ناحیهٔ برش",
+  "↻ Re-check AI speed": "↻ بررسی دوبارهٔ سرعت هوش مصنوعی",
+  "✓ Looks good — start live session": "✓ خوب است — شروع جلسهٔ زنده",
+  "You can start now, or wait a few seconds for the AI speed check above to finish first.":
+    "می‌توانید همین حالا شروع کنید، یا چند ثانیه صبر کنید تا بررسی سرعت هوش مصنوعی بالا تمام شود.",
+  "Warming up the AI model…": "در حال گرم‌کردن مدل هوش مصنوعی…",
+  "AI model ready.": "مدل هوش مصنوعی آماده است.",
 
   // --- The review timeline: a spot per captured frame, and playing from one ---
   "Click to play from that moment": "برای پخش از آن لحظه کلیک کنید",

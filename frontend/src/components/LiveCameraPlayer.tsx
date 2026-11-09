@@ -62,9 +62,12 @@ const BASELINE_N = 60;
 const TARGET_FPS_KEY = "polyp_target_fps";
 const DEFAULT_TARGET_FPS = 10;
 // Never so low it risks hiding a real polyp; never above this because
-// there's nothing to gain once the wire isn't the bottleneck.
-const QUALITY_MIN = 0.4;
+// there's nothing to gain once the wire isn't the bottleneck. DEFAULT_ is
+// only the seed -- the operator can raise (not lower, see the slider's own
+// min below) this floor per browser; see QUALITY_MIN_KEY.
+const DEFAULT_QUALITY_MIN = 0.4;
 const QUALITY_MAX = 0.85;
+const QUALITY_MIN_KEY = "polyp_quality_min";
 // Deliberately asymmetric (AIMD -- additive increase, multiplicative
 // decrease): earn quality back slowly, lose it immediately. Same shape TCP
 // uses for congestion, and what WebRTC's GCC uses for live video calls.
@@ -537,13 +540,16 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // This frame's raw numbers. The grid shows the averages; only the spike
   // test looks at these.
   const [cur, setCur] = useState({ rtt: 0, server: 0, net: 0, fps: 0 });
-  const [hudOn, setHudOnState] = useState(false);
+  // On by default now -- only an explicit prior "off" (stored "0") keeps it
+  // off; a browser that has never touched this setting gets the numbers
+  // showing from the first session.
+  const [hudOn, setHudOnState] = useState(true);
   const setHudOn = useCallback((v: boolean) => {
     setHudOnState(v);
     try { localStorage.setItem(HUD_KEY, v ? "1" : "0"); } catch { /* private mode */ }
   }, []);
   useEffect(() => {
-    try { if (localStorage.getItem(HUD_KEY) === "1") setHudOnState(true); } catch { /* private mode */ }
+    try { if (localStorage.getItem(HUD_KEY) === "0") setHudOnState(false); } catch { /* private mode */ }
   }, []);
 
   const [shots, setShots] = useState<Shot[]>([]);
@@ -1232,6 +1238,25 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     } catch { /* private mode */ }
   }, []);
 
+  // Same remember-the-choice convention, for the OTHER half of the AIMD
+  // tradeoff: how low the picture quality is allowed to drop while still
+  // protecting the fps floor above. The ref is what the AIMD step below
+  // reads; qualityMinFloor is only for the slider to display.
+  const qualityMinFloorRef = useRef(DEFAULT_QUALITY_MIN);
+  const [qualityMinFloor, setQualityMinFloorState] = useState(DEFAULT_QUALITY_MIN);
+  function setQualityMinFloor(v: number) {
+    setQualityMinFloorState(v);
+    qualityMinFloorRef.current = v;
+    try { localStorage.setItem(QUALITY_MIN_KEY, String(v)); } catch { /* private mode */ }
+  }
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(QUALITY_MIN_KEY);
+      const v = raw ? Number(raw) : NaN;
+      if (Number.isFinite(v) && v > 0 && v < QUALITY_MAX) { setQualityMinFloorState(v); qualityMinFloorRef.current = v; }
+    } catch { /* private mode */ }
+  }, []);
+
   // The AIMD state itself. Starts at the ceiling and only drops once a frame
   // actually misses the fps budget -- see the adjustment next to recvMsRef
   // above in ws.onmessage. qualityWindowRef holds a 1/0 per frame (on-budget
@@ -1290,6 +1315,24 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   const [tuneNote, setTuneNote] = useState("");
   const procAmpRef = useRef<Record<string, number>>({});
   useEffect(() => { procAmpRef.current = procAmp; }, [procAmp]);
+
+  // /api/session/start already runs eng.warmup() -- one blank-frame inference
+  // -- before the camera even opens, but that alone hasn't been enough: a GPU
+  // session's CUDA kernel selection and the AIMD quality controller (which
+  // starts at the ceiling, see QUALITY_MAX) both only really settle after a
+  // real run of frames, not one. This probe sends actual frames through the
+  // actual inference socket during calibration -- not startLoop, which still
+  // doesn't run until confirmed -- purely to pay down whatever that cost
+  // turns out to be before the operator is looking at a live procedure.
+  const [warmupNote, setWarmupNote] = useState("");
+  const [warmupMs, setWarmupMs] = useState<number | null>(null);
+  const [warmupReady, setWarmupReadyState] = useState(false);
+  // The calibration tick loop below is a plain recursive closure, not
+  // something React re-creates on every render -- it would otherwise keep
+  // reading the `false` that warmupReady held at the moment the loop started.
+  const warmupReadyRef = useRef(false);
+  const setWarmupReady = (v: boolean) => { warmupReadyRef.current = v; setWarmupReadyState(v); };
+  const warmupStartedRef = useRef(false);
 
   /** Push one control to the card and remember what we asked for. */
   const applyProcAmp = useCallback(async (key: string, value: number) => {
@@ -1434,11 +1477,72 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
 
   // Backstop for the kiosk (autoStart), which has nobody present to click
   // Confirm. FOV detection already caps itself at FOV_SAMPLE_TIMEOUT_MS, but
-  // interlace detection has no time cap of its own (just INTERLACE_SAMPLE_FRAMES
-  // usable frames) -- without this, a frozen or motionless signal could leave
-  // an unattended clinic PC sitting in calibration indefinitely.
-  const CALIBRATION_AUTOSTART_MS = 8000;
+  // interlace detection has no time cap of its own (INTERLACE_SAMPLE_FRAMES
+  // is a frame count, not a clock), and the model warm-up probe below has
+  // its own WARMUP_MAX_MS cap but needs room inside this one -- without this,
+  // a frozen signal, or a model that never settles, could leave an
+  // unattended clinic PC sitting in calibration indefinitely.
+  const CALIBRATION_AUTOSTART_MS = 30_000;
   const calibStartRef = useRef(0);
+
+  // /api/session/start's eng.warmup() (one blank-frame inference, see
+  // backend/routes/infer.py) runs before the camera even opens, but a single
+  // call has not been enough on its own -- a GPU session's first few real
+  // inferences and the AIMD quality controller (which starts at the ceiling,
+  // see QUALITY_MAX) both only settle after several real frames, which used
+  // to mean the first real seconds of a LIVE procedure paid that cost. This
+  // sends real frames through the real inference socket during calibration
+  // instead -- not startLoop, which still doesn't start until confirmed, so
+  // nothing here draws a box, files a capture, or starts a recording -- the
+  // result is thrown away, only the timing is kept.
+  const WARMUP_MAX_PROBES = 20;
+  const WARMUP_STABLE_MS = 400;
+  const WARMUP_STABLE_STREAK = 3;
+  const WARMUP_MAX_MS = 20_000;
+
+  async function sendWarmupFrame(video: HTMLVideoElement, ws: WebSocket): Promise<number | null> {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw || !vh) return null;
+    const capW = inferWidth;
+    const capH = Math.max(1, Math.round(vh * (capW / vw)));
+    const cap = document.createElement("canvas");
+    cap.width = capW;
+    cap.height = capH;
+    cap.getContext("2d")!.drawImage(video, 0, 0, vw, vh, 0, 0, capW, capH);
+    const blob: Blob = await new Promise((res) => cap.toBlob((b) => res(b!), "image/jpeg", 0.7));
+    const buf = await blob.arrayBuffer();
+    const t0 = performance.now();
+    const result = await sendForInference(ws, buf);
+    return result ? performance.now() - t0 : null; // null = the frame timed out
+  }
+
+  async function runModelWarmup() {
+    const start = Date.now();
+    let streak = 0;
+    setWarmupNote(t("Warming up the AI model…"));
+    for (let i = 0; i < WARMUP_MAX_PROBES; i++) {
+      if (phaseRef.current !== "calibrating") return;
+      if (Date.now() - start > WARMUP_MAX_MS) break;
+      const ws = wsRef.current;
+      const video = videoRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN || !video || !video.videoWidth) {
+        await new Promise<void>((res) => setTimeout(res, 200));
+        continue;
+      }
+      const ms = await sendWarmupFrame(video, ws);
+      if (ms !== null) {
+        setWarmupMs(Math.round(ms));
+        if (ms <= WARMUP_STABLE_MS) {
+          streak += 1;
+          if (streak >= WARMUP_STABLE_STREAK) break;
+        } else {
+          streak = 0;
+        }
+      }
+    }
+    setWarmupReady(true);
+    setWarmupNote(t("AI model ready."));
+  }
 
   /** Observe-only pass over incoming frames while picture-tuning and crop
    *  detection run, before anything is sent to the model. Reuses sampleFov/
@@ -1446,9 +1550,14 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
    *  budget is spent (see FOV_SAMPLE_FRAMES / INTERLACE_SAMPLE_FRAMES), so
    *  calling them here and then again from startLoop if the operator
    *  confirms early is not a special case, just the existing guard clause
-   *  firing twice. */
+   *  firing twice. Once both conclude, kicks off the model warm-up probe
+   *  above exactly once per calibration entry. */
   function runCalibrationLoop() {
     calibStartRef.current = Date.now();
+    warmupStartedRef.current = false;
+    setWarmupNote("");
+    setWarmupMs(null);
+    setWarmupReady(false); // also resets warmupReadyRef -- see setWarmupReady above
     const tick = () => {
       if (phaseRef.current !== "calibrating") return;
       const video = videoRef.current;
@@ -1466,8 +1575,12 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       }
       const fovConcluded = fovSamplesRef.current >= FOV_SAMPLE_FRAMES || Date.now() > fovDeadlineRef.current;
       const interlaceConcluded = interlacedRef.current !== null;
+      if (fovConcluded && interlaceConcluded && !warmupStartedRef.current) {
+        warmupStartedRef.current = true;
+        void runModelWarmup();
+      }
       const timedOut = Date.now() - calibStartRef.current > CALIBRATION_AUTOSTART_MS;
-      if (autoStart && ((fovConcluded && interlaceConcluded) || timedOut)) {
+      if (autoStart && ((fovConcluded && interlaceConcluded && warmupReadyRef.current) || timedOut)) {
         confirmCalibration();
         return;
       }
@@ -1941,7 +2054,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
           // Miss the floor even once -> drop now. Fast to react, same as
           // GCC/TCP: a single overshoot is cheap to recover from, a slow
           // reaction to real congestion isn't.
-          qualityRef.current = Math.max(QUALITY_MIN, qualityRef.current * QUALITY_STEP_DOWN_MULT);
+          qualityRef.current = Math.max(qualityMinFloorRef.current, qualityRef.current * QUALITY_STEP_DOWN_MULT);
         } else if (
           qualityWindowRef.current.n >= QUALITY_WINDOW_N
           && qualityWindowRef.current.mean >= QUALITY_GOOD_FRACTION
@@ -3525,6 +3638,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     longTaskMs: longTaskMsShown,
     quality: qualityShown,
     targetFps,
+    inferWidth,
   };
 
   const detectedFs = useFullscreen();
@@ -4119,6 +4233,11 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
                 {t("This runs once, before anything is sent to the AI, so the live session starts at full speed. Review the picture below, then continue.")}
               </p>
               {tuneNote && <p className="text-[11px] text-gray-500 font-mono">{tuneNote}</p>}
+              {warmupNote && (
+                <p className={`text-[11px] font-mono ${warmupReady ? "text-emerald-400" : "text-amber-400"}`}>
+                  {warmupNote}{warmupMs !== null ? ` (${warmupMs} ms)` : ""}
+                </p>
+              )}
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <button
@@ -4140,6 +4259,12 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
               >
                 {manualCrop ? t("Change capture region") : t("Adjust crop manually")}
               </button>
+              <button
+                onClick={() => { warmupStartedRef.current = false; setWarmupReady(false); setWarmupNote(""); setWarmupMs(null); }}
+                className="text-xs px-2.5 py-1.5 rounded-md border border-gray-700 text-gray-300 hover:border-gray-500"
+              >
+                {t("↻ Re-check AI speed")}
+              </button>
             </div>
             <button
               onClick={confirmCalibration}
@@ -4147,6 +4272,11 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
             >
               {t("✓ Looks good — start live session")}
             </button>
+            {!warmupReady && (
+              <p className="text-[11px] text-gray-500">
+                {t("You can start now, or wait a few seconds for the AI speed check above to finish first.")}
+              </p>
+            )}
           </div>
 
           {/* Session controls. Pressed between moments rather than read during
@@ -4257,6 +4387,27 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
               />
               <p className="text-xs text-gray-500">
                 {t("A floor, not a target — running faster than this is fine. Picture quality drops automatically only if needed to keep fps from falling below it.")}
+              </p>
+            </div>
+
+            {/* The other half of that tradeoff: how far picture quality is
+                allowed to fall before the fps floor above wins outright. */}
+            <div className="space-y-1">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-gray-400">{t("Minimum send quality (floor)")}</span>
+                <span className="font-mono text-gray-200">{Math.round(qualityMinFloor * 100)}%</span>
+              </div>
+              <input
+                type="range"
+                min={0.1}
+                max={QUALITY_MAX}
+                step={0.05}
+                value={qualityMinFloor}
+                onChange={(e) => setQualityMinFloor(Number(e.target.value))}
+                className="w-full accent-blue-500 cursor-pointer"
+              />
+              <p className="text-xs text-gray-500">
+                {t("The JPEG quality the picture never drops below, even on a bad uplink. Lower risks a blockier image; higher risks missing the fps floor above instead.")}
               </p>
             </div>
 
