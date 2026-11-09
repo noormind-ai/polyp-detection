@@ -1353,7 +1353,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // (autoStart) has nobody to watch a countdown, so it confirms the moment
   // calibrationReady is true (see the effect below).
   const [countdown, setCountdown] = useState<number | null>(null);
-  const COUNTDOWN_SECONDS = 3;
+  const COUNTDOWN_SECONDS = 5;
 
   /** Push one control to the card and remember what we asked for. */
   const applyProcAmp = useCallback(async (key: string, value: number) => {
@@ -1764,6 +1764,12 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     // desktop, before the operator had drawn anything — and it was never
     // re-measured, because sampling stops after FOV_SAMPLE_FRAMES.
     resetFovDetection();
+    // During calibration, drawing a new crop (or clearing one) has to put
+    // the "Finding the frame" checklist item back to "waiting" -- otherwise
+    // it stayed ✓ from before the redo, the countdown kept running (or had
+    // already finished) against a crop that no longer matches what's about
+    // to be measured, and "Start" could fire on stale framing.
+    setFramingDone(false);
     try {
       if (rect) localStorage.setItem(CROP_KEY, JSON.stringify(rect));
       else localStorage.removeItem(CROP_KEY);
@@ -3255,6 +3261,13 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   }
 
   async function startStream(deviceId: string) {
+    // A manual crop drawn in a past session is remembered (CROP_KEY) and
+    // would otherwise come straight back here, silently overriding fresh
+    // auto-detection with a region drawn against a different sitting. The
+    // default for a new camera session is auto-detection; a manual crop is
+    // only in force again once the operator explicitly draws one THIS
+    // session (see "Adjust crop manually" / openRegionSelector).
+    if (cropRectRef.current?.mode === "camera") setCropRect(null);
     // An answer given to the replay prompt was about that clip. A live source
     // goes back to the documented on-by-default, so "don't save" for a demo
     // cannot leave an actual procedure unrecorded.
