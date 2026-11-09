@@ -1595,8 +1595,15 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
           ? prev : { w: video.videoWidth, h: video.videoHeight }));
       }
       const fovConcluded = fovSamplesRef.current >= FOV_SAMPLE_FRAMES || Date.now() > fovDeadlineRef.current;
-      const interlaceConcluded = interlacedRef.current !== null;
-      if (fovConcluded && interlaceConcluded) {
+      // Interlace detection is NOT part of this gate. It only latches "yes"
+      // on a comb reading (needs motion) and otherwise needs
+      // INTERLACE_SAMPLE_FRAMES *usable* samples -- combRatio returns null
+      // (not counted) on a flat/still frame, which a calibration screen
+      // pointed at a motionless scene before insertion can be indefinitely.
+      // That starved "Finding the frame" forever with no way out. It still
+      // runs every tick below (sampleInterlace) for the live page's own
+      // deinterlace auto-detection -- it just never blocks getting there.
+      if (fovConcluded) {
         setFramingDone(true);
         if (!warmupStartedRef.current) {
           warmupStartedRef.current = true;
