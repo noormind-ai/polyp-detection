@@ -690,6 +690,15 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // things measured against the old one.
   const lastFrameSizeRef                  = useRef<{ w: number; h: number } | null>(null);
   const [streaming, setStreaming]         = useState(false);
+  // Only the real camera has hardware proc-amp to tune and a border to find --
+  // screen share already has its own framing step (openRegionSelector, run
+  // automatically by startScreenShare) and a file replay has neither, so both
+  // skip straight to "live". Read inside the long-running capture/calibration
+  // loops via the ref, which can't see the render that set the state.
+  type CalibPhase = "setup" | "calibrating" | "live";
+  const [phase, setPhase] = useState<CalibPhase>(initialMode === "camera" ? "setup" : "live");
+  const phaseRef = useRef<CalibPhase>(phase);
+  useEffect(() => { phaseRef.current = phase; }, [phase]);
   // "closed" now means closed for good (the component is going away);
   // an unexpected drop is "reconnecting", because it is about to come back.
   const [wsStatus, setWsStatus]           = useState<"connecting" | "open" | "error" | "reconnecting" | "closed">("connecting");
@@ -1422,6 +1431,73 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     setFovFrame(null);
     setShowFovOverlay(false);
   }
+
+  // Backstop for the kiosk (autoStart), which has nobody present to click
+  // Confirm. FOV detection already caps itself at FOV_SAMPLE_TIMEOUT_MS, but
+  // interlace detection has no time cap of its own (just INTERLACE_SAMPLE_FRAMES
+  // usable frames) -- without this, a frozen or motionless signal could leave
+  // an unattended clinic PC sitting in calibration indefinitely.
+  const CALIBRATION_AUTOSTART_MS = 8000;
+  const calibStartRef = useRef(0);
+
+  /** Observe-only pass over incoming frames while picture-tuning and crop
+   *  detection run, before anything is sent to the model. Reuses sampleFov/
+   *  sampleInterlace verbatim -- both already stop themselves once their own
+   *  budget is spent (see FOV_SAMPLE_FRAMES / INTERLACE_SAMPLE_FRAMES), so
+   *  calling them here and then again from startLoop if the operator
+   *  confirms early is not a special case, just the existing guard clause
+   *  firing twice. */
+  function runCalibrationLoop() {
+    calibStartRef.current = Date.now();
+    const tick = () => {
+      if (phaseRef.current !== "calibrating") return;
+      const video = videoRef.current;
+      if (video && video.videoWidth) {
+        sampleFov(video);
+        sampleInterlace(video);
+        // Same aspect/size bookkeeping startLoop does at the top of its own
+        // loop -- without it the Live preview's box ratio sits on the
+        // pre-stream default until the first inferred frame, even though the
+        // real picture is already playing underneath it.
+        const { w: srcW, h: srcH } = sourceRect(video);
+        setAspect(`${srcW}/${srcH}`);
+        setLiveFrameSize((prev) => (prev && prev.w === video.videoWidth && prev.h === video.videoHeight
+          ? prev : { w: video.videoWidth, h: video.videoHeight }));
+      }
+      const fovConcluded = fovSamplesRef.current >= FOV_SAMPLE_FRAMES || Date.now() > fovDeadlineRef.current;
+      const interlaceConcluded = interlacedRef.current !== null;
+      const timedOut = Date.now() - calibStartRef.current > CALIBRATION_AUTOSTART_MS;
+      if (autoStart && ((fovConcluded && interlaceConcluded) || timedOut)) {
+        confirmCalibration();
+        return;
+      }
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+
+  /** The operator has seen the tuned picture and the detected crop and is
+   *  happy with both (or the kiosk watchdog decided the same thing on its
+   *  own -- see runCalibrationLoop). Only now does the model start seeing
+   *  frames. */
+  function confirmCalibration() {
+    setPhase("live");
+    startLoop();
+  }
+
+  // The whole point of calibrating is to look at the tuned picture and the
+  // detected crop -- force both into view rather than leaving it to defaults
+  // the operator would otherwise have to click through (showLive defaults
+  // off to save CPU on weak hardware, enhOpen/showFovOverlay default
+  // collapsed). Only ever turns these ON; it never turns them back off on
+  // its own, so an operator's own "Hide" click during Live still sticks.
+  useEffect(() => {
+    if (phase === "calibrating") {
+      setShowLive(true);
+      setShowFovOverlay(true);
+      setEnhOpen(true);
+    }
+  }, [phase]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     try {
@@ -3056,7 +3132,12 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       setCameraBusy(false);
       setLastError("");
       setStreaming(true);
-      startLoop();
+      // Tune and find the crop BEFORE a single frame goes to the model --
+      // see the "Calibrating" step. Nothing in startLoop changes: it still
+      // calls the very same sampleFov/sampleInterlace itself, so sampling
+      // just continues seamlessly if the operator confirms early.
+      setPhase("calibrating");
+      runCalibrationLoop();
     } catch (err: unknown) {
       setNegotiating("");
       setLastError(describeCameraError(err));
@@ -3349,6 +3430,9 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     // So does the scan type: a progressive demo clip must not inherit
     // "interlaced" from the capture card that was selected a moment ago.
     resetInterlaceDetection();
+    // Re-opening the camera (device change, kiosk watchdog) must re-calibrate
+    // rather than skip straight back to live on stale tuning/crop numbers.
+    setPhase(initialMode === "camera" ? "setup" : "live");
   }
 
   const wsOk = wsStatus === "open";
@@ -3467,13 +3551,16 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   const autoFsRef = useRef(false);
   useEffect(() => {
     if (!autoStart || autoFsRef.current) return;
-    if (!streaming || !showDetected || detectedFs.active) return;
+    // Detected has nothing on it yet during calibration (startLoop hasn't run,
+    // and the panel is deliberately clipped out of view) -- wait for "live",
+    // not just "streaming", or this would fullscreen an empty, hidden panel.
+    if (phase !== "live" || !streaming || !showDetected || detectedFs.active) return;
     autoFsRef.current = true;
     // A beat after the first frames, so the panel is sized to the real
     // aspect ratio before it takes the screen (fsBoxStyle reads it).
     const t = setTimeout(() => detectedFs.toggle(), 1500);
     return () => clearTimeout(t);
-  }, [autoStart, streaming, showDetected]);   // eslint-disable-line react-hooks/exhaustive-deps
+  }, [autoStart, phase, streaming, showDetected]);   // eslint-disable-line react-hooks/exhaustive-deps
   const panelBox = "relative w-full rounded-xl overflow-hidden border border-gray-800 bg-black";
   // When a screen-share crop is active the Detected panel shows only that region,
   // so the Live panel has to be blown up and offset to the same region — otherwise
@@ -3569,7 +3656,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
           new is introduced around the ref'd <video>/<canvas>. */}
       <div
         ref={detectedFs.ref}
-        className={!showDetected ? "h-0 overflow-hidden opacity-0" : detectedFs.active ? fsWrapClass : ""}
+        className={!showDetected || phase !== "live" ? "h-0 overflow-hidden opacity-0" : detectedFs.active ? fsWrapClass : ""}
       >
         <div className={panelBox} style={detectedFs.active ? fsBoxStyle(aspect) : { aspectRatio: aspect }}>
           <canvas ref={analyzedRef} className="absolute inset-0 w-full h-full object-contain" />
@@ -4014,11 +4101,59 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
             so Review and Detected end up the same width either way rather than
             Detected staying stuck at 2/3 width with a dead third of a track. */}
         <div dir="ltr" className={showLive ? "grid grid-cols-1 xl:grid-cols-3 gap-4 items-start" : "grid grid-cols-1 xl:grid-cols-2 gap-4 items-start"}>
+          {/* Calibrating: tune the picture and find the crop BEFORE a single
+              frame goes to the model, instead of doing both while live
+              encode/send is already competing for the same CPU. Same grid
+              slot the session-controls column takes in "live" -- only one
+              of the two is ever shown, via the "hidden" class rather than
+              conditional mounting, so nothing here disturbs the <video>/
+              <canvas> refs that livePanel/detectedPanel keep in this same
+              render pass. */}
+          <div dir={pageDir} className={`${phase === "calibrating" ? "" : "hidden"} ${showLive ? "xl:col-span-3" : "xl:col-span-2"}
+                          min-w-0 bg-gray-900/50 border border-emerald-800 rounded-xl p-3 space-y-3`}>
+            <div>
+              <p className="text-sm font-medium text-emerald-300">
+                {t("🎛 Calibrating — tuning the picture and finding the frame")}
+              </p>
+              <p className="text-xs text-gray-500">
+                {t("This runs once, before anything is sent to the AI, so the live session starts at full speed. Review the picture below, then continue.")}
+              </p>
+              {tuneNote && <p className="text-[11px] text-gray-500 font-mono">{tuneNote}</p>}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                onClick={() => procAmpCaps && void runAutoTune(procAmpCaps)}
+                disabled={!procAmpCaps}
+                className="text-xs px-2.5 py-1.5 rounded-md border border-emerald-800 text-emerald-300 hover:border-emerald-600 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {t("↻ Redo auto-tune")}
+              </button>
+              <button
+                onClick={resetFovDetection}
+                className="text-xs px-2.5 py-1.5 rounded-md border border-emerald-800 text-emerald-300 hover:border-emerald-600"
+              >
+                {t("↻ Redo framing")}
+              </button>
+              <button
+                onClick={openRegionSelector}
+                className="text-xs px-2.5 py-1.5 rounded-md border border-gray-700 text-gray-300 hover:border-gray-500"
+              >
+                {manualCrop ? t("Change capture region") : t("Adjust crop manually")}
+              </button>
+            </div>
+            <button
+              onClick={confirmCalibration}
+              className="w-full md:w-auto py-2.5 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-sm transition-colors"
+            >
+              {t("✓ Looks good — start live session")}
+            </button>
+          </div>
+
           {/* Session controls. Pressed between moments rather than read during
               one, so they span the top of the grid instead of sitting on the
               video column -- which is what lets the Detected panel and the
               review lane start at the same height. */}
-          <div dir={pageDir} className={`${showLive ? "xl:col-span-3" : "xl:col-span-2"} min-w-0 bg-gray-900/50 border border-gray-800 rounded-xl p-3
+          <div dir={pageDir} className={`${phase === "live" ? "" : "hidden"} ${showLive ? "xl:col-span-3" : "xl:col-span-2"} min-w-0 bg-gray-900/50 border border-gray-800 rounded-xl p-3
                           flex flex-col md:flex-row md:flex-wrap md:items-center gap-3 [&>*]:min-w-0`}>
             {/* Right at the top of the column — it's pressed mid-procedure, so it
                 should never be somewhere you have to look for or scroll to. */}
