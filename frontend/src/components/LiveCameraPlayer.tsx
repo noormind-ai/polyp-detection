@@ -702,9 +702,18 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // skip straight to "live". Read inside the long-running capture/calibration
   // loops via the ref, which can't see the render that set the state.
   type CalibPhase = "setup" | "calibrating" | "live";
-  const [phase, setPhase] = useState<CalibPhase>(initialMode === "camera" ? "setup" : "live");
+  const [phase, setPhaseState] = useState<CalibPhase>(initialMode === "camera" ? "setup" : "live");
   const phaseRef = useRef<CalibPhase>(phase);
-  useEffect(() => { phaseRef.current = phase; }, [phase]);
+  // Set the ref SYNCHRONOUSLY, here, not via a useEffect mirror. The
+  // calibration loop below calls requestAnimationFrame(tick) in the same
+  // synchronous breath as this state update, and that first tick's very
+  // first line reads phaseRef -- a useEffect's mirror is not guaranteed to
+  // have run by then (effects flush after the state update, on their own
+  // schedule, which can land after the next animation frame). Losing that
+  // race made the first tick see the OLD phase, return immediately without
+  // rescheduling itself, and silently kill calibration forever -- "stuck at
+  // Finding the frame" with nothing after it ever running again.
+  const setPhase = (p: CalibPhase) => { phaseRef.current = p; setPhaseState(p); };
   // "closed" now means closed for good (the component is going away);
   // an unexpected drop is "reconnecting", because it is about to come back.
   const [wsStatus, setWsStatus]           = useState<"connecting" | "open" | "error" | "reconnecting" | "closed">("connecting");
@@ -1612,10 +1621,12 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       }
       // Pure backstop, not the happy path -- see the calibrationReady effect
       // below for how an attended operator (and a kiosk under normal
-      // conditions) actually proceeds. This only fires if something above
-      // never concludes at all (e.g. a signal that never locks), so an
-      // unattended clinic PC still cannot wait forever.
-      if (autoStart && Date.now() - calibStartRef.current > CALIBRATION_AUTOSTART_MS) {
+      // conditions) actually proceeds. Applies to everyone, not just the
+      // kiosk: this only fires if something above never concludes at all
+      // (e.g. a signal that never locks, or a bug neither of us has found
+      // yet) -- nobody should be able to get stuck on this screen forever,
+      // operator or unattended clinic PC alike.
+      if (Date.now() - calibStartRef.current > CALIBRATION_AUTOSTART_MS) {
         confirmCalibration();
         return;
       }
@@ -1654,6 +1665,21 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       setShowFovOverlay(true);
       setEnhOpen(true);
     }
+  }, [phase]);   // eslint-disable-line react-hooks/exhaustive-deps
+
+  // A second, independent backstop -- plain browser setTimeout, not the
+  // requestAnimationFrame tick loop in runCalibrationLoop. That loop had a
+  // bug where its very first tick could read a stale ref and return without
+  // ever rescheduling itself, silently freezing calibration forever with no
+  // way out (see the setPhase comment above for the actual fix). This timer
+  // does not depend on that loop still running at all, so even an
+  // unrelated future freeze on this screen cannot trap anyone past this.
+  useEffect(() => {
+    if (phase !== "calibrating") return;
+    const t = setTimeout(() => {
+      if (phaseRef.current === "calibrating") confirmCalibration();
+    }, CALIBRATION_AUTOSTART_MS + 2000);
+    return () => clearTimeout(t);
   }, [phase]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   // "Start" stays disabled until all three checklist items are true -- no
