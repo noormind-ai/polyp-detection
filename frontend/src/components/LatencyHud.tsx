@@ -152,51 +152,53 @@ export default function LatencyHud({
     // 15 times a second draws the eye it is supposed to stay out of.
     const cell = "inline-flex items-baseline gap-1";
     const num = "tabular-nums min-w-[3.5rem] text-end";
-    // Plain-number fields (recvMs, encodeMs, bytesSent, quality) aren't
-    // Metric objects like rtt/server/fps -- they're a single current value
-    // each, same as the full grid below already treats them.
-    const plainMs = (v?: number | null) => (v != null && v > 0 ? t("{ms} ms", { ms: Math.round(v) }) : "—");
-    const kb = (v?: number | null) => (v != null && v > 0 ? t("{kb} KB", { kb: Math.round(v / 1024 * 10) / 10 }) : "—");
-    const pct = (v?: number | null) => (v != null ? t("{pct}%", { pct: Math.round(v * 100) }) : "—");
+    // This overlay sits over the live picture in BOTH languages -- these
+    // labels and units are deliberately never run through t(). A Farsi
+    // "میلی‌ثانیه" is no faster to read at a glance than "ms", and the whole
+    // point of a compact readout is a glance, not a read.
+    const msEn = (v: number) => (v > 0 ? `${Math.round(v)} ms` : "—");
+    const plainMs = (v?: number | null) => (v != null && v > 0 ? `${Math.round(v)} ms` : "—");
+    const kb = (v?: number | null) => (v != null && v > 0 ? `${Math.round(v / 1024 * 10) / 10} KB` : "—");
+    const pct = (v?: number | null) => (v != null ? `${Math.round(v * 100)}%` : "—");
     return (
       <div
         dir="ltr"
         className={`font-mono text-[11px] leading-4 bg-black/70 backdrop-blur-sm rounded-md border border-gray-700 px-2 py-1 flex items-baseline gap-3 whitespace-nowrap ${className}`}
       >
         <span className={cell}>
-          <span className="text-gray-500">{t("rtt")}</span>
-          <span className={`${num} ${red.rtt ? "text-red-400" : "text-white"}`}>{ms(stats.rtt)}</span>
+          <span className="text-gray-500">rtt</span>
+          <span className={`${num} ${red.rtt ? "text-red-400" : "text-white"}`}>{msEn(stats.rtt.shown)}</span>
         </span>
         <span className={cell}>
-          <span className="text-gray-500">{t("srv")}</span>
-          <span className={`${num} ${red.server ? "text-red-400" : "text-white"}`}>{ms(stats.server)}</span>
+          <span className="text-gray-500">srv</span>
+          <span className={`${num} ${red.server ? "text-red-400" : "text-white"}`}>{msEn(stats.server.shown)}</span>
         </span>
         <span className={cell}>
-          <span className="text-gray-500">{t("rcv")}</span>
+          <span className="text-gray-500">rcv</span>
           <span className={`${num} text-white`}>{plainMs(stats.recvMs)}</span>
         </span>
         <span className={cell}>
-          <span className="text-gray-500">{t("enc")}</span>
+          <span className="text-gray-500">enc</span>
           <span className={`${num} text-white`}>{plainMs(stats.encodeMs)}</span>
         </span>
         <span className={cell}>
-          <span className="text-gray-500">{t("sent")}</span>
+          <span className="text-gray-500">sent</span>
           <span className={`${num} text-white`}>{kb(stats.bytesSent)}</span>
         </span>
         <span className={cell}>
-          <span className="text-gray-500">{t("fps")}</span>
+          <span className="text-gray-500">fps</span>
           <span className={`tabular-nums min-w-[2.5rem] text-end ${red.fps ? "text-red-400" : "text-white"}`}>
             {stats.fps.shown > 0 ? stats.fps.shown.toFixed(1) : "—"}
           </span>
         </span>
         <span className={cell}>
-          <span className="text-gray-500">{t("qual")}</span>
+          <span className="text-gray-500">qual</span>
           <span className={`${num} text-white`}>{pct(stats.quality)}</span>
         </span>
         <span className={cell}>
-          <span className="text-gray-500">{t("res")}</span>
+          <span className="text-gray-500">res</span>
           <span className={`${num} text-white`}>
-            {stats.inferWidth ? t("{width}px", { width: stats.inferWidth }) : "—"}
+            {stats.inferWidth ? `${stats.inferWidth}px` : "—"}
           </span>
         </span>
       </div>

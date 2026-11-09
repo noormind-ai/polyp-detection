@@ -26,21 +26,15 @@ export const FA: Record<string, string> = {
   "The browser blocked the second window. Allow pop-ups for this site and try again.":
     "مرورگر پنجرهٔ دوم را مسدود کرد. برای این سایت پنجره‌های بازشو را مجاز کنید و دوباره تلاش کنید.",
 
-  // --- Latency readout (LatencyHud): the compact overlay's abbreviations are
-  // kept short in both languages on purpose -- it sits over the picture. ---
+  // --- Latency readout (LatencyHud) ---
+  // The compact overlay (fullscreen view, doctor's monitor) is deliberately
+  // NOT translated -- its labels (rtt/srv/rcv/enc/...) and units (ms/KB/%/px)
+  // are plain English literals in LatencyHud.tsx's compact branch, in both
+  // languages, on purpose: it sits over the live picture and has to read at
+  // a glance, and "میلی‌ثانیه" is no faster to glance-read than "ms". Only
+  // the full debug grid below this overlay (the non-compact render) goes
+  // through t() at all.
   "Show latency numbers on the full-screen view": "نمایش اعداد تاخیر روی نمای تمام‌صفحه",
-  "rtt": "رفت‌وبرگشت",
-  "srv": "سرور",
-  "net": "شبکه",
-  "fps": "فریم",
-  "rcv": "دریافت",
-  "enc": "انکود",
-  "sent": "ارسال",
-  "qual": "کیفیت",
-  "res": "وضوح",
-  "{pct}%": "{pct}٪",
-  "{width}px": "{width} پیکسل",
-  "{kb} KB": "{kb} کیلوبایت",
   "Minimum send quality (floor)": "حداقل کیفیت ارسال (کف)",
   "The JPEG quality the picture never drops below, even on a bad uplink. Lower risks a blockier image; higher risks missing the fps floor above instead.":
     "کیفیت JPEG که تصویر هرگز از آن پایین‌تر نمی‌رود، حتی روی یک آپ‌لینک ضعیف. کم کردن آن ریسک تصویر بلوکی‌تر دارد؛ زیاد کردن آن ریسک نرسیدن به کف فریم‌بر‌ثانیهٔ بالا را دارد.",
