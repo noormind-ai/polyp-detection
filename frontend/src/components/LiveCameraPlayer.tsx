@@ -1651,6 +1651,33 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     setShowLive(false);
     setShowFovOverlay(false);
     setEnhOpen(false);
+    // The AI-speed probe's replies go through the SAME ws.onmessage as a
+    // real inferred frame -- there is no tag on the wire saying "this one
+    // was just a timing check" -- so every probe round trip already fed the
+    // rolling rtt/server/net/fps baselines and the AIMD quality controller
+    // (qualityRef), exactly as if it were a real live frame. Sent one at a
+    // time rather than pipelined, a cold probe's round trip reads as a slow
+    // frame to that controller, which reacted (dropping quality) and left
+    // Live starting from numbers shaped by the probe's own different
+    // traffic pattern, not by anything the live loop is actually doing.
+    // Reset everything the probe could have touched to a clean slate right
+    // here, so "the result is thrown away" (see runModelWarmup) is actually
+    // true for the shared connection stats too, not just for boxes/captures.
+    rttBase.current.clear();
+    serverBase.current.clear();
+    netBase.current.clear();
+    fpsBase.current.clear();
+    qualityWindowRef.current.clear();
+    qualityRef.current = QUALITY_MAX;
+    setQualityShown(QUALITY_MAX);
+    msHistory.current = [];
+    rttHistory.current = [];
+    arrivalHistory.current = [];
+    lastArrivalRef.current = 0;
+    sentCountRef.current = 0;
+    receivedCountRef.current = 0;
+    setCur({ rtt: 0, server: 0, net: 0, fps: 0 });
+    setStats({ sent: 0, received: 0, avgMs: 0, rttMs: 0, netMs: 0, fps: 0 });
     startLoop();
   }
 
