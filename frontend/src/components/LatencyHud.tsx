@@ -93,6 +93,11 @@ export interface LatencyStats {
    *  to `quality` so "why is quality low" and "why is fps below what I
    *  asked for" read as the same tradeoff, not two separate mysteries. */
   targetFps?: number | null;
+  /** The width frames are resized to before sending, in pixels. Fixed for
+   *  the life of the session (it's a prop, not a measurement) -- shown so
+   *  "what resolution is this running at" has an answer next to the other
+   *  numbers instead of only in the page's own footer caption. */
+  inferWidth?: number | null;
 }
 
 /** The hard ceiling above which a round trip is a clinical problem rather than
@@ -147,6 +152,12 @@ export default function LatencyHud({
     // 15 times a second draws the eye it is supposed to stay out of.
     const cell = "inline-flex items-baseline gap-1";
     const num = "tabular-nums min-w-[3.5rem] text-end";
+    // Plain-number fields (recvMs, encodeMs, bytesSent, quality) aren't
+    // Metric objects like rtt/server/fps -- they're a single current value
+    // each, same as the full grid below already treats them.
+    const plainMs = (v?: number | null) => (v != null && v > 0 ? t("{ms} ms", { ms: Math.round(v) }) : "—");
+    const kb = (v?: number | null) => (v != null && v > 0 ? t("{kb} KB", { kb: Math.round(v / 1024 * 10) / 10 }) : "—");
+    const pct = (v?: number | null) => (v != null ? t("{pct}%", { pct: Math.round(v * 100) }) : "—");
     return (
       <div
         dir="ltr"
@@ -161,13 +172,31 @@ export default function LatencyHud({
           <span className={`${num} ${red.server ? "text-red-400" : "text-white"}`}>{ms(stats.server)}</span>
         </span>
         <span className={cell}>
-          <span className="text-gray-500">{t("net")}</span>
-          <span className={`${num} ${red.net ? "text-red-400" : "text-white"}`}>{ms(stats.net)}</span>
+          <span className="text-gray-500">{t("rcv")}</span>
+          <span className={`${num} text-white`}>{plainMs(stats.recvMs)}</span>
+        </span>
+        <span className={cell}>
+          <span className="text-gray-500">{t("enc")}</span>
+          <span className={`${num} text-white`}>{plainMs(stats.encodeMs)}</span>
+        </span>
+        <span className={cell}>
+          <span className="text-gray-500">{t("sent")}</span>
+          <span className={`${num} text-white`}>{kb(stats.bytesSent)}</span>
         </span>
         <span className={cell}>
           <span className="text-gray-500">{t("fps")}</span>
           <span className={`tabular-nums min-w-[2.5rem] text-end ${red.fps ? "text-red-400" : "text-white"}`}>
             {stats.fps.shown > 0 ? stats.fps.shown.toFixed(1) : "—"}
+          </span>
+        </span>
+        <span className={cell}>
+          <span className="text-gray-500">{t("qual")}</span>
+          <span className={`${num} text-white`}>{pct(stats.quality)}</span>
+        </span>
+        <span className={cell}>
+          <span className="text-gray-500">{t("res")}</span>
+          <span className={`${num} text-white`}>
+            {stats.inferWidth ? t("{width}px", { width: stats.inferWidth }) : "—"}
           </span>
         </span>
       </div>
