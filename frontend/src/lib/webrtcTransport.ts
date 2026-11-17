@@ -25,7 +25,16 @@ export function startWebrtcSession(opts: {
   let closed = false;
   onStatus("connecting");
 
-  const pc = new RTCPeerConnection();
+  // Without an ICE server, each side only knows its own private-network
+  // address, which is useless across the internet -- especially since the
+  // server itself sits behind its hosting provider's own private network,
+  // not directly on the public internet. A public STUN server is just a
+  // well-known helper that tells each side what it looks like from the
+  // outside; see the matching RTCConfiguration on the server in
+  // backend/routes/webrtc_infer.py.
+  const pc = new RTCPeerConnection({
+    iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+  });
   stream.getVideoTracks().forEach((track) => pc.addTrack(track, stream));
 
   const ws = new WebSocket(wsUrl);

@@ -134,9 +134,17 @@ async def webrtc_infer_stream(websocket: WebSocket):
         await websocket.close()
         return
 
-    from aiortc import RTCPeerConnection, RTCSessionDescription
+    from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
 
-    pc = RTCPeerConnection()
+    # This server sits behind its hosting provider's own private network
+    # (confirmed 2026-11-07: its own NIC reports a 192.168.x address, not a
+    # public one) -- without an ICE server it only ever offers that private
+    # address as a candidate, which the browser has no way to reach. A public
+    # STUN server tells it what it looks like from the outside. Matching
+    # config on the browser side in frontend/src/lib/webrtcTransport.ts.
+    pc = RTCPeerConnection(RTCConfiguration(iceServers=[
+        RTCIceServer(urls="stun:stun.l.google.com:19302"),
+    ]))
     track_task: asyncio.Task | None = None
 
     @pc.on("track")
