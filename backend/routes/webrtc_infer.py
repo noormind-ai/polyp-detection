@@ -20,7 +20,15 @@ import logging
 from fastapi import APIRouter, WebSocket
 
 from backend import auth
-from backend.services import engine
+from backend.services import engine, turn_credentials
+
+# Public address of the TURN relay (coturn) -- same box, same IP this
+# backend already runs on. Overridable so this file doesn't hardcode an IP
+# that could change; see documents/webrtc-implementation-plan.txt for why a
+# relay is needed at all (the hosting provider blocks arbitrary inbound
+# ports; 3478 had to be explicitly opened).
+import os
+TURN_HOST = os.environ.get("TURN_HOST", "31.214.168.29")
 
 log = logging.getLogger("webrtc_infer")
 
@@ -147,15 +155,36 @@ async def webrtc_infer_stream(websocket: WebSocket):
 
     from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
 
-    # This server sits behind its hosting provider's own private network
-    # (confirmed 2026-11-07: its own NIC reports a 192.168.x address, not a
-    # public one) -- without an ICE server it only ever offers that private
-    # address as a candidate, which the browser has no way to reach. A public
-    # STUN server tells it what it looks like from the outside. Matching
-    # config on the browser side in frontend/src/lib/webrtcTransport.ts.
-    pc = RTCPeerConnection(RTCConfiguration(iceServers=[
-        RTCIceServer(urls="stun:stun.l.google.com:19302"),
-    ]))
+    # Short-lived credentials for the self-hosted TURN relay (coturn on this
+    # same box, port 3478 -- opened by the hosting provider 2026-11-17,
+    # confirmed reachable with a real STUN/TURN packet, not just a raw
+    # connect). Generated fresh per connection; sent to the browser as the
+    # FIRST message, before any offer/answer, because the browser's
+    # RTCPeerConnection needs its full iceServers list (including this) at
+    # construction time -- before it starts gathering candidates, not after.
+    # Always exactly one setup message before anything else, so the client
+    # never has to guess whether one is coming -- a deployment with no TURN
+    # configured still sends a plain "ready" so the client isn't left
+    # waiting forever for a message that was never going to arrive.
+    turn = turn_credentials.generate()
+    if turn:
+        await websocket.send_text(json.dumps({"type": "turn", **turn}))
+    else:
+        await websocket.send_text(json.dumps({"type": "ready"}))
+
+    ice_servers = [RTCIceServer(urls="stun:stun.l.google.com:19302")]
+    if turn:
+        ice_servers.append(RTCIceServer(
+            urls=[f"turn:{TURN_HOST}:3478?transport=udp", f"turn:{TURN_HOST}:3478?transport=tcp"],
+            username=turn["username"], credential=turn["password"],
+        ))
+    # Without any ICE server this box only ever offers its own private
+    # address as a candidate (it sits behind its hosting provider's private
+    # network -- confirmed 2026-11-07), which the browser has no way to
+    # reach. STUN alone reports a public address but can't open a door the
+    # provider's firewall has closed for everything except a few fixed
+    # ports -- that's what the TURN entry above is actually for.
+    pc = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
     track_task: asyncio.Task | None = None
 
     @pc.on("track")
