@@ -360,15 +360,11 @@ def _predict(name: str, frame: np.ndarray) -> tuple[list[dict], float]:
     return boxes, infer_ms
 
 
-def _infer_sync(name: str, frame_bytes: bytes) -> tuple[list[dict], float, float, dict | None]:
-    import cv2
-
-    t0 = time.perf_counter()
-    frame = cv2.imdecode(np.frombuffer(frame_bytes, np.uint8), cv2.IMREAD_COLOR)
-    if frame is None:
-        raise ValueError("payload was not a decodable image")
-    decode_ms = (time.perf_counter() - t0) * 1000
-
+def _infer_array_sync(name: str, frame: np.ndarray) -> tuple[list[dict], float, dict | None]:
+    """The part of inference that only needs an already-decoded pixel array --
+    shared by _infer_sync (JPEG bytes in) and infer_array (a frame that's
+    already a pixel array, e.g. from a WebRTC track) so neither path
+    duplicates the gate+_predict call."""
     gate = None
     try:
         from . import frame_gate
@@ -380,9 +376,22 @@ def _infer_sync(name: str, frame_bytes: bytes) -> tuple[list[dict], float, float
     # at the fitted cut this still mutes ~1.7% of frames a doctor called polyp,
     # which is a clinician's call, not a deploy-time default.
     if gate and gate["fired"] and gate["enforce"]:
-        return [], decode_ms, 0.0, gate
+        return [], 0.0, gate
 
     boxes, infer_ms = _predict(name, frame)
+    return boxes, infer_ms, gate
+
+
+def _infer_sync(name: str, frame_bytes: bytes) -> tuple[list[dict], float, float, dict | None]:
+    import cv2
+
+    t0 = time.perf_counter()
+    frame = cv2.imdecode(np.frombuffer(frame_bytes, np.uint8), cv2.IMREAD_COLOR)
+    if frame is None:
+        raise ValueError("payload was not a decodable image")
+    decode_ms = (time.perf_counter() - t0) * 1000
+
+    boxes, infer_ms, gate = _infer_array_sync(name, frame)
     return boxes, decode_ms, infer_ms, gate
 
 
@@ -446,6 +455,23 @@ class _Bound:
 
     async def infer_video(self, video_bytes: bytes) -> dict:
         return await asyncio.to_thread(_infer_video_sync, self.name, video_bytes)
+
+    async def infer_array(self, frame: np.ndarray) -> tuple[list[dict], dict]:
+        """Same as infer_frame, but for a frame that's already a decoded
+        pixel array -- e.g. from aiortc's WebRTC track -- skipping the JPEG
+        encode-then-decode round trip entirely. No quality loss from the
+        extra lossy re-encode, and no CPU spent on a conversion nothing
+        actually needed."""
+        t0 = time.perf_counter()
+        boxes, infer_ms, gate = await asyncio.to_thread(_infer_array_sync, self.name, frame)
+        total_ms = int((time.perf_counter() - t0) * 1000)
+        return boxes, {
+            "modal_ms": total_ms,
+            "decode_ms": 0.0,
+            "cpu_ms": round(infer_ms, 2),
+            "model": self.name,
+            "gate": gate,
+        }
 
 
 def bind(name: str | None) -> _Bound:

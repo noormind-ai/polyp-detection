@@ -43,7 +43,16 @@ def aiortc_available() -> bool:
 
 
 async def _consume_track(track, websocket: WebSocket, eng, user: str) -> None:
-    """Re-encode + infer, one frame at a time, always the LATEST one.
+    """Infer, one frame at a time, always the LATEST one.
+
+    When the engine supports it (local_cpu's _Bound.infer_array — see
+    backend/services/local_cpu.py), the decoded pixel array goes straight to
+    the model: no JPEG re-encode, no second decode, no lossy round trip for
+    data that was never leaving this process anyway. The Modal engine has no
+    such method — its infer_frame() genuinely needs bytes to cross an RPC
+    boundary to a remote GPU container, so for that engine only, frames are
+    re-encoded to JPEG first (the seam this function originally used for
+    every engine).
 
     track.recv() is push-based: frames keep arriving over RTP regardless of
     whether the previous infer_frame() call has returned. A naive
@@ -57,8 +66,6 @@ async def _consume_track(track, websocket: WebSocket, eng, user: str) -> None:
     whatever is in that slot right now, dropping anything that arrived and
     was overwritten while inference was running.
     """
-    import cv2
-
     slot: dict = {"frame": None}
     frame_ready = asyncio.Event()
 
@@ -82,12 +89,16 @@ async def _consume_track(track, websocket: WebSocket, eng, user: str) -> None:
                 continue
 
             img = frame.to_ndarray(format="bgr24")
-            ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            if not ok:
-                continue
 
             try:
-                detections, timing = await eng.infer_frame(buf.tobytes())
+                if hasattr(eng, "infer_array"):
+                    detections, timing = await eng.infer_array(img)
+                else:
+                    import cv2
+                    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    if not ok:
+                        continue
+                    detections, timing = await eng.infer_frame(buf.tobytes())
             except Exception as e:
                 log.error("webrtc frame inference error (user=%s): %s", user, e)
                 await websocket.send_text(json.dumps({"error": str(e)[:200]}))
