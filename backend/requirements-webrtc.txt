@@ -1,0 +1,11 @@
+# Optional. NOT installed by requirements.txt or requirements-cpu.txt, and
+# NOT imported at module load time anywhere in backend/ — only lazily,
+# inside backend/routes/webrtc_infer.py's handler. A deployment that never
+# installs this file is unaffected by the route existing.
+#
+# See documents/webrtc-implementation-plan.txt for why this exists and
+# documents/webrtc-vs-jpeg-streaming.txt for the concept. On noormind-iran
+# specifically, PyPI's own domain is unreachable (US-sanctions-related CDN
+# block, confirmed 2026-11-07) — install via a mirror:
+#   pip install -r backend/requirements-webrtc.txt -i https://mirrors.aliyun.com/pypi/simple/
+aiortc>=1.9.0

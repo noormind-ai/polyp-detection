@@ -1,0 +1,95 @@
+WEBRTC VS JPEG-OVER-WEBSOCKET
+================================
+Status: conceptual only, nothing coded. Rewritten to focus on the real
+problem: on a low-CPU client, JPEG-encoding every frame is itself slow
+enough to make inference choppy -- separate from network latency, which a
+2026-10-11 fix (sending frame N+1 before frame N's reply) already solved.
+
+WebRTC can plausibly help BOTH, for one reason: browsers often have a
+hardware video chip that encodes video for free, but nothing hardware-
+accelerates JPEG. Swapping the encode step is the whole idea below.
+
+
+HOW WEBRTC WORKS, CONCEPTUALLY
+---------------------------------
+- Instead of separate photos, one continuous encoded video stream.
+- The browser's video encoder (hardware chip, when the device has one) does
+  the compressing -- not your JavaScript code, not the JPEG library.
+- Most frames are sent as "what changed since last frame" (small). A full
+  picture is sent only occasionally (a "keyframe"). Cheap because an
+  endoscope image rarely changes much frame to frame.
+- Travels over UDP: a late/lost piece is just dropped, never blocks the
+  frames behind it. (Today's WebSocket is TCP: one lost piece stalls
+  everything queued behind it.)
+- Needs a one-time handshake first ("signaling") so both sides agree how to
+  reach each other, before any video flows.
+
+
+SIDE BY SIDE
+--------------
+TODAY (JPEG over WebSocket):
+
+  capture frame
+      -> draw + deinterlace on a canvas
+      -> JPEG-encode it                      <- the slow CPU step
+      -> send the file over WebSocket (TCP)
+      -> server JPEG-decodes it
+      -> model runs on it
+      -> boxes sent back, same WebSocket
+
+WEBRTC (parallel path, not a replacement):
+
+  capture frame
+      -> draw + deinterlace on a canvas      <- unchanged, still needed
+      -> canvas feeds a continuous video track
+      -> BROWSER'S OWN ENCODER compresses it <- replaces the JPEG step
+      -> sent over a WebRTC connection (UDP)
+      -> server (new: aiortc library) decodes the stream back into frames
+      -> model runs on it -- unchanged
+      -> boxes sent back over the existing WebSocket (kept, now carrying
+         only the handshake + small results, nothing heavy)
+
+
+IF WE BUILD IT: HOW, AS A PARALLEL OPTION
+---------------------------------------------
+Keep today's path as-is and working. Add the new one beside it, picked by a
+toggle -- never a silent swap.
+
+1. Frontend: add an RTCPeerConnection alongside the existing WebSocket.
+   The WebSocket now only carries the handshake and results.
+2. Backend: add aiortc as a second way to receive frames, next to the
+   current JPEG-over-WebSocket handler. Same model code either way.
+3. Test on a sandbox page (same pattern as /sim), not the live clinic flow,
+   with a flag to pick which transport.
+4. Measure: per-frame CPU time on the actual low-CPU client, both ways,
+   before deciding anything.
+
+
+RISKY, COMPACT
+-----------------
+- Checked 2026-11-06 on the actual clinic PC (Intel N100): its integrated
+  GPU does support hardware H.264 encode (Intel Quick Sync), and Chrome is a
+  recent version that uses it by default -- so the chip-level requirement
+  for this to help is met. Not yet confirmed at runtime (would need
+  chrome://webrtc-internals during a live call to see which encoder Chrome
+  actually picked), but the hardware is not the blocker it might have been.
+- aiortc is a heavy native dependency (needs system video libraries
+  compiled in) -- checked 2026-11-06: the Iran server actually has 101GB
+  free (not the ~18GB this note used to say), so disk is not the tight
+  constraint it looked like. Still worth a throwaway-venv test first,
+  since there's no separate machine to try it on instead (see the
+  implementation plan doc).
+- NAT traversal (how two computers find each other through firewalls) can
+  silently fail on this network and needs STUN/TURN infrastructure we don't
+  have yet -- flagged as an operational risk in the earlier ADR, still true.
+  Mitigation in the implementation plan: test real connectivity from the
+  clinic's own network early (before any model code is built on top), and
+  fall back to JPEG automatically if the WebRTC connection never opens.
+- The backend's _stream_frames loop currently treats every frame as fully
+  independent (no memory between frames). A continuous video stream breaks
+  that -- decoding frame 500 needs frames 1-499 to have been decoded first,
+  in order. Real backend rework, not a drop-in swap.
+- Bigger rewrite of the capture pipeline than it looks: the deinterlace
+  step (documents/adr/0006) and the recording path (documents/adr/0009)
+  both currently assume today's draw-then-JPEG flow and would need
+  rechecking, not just the transport code.

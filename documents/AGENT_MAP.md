@@ -114,6 +114,7 @@ not part of the backend above.
 - `POST /spectate/{case_id}/room-stats` — `backend/routes/spectate.py:40`
 - `GET /spectate/rooms` — `backend/routes/spectate.py:73`
 - `WEBSOCKET /ws/spectate/{case_id}` — `backend/routes/spectate.py:86`
+- `WEBSOCKET /ws/webrtc-infer` — `backend/routes/webrtc_infer.py:58`
 - `backend/main.py` — see `@app.get(...)` lines directly
 
 ### Backend modules (top-level def/class)
@@ -121,13 +122,14 @@ not part of the backend above.
 - `backend/accounts.py` — lines 74, 78, 99, 106, 123, 139, 146, 156, 161, 184, 190, 196, 229, 246, 256, 265, 276
 - `backend/auth.py` — lines 85, 102, 113, 131, 149, 158, 176, 187, 191, 223, 248, 253, 260, 306, 329, 377, 394, 398
 - `backend/db.py` — lines 147, 151, 169, 182
-- `backend/main.py` — lines 67
+- `backend/main.py` — lines 68
 - `backend/routes/auth.py` — lines 26, 30, 40, 61, 72, 101, 113, 128, 163, 174
 - `backend/routes/diagnostics.py` — lines 57, 62, 68, 75, 89, 131, 161, 188, 197, 234, 242
 - `backend/routes/feedback.py` — lines 94, 99, 106, 118, 134, 139, 182, 193, 201, 208, 224, 233, 245, 259, 272, 301, 338, 364, 434, 465, 496, 506, 517, 529, 554
 - `backend/routes/infer.py` — lines 43, 63, 70, 81, 91, 119, 133, 146, 158, 178, 242, 340, 360
 - `backend/routes/recordings.py` — lines 96, 101, 106, 111, 121, 131, 135, 143, 157, 207, 264, 320, 344, 364
 - `backend/routes/spectate.py` — lines 30, 41, 74, 87
+- `backend/routes/webrtc_infer.py` — lines 31, 42, 59
 - `backend/scripts/export_manifest.py` — lines 37
 - `backend/scripts/finalize_stale_recordings.py` — lines 89, 101, 117, 155, 168, 172
 - `backend/scripts/migrate_manifest_to_sqlite.py` — lines 47, 53, 60, 71
@@ -154,7 +156,7 @@ not part of the backend above.
 - `frontend/src/app/layout.tsx` — lines 7, 11
 - `frontend/src/app/login/page.tsx` — lines 46
 - `frontend/src/app/model-comparison/page.tsx` — lines 19
-- `frontend/src/app/page.tsx` — lines 162
+- `frontend/src/app/page.tsx` — lines 163
 - `frontend/src/app/sim/page.tsx` — lines 16
 - `frontend/src/app/spectator/[caseId]/page.tsx` — lines 114
 - `frontend/src/app/spectator/page.tsx` — lines 24
@@ -169,16 +171,16 @@ not part of the backend above.
 - `frontend/src/components/FilterBankNotice.tsx` — lines 63
 - `frontend/src/components/GpuStatusBar.tsx` — lines 22
 - `frontend/src/components/InBodyGateNotice.tsx` — lines 12
-- `frontend/src/components/LatencyHud.tsx` — lines 68
-- `frontend/src/components/LiveCameraPlayer.tsx` — lines 358
+- `frontend/src/components/LatencyHud.tsx` — lines 135
+- `frontend/src/components/LiveCameraPlayer.tsx` — lines 402
 - `frontend/src/components/LoginPanel.tsx` — lines 28
 - `frontend/src/components/ModelComparison.tsx` — lines 42
 - `frontend/src/components/ModelPerformance.tsx` — lines 20
 - `frontend/src/components/OnScreenKeyboard.tsx` — lines 26
 - `frontend/src/components/QualityGateNotice.tsx` — lines 33
 - `frontend/src/components/RealtimePlayer.tsx` — lines 132
-- `frontend/src/components/RecordingControls.tsx` — lines 25, 34, 55
-- `frontend/src/components/RecordingRecoveryBanner.tsx` — lines 30
+- `frontend/src/components/RecordingControls.tsx` — lines 27, 36, 57
+- `frontend/src/components/RecordingRecoveryBanner.tsx` — lines 33
 - `frontend/src/components/RecordingsPanel.tsx` — lines 48
 - `frontend/src/components/ReplaySurface.tsx` — lines 39
 - `frontend/src/components/ReviewCallout.tsx` — lines 28
@@ -188,12 +190,13 @@ not part of the backend above.
 - `frontend/src/components/TemporalGateNotice.tsx` — lines 30
 - `frontend/src/components/TutorialsPanel.tsx` — lines 21
 - `frontend/src/components/UploadPanel.tsx` — lines 14
+- `frontend/src/components/UploadQueueStatus.tsx` — lines 29
 - `frontend/src/components/VideoPlayer.tsx` — lines 26
 - `frontend/src/components/WarmupPanel.tsx` — lines 27
 - `frontend/src/lib/alertEpisodeGate.ts` — lines 31
 - `frontend/src/lib/alertSound.ts` — lines 38
 - `frontend/src/lib/auth.tsx` — lines 123, 281
-- `frontend/src/lib/cameraMode.ts` — lines 55, 101, 126, 297
+- `frontend/src/lib/cameraMode.ts` — lines 55, 101, 126, 307
 - `frontend/src/lib/clinicDiagnostic.ts` — lines 25, 32, 686
 - `frontend/src/lib/deinterlaceGL.ts` — lines 33, 176
 - `frontend/src/lib/drawBoxes.ts` — lines 10
@@ -204,7 +207,7 @@ not part of the backend above.
 - `frontend/src/lib/frameQuality.ts` — lines 45, 53, 55, 130, 184
 - `frontend/src/lib/frameRing.ts` — lines 57, 61, 73
 - `frontend/src/lib/gateDefaults.ts` — lines 26
-- `frontend/src/lib/i18n.tsx` — lines 14, 64
+- `frontend/src/lib/i18n.tsx` — lines 14, 79
 - `frontend/src/lib/inBody.ts` — lines 113, 191, 230, 372
 - `frontend/src/lib/interlace.ts` — lines 57, 70, 118, 187
 - `frontend/src/lib/modelResults.ts` — lines 84, 12526, 12527, 12530, 12531, 12532
@@ -213,6 +216,7 @@ not part of the backend above.
 - `frontend/src/lib/temporal.ts` — lines 33, 40, 53, 56, 72
 - `frontend/src/lib/translations.ts` — lines 3
 - `frontend/src/lib/uploadCoordinator.ts` — lines 31, 46
+- `frontend/src/lib/uploadRegistry.ts` — lines 44, 52, 60, 65, 69, 108
 - `frontend/src/lib/useAlertSound.ts` — lines 23, 24, 29, 30, 45
 - `frontend/src/lib/useDoctorWindow.ts` — lines 51, 57, 122, 143, 255, 262
 - `frontend/src/lib/useDurationFix.ts` — lines 13
@@ -220,7 +224,7 @@ not part of the backend above.
 - `frontend/src/lib/useInBodyGate.ts` — lines 47
 - `frontend/src/lib/useQualityGate.ts` — lines 47
 - `frontend/src/lib/useRollingClip.ts` — lines 18
-- `frontend/src/lib/useSessionRecorder.ts` — lines 55, 65, 66, 70, 78, 85, 204, 217
+- `frontend/src/lib/useSessionRecorder.ts` — lines 57, 67, 68, 72, 80, 87, 99, 100, 104, 112, 244, 257
 - `frontend/src/lib/useTemporalGate.ts` — lines 28
 
 ### Inference (separate Modal deploy)

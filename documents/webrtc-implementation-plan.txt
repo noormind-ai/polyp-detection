@@ -1,0 +1,164 @@
+WEBRTC IMPLEMENTATION PLAN
+=============================
+Status: approved 2026-11-06, now being built. This builds on
+documents/webrtc-vs-jpeg-streaming.txt (the concept) -- read that first if
+you haven't; this file is about HOW to build it, not WHAT it is.
+
+Correction from the first draft of this file: the real live-clinic camera
+path is LiveCameraPlayer.tsx, not RealtimePlayer.tsx (that one is the
+file-replay/demo player). This matters because the ordering guarantee from
+documents/adr/0007-one-frame-in-flight.md actually lives in
+LiveCameraPlayer.tsx -- so porting WebRTC into the real clinic flow (step 6
+below) touches that file specifically.
+
+
+DECISIONS, SETTLED
+---------------------
+- Results stay on the existing per-connection WebSocket, never moved to a
+  WebRTC data channel -- simpler, no reason to touch a second channel for
+  tiny JSON.
+- There is no separate dev/test machine. noormind-iran (Linux) is the only
+  box that matches the real target environment, so step 1 (the aiortc
+  install) happens there directly, inside a throwaway venv -- isolation
+  comes from the venv, not from different hardware.
+- NAT/UDP reliability on Iran's network is expected to be a real risk, not
+  proven safe -- treated as something to test early and work around
+  (automatic fallback to JPEG if the connection never opens), not a
+  blocker that stops the plan.
+- The eventual on-screen toggle lives where a live camera session starts
+  (asks which transport, JPEG default), and both transports report
+  latency in the same slot/units on screen so they're actually comparable.
+
+
+THE SAFETY RULE THIS PLAN FOLLOWS
+-------------------------------------
+Every step below is written so that a session where the new mode is OFF
+runs through the exact same code as today, untouched. That's done by:
+
+  - Backend: a brand-new WebSocket route (/ws/webrtc-infer), not a flag
+    inside the existing one. The existing per-frame JPEG handler
+    (_stream_frames in backend/routes/infer.py) is never edited.
+  - Backend: aiortc is imported lazily, only inside the new route's
+    handler -- a server that never installs it is unaffected. This copies
+    the exact pattern backend/services/engine.py already uses for making
+    the `modal` package optional.
+  - Frontend: the new transport is new functions in CaptureSimulator.tsx
+    (the /sim sandbox), picked by a toggle that defaults OFF and is never
+    remembered in storage.
+
+
+MENTAL MODEL: WHAT ACTUALLY RUNS, STEP BY STEP
+--------------------------------------------------
+  MODE OFF (today, unchanged):
+    capture -> deinterlace on canvas -> JPEG-encode -> send bytes on the
+    WebSocket -> backend decodes JPEG -> model -> boxes back, same socket
+
+  MODE ON (new):
+    capture -> deinterlace on canvas (same step, reused)
+       -> canvas becomes a live video feed (captureStream())
+       -> a new "peer connection" is created
+       -> ONE-TIME HANDSHAKE over a NEW, separate WebSocket (/ws/webrtc-infer)
+          -- "here's how to reach me," not video data yet
+       -> video then flows over the peer connection itself, a separate
+          pipe from any WebSocket
+       -> backend (new: aiortc) pulls frames out of that pipe, one at a
+          time, in order, via a single-slot "latest wins" mailbox so a
+          slow inference never lets frames pile up
+       -> each frame is re-encoded to JPEG bytes and handed to the SAME
+          infer_frame() function used today -- model code is untouched
+       -> boxes go back over that same new WebSocket, same JSON shape
+          {"boxes":..., "timing":...} the JPEG path already uses -- so the
+          part of the frontend that draws boxes needs no changes
+
+
+IMPLEMENTATION PLAN, IN ORDER
+---------------------------------
+Each step is checked before the next. Nothing touches the real clinic
+page until step 6, and the real systemd service until step 7.
+
+0. DONE 2026-11-07, on noormind-iran directly (no separate machine
+   exists): a throwaway venv (~/webrtc-spike), `pip install aiortc`.
+   Hit a real snag worth recording: plain `pip install aiortc` failed
+   twice, and it wasn't a slow-connection problem -- direct testing
+   (curl -v against pypi.org) showed the connection opens fine but then
+   zero bytes ever come back, while github.com and non-US PyPI mirrors
+   (Aliyun, Tsinghua) all worked instantly. This matches PyPI's known
+   US-sanctions-related blocking of Iranian traffic via its CDN (Fastly)
+   -- not something this server's network is doing wrong, and not
+   specific to aiortc. FIX: install via a mirror --
+   `pip install -i https://mirrors.aliyun.com/pypi/simple/ aiortc`.
+   Worked cleanly: all 13 packages (aiortc + deps incl. the 35MB `av`
+   wheel) installed in under a minute, `from aiortc import
+   RTCPeerConnection` succeeds, and the whole venv is only 173MB (disk
+   went from 101GB to 100GB free -- never a real constraint). Any future
+   `pip install` on this server needs `-i
+   https://mirrors.aliyun.com/pypi/simple/` for the same reason --
+   worth remembering for requirements-webrtc.txt's own install step
+   later, and for anything else installed on this box going forward.
+   `rm -rf ~/webrtc-spike` undoes this step completely; the live backend
+   was never touched.
+
+1. Backend: new file backend/routes/webrtc_infer.py, a /ws/webrtc-infer
+   route. Receives one SDP offer, replies with an answer, counts/logs
+   incoming video frames -- no model yet. Registered in backend/main.py
+   next to the other routes. This is also the first real test of the
+   NAT/UDP risk: if a browser on the clinic's actual network can't even
+   open this connection, that's learned here, cheaply, before any model
+   code sits on top of it.
+
+2. Frontend: in CaptureSimulator.tsx (/sim), a transport toggle, a real
+   RTCPeerConnection, canvas.captureStream() feeding it from the same
+   canvas the paint loop already draws to. Signaling goes over a new
+   WebSocket to /api/ws/webrtc-infer. A 5-second connect timeout falls
+   back to a clear "WebRTC unavailable, use JPEG" message instead of
+   hanging.
+
+3. Backend: on each received frame, decode -> re-encode to JPEG -> call
+   the existing, unmodified infer_frame() (same function the JPEG path
+   calls) -> reply with the same {"boxes","timing"} shape. A single-slot
+   mailbox (not a queue) between the receive loop and the inference call
+   reproduces today's MAX_IN_FLIGHT=1 behavior, now on the backend.
+
+4. Frontend: CaptureSimulator.tsx's existing result-handling code (parse
+   boxes, scale, draw) already doesn't care which transport produced the
+   data -- lift it into one named function, call it from both the JPEG
+   and the WebRTC socket's onmessage.
+
+5. Measure, on the actual clinic PC, not a dev machine: browser's own
+   getStats() encode-time numbers (authoritative, hardware or software,
+   no guessing) next to the existing JPEG CPU readout; cross-check
+   chrome://webrtc-internals for which encoder Chrome actually picked;
+   Task Manager CPU% for the Chrome process, same clip, toggle flipped
+   both ways. Show both transports' latency in the same on-screen slot --
+   JPEG's number is exact, WebRTC's is a best-effort approximation, but
+   labelled the same way so they're genuinely comparable.
+   DECISION GATE: only continue past here if the CPU win on the real
+   hardware is big enough to justify what comes next.
+
+6. Only if 5 justifies it: port into the real live-camera flow
+   (LiveCameraPlayer.tsx). Ask which transport when a live session
+   starts; fall back to JPEG automatically on a failed WebRTC connection.
+   The hard part here isn't the ordering guarantee (that survives if the
+   backend's mailbox from step 3 stays serial) -- it's that today's client
+   pairs an exact canvas snapshot with the request that produced it, so
+   boxes are drawn on, filed against, and recorded from the exact frame
+   sent. WebRTC's encoder pulls frames on its own schedule, so there's no
+   exact snapshot to pair with a reply anymore -- needs a timestamped ring
+   of recent snapshots, matched to a reply by closest timestamp, which is
+   a real approximation and a real behavior change for auto-capture and
+   the review timeline, not a transparent swap.
+
+7. Only after 6 is solid: install the real requirements-webrtc.txt into
+   the live polyp-backend systemd service's venv (not the step-0 throwaway
+   one), restart, smoke-test that the existing JPEG path still works
+   exactly as before.
+
+
+OPEN ITEMS STILL WORTH A PLAIN ANSWER
+-----------------------------------------
+1. Exact-frame correlation in step 6 is a real behavior change (best-effort
+   match, not exact) -- worth confirming that's acceptable for
+   auto-capture/recording before it's built, not after.
+2. Trickle ICE was skipped for v1 to keep the signaling protocol smaller --
+   revisit only if step 1's real-network test shows connect time itself is
+   a problem, separate from whether it connects at all.

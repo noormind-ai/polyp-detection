@@ -26,6 +26,7 @@ import { drawBoxes, type Box } from "@/lib/drawBoxes";
 import { createGLEnhancer, type GLEnhancer } from "@/lib/enhanceGL";
 import { createGLDeinterlacer, DEINT_MODES, type GLDeinterlacer, type DeintMode } from "@/lib/deinterlaceGL";
 import { JpegEncoder } from "@/lib/jpegEncoder";
+import { startWebrtcSession, type WebrtcSession, type WebrtcStatus } from "@/lib/webrtcTransport";
 import { readProcAmpCaps, readProcAmpValues, measureLevels, autoTuneProcAmp,
          type ProcAmpCaps, type Levels } from "@/lib/procAmp";
 import { useFullscreen, fsWrapClass, fsExitBtnClass, fsBoxStyle } from "@/lib/useFullscreen";
@@ -445,6 +446,17 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // page.tsx's openMode resolves after this component is already mounted.
   const uplinkMbpsRef = useRef(uplinkMbps);
   useEffect(() => { uplinkMbpsRef.current = uplinkMbps; }, [uplinkMbps]);
+  // Experimental parallel transport (see documents/webrtc-implementation-plan.txt):
+  // WebRTC's own video encoder instead of per-frame JPEG, picked once at
+  // session start -- never mid-session, never persisted to storage, so a
+  // past test can't silently turn itself on later. v1 scope, confirmed with
+  // the operator 2026-11-07: auto-capture and recording are disabled (not
+  // approximated) while this is active -- see startLoopWebRTC below.
+  const [transport, setTransport] = useState<"jpeg" | "webrtc">("jpeg");
+  const transportRef = useRef(transport);
+  useEffect(() => { transportRef.current = transport; }, [transport]);
+  const webrtcSessionRef = useRef<WebrtcSession | null>(null);
+  const [webrtcStatus, setWebrtcStatus] = useState<WebrtcStatus | null>(null);
   /** Drop the current socket so it comes straight back on the current URL.
    *  Set by the socket effect; used when the case id rotates. */
   const reopenSocketRef = useRef<(() => void) | null>(null);
@@ -1678,7 +1690,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     receivedCountRef.current = 0;
     setCur({ rtt: 0, server: 0, net: 0, fps: 0 });
     setStats({ sent: 0, received: 0, avgMs: 0, rttMs: 0, netMs: 0, fps: 0 });
-    startLoop();
+    beginLoop();
   }
 
   // The whole point of calibrating is to look at the tuned picture and the
@@ -2925,7 +2937,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     if (!video) return;
     await armWindow(video);
     await video.play().catch(() => {});
-    startLoop();
+    beginLoop();
   }
 
   /** Stop and hold on the current frame. The inference loop keeps grabbing that
@@ -3198,6 +3210,88 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     }
   }
 
+  /** Parallel to startLoop(): the same picture pipeline up to the
+   *  deinterlaced canvas, but the canvas is handed to the browser's own
+   *  video encoder via captureStream() instead of being JPEG-encoded and
+   *  sent by hand. Boxes come back as the same {"boxes","timing"} JSON
+   *  startLoop() already draws, just over the new signaling socket.
+   *
+   *  Unlike startLoop(), there is no exact pairing between a drawn frame and
+   *  the reply describing it -- the encoder pulls frames on its own
+   *  schedule. drawAnalyzedFrame always uses the latest known boxes
+   *  (lastBoxesRef), redrawn every animation frame. auto-capture and
+   *  recording need an exact frame to file/record against, so they are
+   *  deliberately not called from this path at all in v1 -- see the toggle
+   *  in the status bar for the on-screen note, and
+   *  documents/webrtc-implementation-plan.txt for why. */
+  async function startLoopWebRTC() {
+    if (scanRef.current) return;
+    scanRef.current = true;
+
+    const canvas = document.createElement("canvas");
+
+    const draw = () => {
+      if (!scanRef.current) return;
+      const video = videoRef.current;
+      if (!video || !video.videoWidth) {
+        requestAnimationFrame(draw);
+        return;
+      }
+      sampleFov(video);
+      sampleInterlace(video);
+      const { x: srcX, y: srcY, w: srcW, h: srcH } = sourceRect(video);
+      setAspect(`${srcW}/${srcH}`);
+      const scale = inferWidth / srcW;
+      const capW = inferWidth;
+      const capH = Math.round(srcH * scale);
+      if (canvas.width !== capW || canvas.height !== capH) {
+        canvas.width = capW;
+        canvas.height = capH;
+      }
+      if (capH * 2 >= srcH) {
+        drawDeinterlaced(video, srcX, srcY, srcW, srcH, canvas, capW, capH);
+      } else {
+        canvas.getContext("2d")!.drawImage(video, srcX, srcY, srcW, srcH, 0, 0, capW, capH);
+      }
+      drawAnalyzedFrame(canvas, canvas, lastBoxesRef.current);
+      requestAnimationFrame(draw);
+    };
+    requestAnimationFrame(draw);
+
+    const stream = canvas.captureStream(30);
+    const wsUrl = `${API_WS}/api/ws/webrtc-infer?case_id=${encodeURIComponent(caseIdRef.current)}`
+      + (backend ? `&backend=${encodeURIComponent(backend)}` : "");
+    webrtcSessionRef.current = startWebrtcSession({
+      wsUrl,
+      stream,
+      onStatus: setWebrtcStatus,
+      onResult: (data) => {
+        const d = data as { boxes?: Box[]; timing?: Timing; error?: string };
+        if (d.error || !d.boxes) return;
+        const shown = temporal.filter(d.boxes.filter((b) => b.conf >= confMinRef.current));
+        updateBoxes(shown);
+      },
+    });
+  }
+
+  function stopLoopWebRTC() {
+    webrtcSessionRef.current?.close();
+    webrtcSessionRef.current = null;
+    setWebrtcStatus(null);
+  }
+
+  /** The single choke point every startLoop() call site now goes through --
+   *  picks the transport in effect for THIS session, checked once at start.
+   *  Switching transport mid-session isn't supported; the status-bar toggle
+   *  is disabled while streaming, on purpose. */
+  function beginLoop() {
+    if (transportRef.current === "webrtc") {
+      void startLoopWebRTC();
+    } else {
+      void startLoop();
+    }
+  }
+
   const DEVICE_KEY = "polyp_camera_device_id";
   const DEVICE_LABEL_KEY = "polyp_camera_device_label";
 
@@ -3461,7 +3555,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       // covers the seconds asked for and nothing ahead of them.
       await armWindow(video);
 
-      startLoop();
+      beginLoop();
     } catch (err: unknown) {
       setStreaming(false);
       setDemoFile(null);
@@ -3531,7 +3625,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       switchCaptureMode("screen");
       setCameraBusy(false);
       setStreaming(true);
-      startLoop();
+      beginLoop();
 
       // Guide straight into region selection — a shared window/screen usually has toolbars/UI
       // chrome around the actual video, so cropping right away is part of the normal flow here.
@@ -3659,6 +3753,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
 
   function stopCamera() {
     scanRef.current = false;
+    stopLoopWebRTC(); // no-op if this session never used the WebRTC transport
     // Close the recording before killing the tracks: stop() flushes the final
     // slice, and a recorder whose source has already died has nothing to flush.
     recorderRef.current.stop();
@@ -4207,6 +4302,31 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
           {captureMode === "local" && localFile && (
             <span className="text-xs px-2 py-0.5 rounded-md border border-purple-800 bg-purple-950/40 text-purple-300">
               {t("Your clip: {name}", { name: localFile.name })}
+            </span>
+          )}
+          {/* Experimental parallel transport -- pick before starting, not
+              mid-session (disabled while streaming). See
+              documents/webrtc-implementation-plan.txt. */}
+          <button
+            onClick={() => setTransport(transport === "jpeg" ? "webrtc" : "jpeg")}
+            disabled={streaming}
+            title={t("Experimental: sends video via WebRTC instead of per-frame JPEG. Auto-capture and recording turn off while this is active. Pick before starting.")}
+            className={`${toggleBtn} ${transport === "webrtc" ? "text-emerald-400 border-emerald-700" : ""} ${streaming ? "opacity-40 cursor-not-allowed" : ""}`}
+          >
+            {t("Transport: {mode}", { mode: transport === "webrtc" ? "WebRTC" : "JPEG" })}
+          </button>
+          {transport === "webrtc" && (
+            <span className="text-xs px-2 py-0.5 rounded-md border border-amber-800 bg-amber-950/40 text-amber-300">
+              {t("WebRTC mode: auto-capture & recording are off")}
+            </span>
+          )}
+          {transport === "webrtc" && webrtcStatus && (
+            <span className={`text-xs px-2 py-0.5 rounded-md border ${
+              webrtcStatus === "open" ? "border-emerald-800 bg-emerald-950/40 text-emerald-300"
+              : webrtcStatus === "connecting" ? "border-gray-700 bg-gray-900/40 text-gray-400"
+              : "border-red-800 bg-red-950/40 text-red-300"
+            }`}>
+              {t("WebRTC: {status}", { status: webrtcStatus })}
             </span>
           )}
           {/* Tier 3 — the same control the spectator view gets, over the same
