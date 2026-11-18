@@ -22,13 +22,19 @@ from fastapi import APIRouter, WebSocket
 from backend import auth
 from backend.services import engine, turn_credentials
 
-# Public address of the TURN relay (coturn) -- same box, same IP this
-# backend already runs on. Overridable so this file doesn't hardcode an IP
-# that could change; see documents/webrtc-implementation-plan.txt for why a
-# relay is needed at all (the hosting provider blocks arbitrary inbound
-# ports; 3478 had to be explicitly opened).
+# The address THIS PROCESS uses to reach the TURN relay (coturn, same box).
+# Deliberately the box's PRIVATE address, not its public one -- confirmed by
+# direct testing 2026-11-18: a process can't reliably reach its own public
+# IP from inside the same machine (a routing quirk called hairpin NAT; many
+# providers' networks don't support it), even though that exact IP is fully
+# reachable from the outside. A direct aioice.turn.create_turn_endpoint()
+# call against the public IP timed out with zero log entries on coturn's
+# side; the identical call against the private IP succeeded immediately.
+# The BROWSER's TURN address is unaffected by this -- it's genuinely
+# external, so it keeps using the public host (derived from the page's own
+# URL in frontend/src/lib/webrtcTransport.ts, not this constant).
 import os
-TURN_HOST = os.environ.get("TURN_HOST", "31.214.168.29")
+TURN_HOST_INTERNAL = os.environ.get("TURN_HOST_INTERNAL", "192.168.158.12")
 
 log = logging.getLogger("webrtc_infer")
 
@@ -174,8 +180,13 @@ async def webrtc_infer_stream(websocket: WebSocket):
 
     ice_servers = [RTCIceServer(urls="stun:stun.l.google.com:19302")]
     if turn:
+        # aiortc only ever uses the first turn: URL it finds for a given
+        # RTCIceServer (confirmed by reading aiortc's own source,
+        # rtcicetransport.py's connection_kwargs) -- one plain UDP URL is
+        # enough here. TURN_HOST_INTERNAL, not a public address: this
+        # connection is this same box talking to its own TURN relay.
         ice_servers.append(RTCIceServer(
-            urls=[f"turn:{TURN_HOST}:3478?transport=udp", f"turn:{TURN_HOST}:3478?transport=tcp"],
+            urls=f"turn:{TURN_HOST_INTERNAL}:3478",
             username=turn["username"], credential=turn["password"],
         ))
     # Without any ICE server this box only ever offers its own private
