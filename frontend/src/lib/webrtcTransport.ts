@@ -17,18 +17,36 @@ export type WebrtcStatus = "connecting" | "open" | "closed" | "error" | "timeout
 
 export type WebrtcResult = { boxes?: unknown; timing?: unknown; error?: string };
 
+/** Numbers the browser itself measured -- not derived, not guessed.
+ *  encodeMsPerFrame comes straight from getStats()'s outbound-rtp report
+ *  (totalEncodeTime/framesEncoded, delta since the last poll): this is the
+ *  actual answer to "does WebRTC's encoder cost less CPU than JPEG",
+ *  whichever encoder Chrome actually picked, hardware or software.
+ *  rttMs comes from the active ICE candidate pair's own currentRoundTripTime
+ *  -- a real measurement, but a smoothed one updated once per poll, not an
+ *  exact per-frame number the way JPEG mode's RTT is (see the comment at
+ *  the call site in LiveCameraPlayer.tsx for why that's an accepted,
+ *  disclosed difference rather than a hidden one). */
+export type WebrtcStats = { encodeMsPerFrame: number; rttMs: number };
+
 export type WebrtcSession = { close: () => void };
+
+const STATS_POLL_MS = 1000;
 
 export function startWebrtcSession(opts: {
   wsUrl: string;
   stream: MediaStream;
   onResult: (data: WebrtcResult) => void;
   onStatus: (status: WebrtcStatus) => void;
+  onStats?: (stats: WebrtcStats) => void;
   connectTimeoutMs?: number;
 }): WebrtcSession {
-  const { wsUrl, stream, onResult, onStatus, connectTimeoutMs = 5000 } = opts;
+  const { wsUrl, stream, onResult, onStatus, onStats, connectTimeoutMs = 5000 } = opts;
   let closed = false;
   let pc: RTCPeerConnection | null = null;
+  let statsTimer: ReturnType<typeof setInterval> | null = null;
+  let lastEncodeTime = 0;
+  let lastFramesEncoded = 0;
   onStatus("connecting");
 
   const ws = new WebSocket(wsUrl);
@@ -68,6 +86,7 @@ export function startWebrtcSession(opts: {
       if (pc.connectionState === "connected") {
         clearTimeout(timeoutId);
         onStatus("open");
+        if (onStats && !statsTimer) statsTimer = setInterval(() => void pollStats(), STATS_POLL_MS);
       } else if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
         onStatus("error");
       }
@@ -105,9 +124,35 @@ export function startWebrtcSession(opts: {
   ws.onerror = () => { if (!closed) onStatus("error"); };
   ws.onclose = () => { if (!closed) onStatus("closed"); };
 
+  async function pollStats() {
+    if (closed || !pc || !onStats) return;
+    const report = await pc.getStats();
+    let encodeMsPerFrame = 0;
+    let rttMs = 0;
+    report.forEach((stat) => {
+      if (stat.type === "outbound-rtp" && stat.kind === "video") {
+        const totalEncodeTime = stat.totalEncodeTime as number | undefined;
+        const framesEncoded = stat.framesEncoded as number | undefined;
+        if (typeof totalEncodeTime === "number" && typeof framesEncoded === "number") {
+          const dTime = totalEncodeTime - lastEncodeTime;
+          const dFrames = framesEncoded - lastFramesEncoded;
+          if (dFrames > 0) encodeMsPerFrame = (dTime / dFrames) * 1000;
+          lastEncodeTime = totalEncodeTime;
+          lastFramesEncoded = framesEncoded;
+        }
+      } else if (stat.type === "candidate-pair" && (stat as { state?: string }).state === "succeeded"
+        && (stat as { nominated?: boolean }).nominated) {
+        const rtt = (stat as { currentRoundTripTime?: number }).currentRoundTripTime;
+        if (typeof rtt === "number") rttMs = rtt * 1000;
+      }
+    });
+    onStats({ encodeMsPerFrame, rttMs });
+  }
+
   function close() {
     closed = true;
     clearTimeout(timeoutId);
+    if (statsTimer) clearInterval(statsTimer);
     try { ws.close(); } catch { /* already closed */ }
     try { pc?.close(); } catch { /* already closed */ }
   }

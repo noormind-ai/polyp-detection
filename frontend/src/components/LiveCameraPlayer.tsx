@@ -3265,11 +3265,72 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       wsUrl,
       stream,
       onStatus: setWebrtcStatus,
+      // Same refs/state the JPEG path (ws.onmessage) populates, reused
+      // as-is -- the numbers land in the exact same HUD slots so the two
+      // transports are directly comparable, not two different-shaped
+      // readouts. What's genuinely different between the two modes is
+      // called out below at each field, not hidden.
       onResult: (data) => {
         const d = data as { boxes?: Box[]; timing?: Timing; error?: string };
         if (d.error || !d.boxes) return;
         const shown = temporal.filter(d.boxes.filter((b) => b.conf >= confMinRef.current));
         updateBoxes(shown);
+        if (!d.timing) return;
+
+        // gate isn't in the Timing type (same as the JPEG path's ws.onmessage,
+        // which reads it off the raw message the same way, not off Timing).
+        const g = (data as { timing?: { gate?: GateState } }).timing?.gate;
+        if (g) setGate(g);
+        onActivity?.();
+
+        // Server inference time: exact, identical computation to the JPEG
+        // path -- the server reports its own processing time the same way
+        // regardless of transport.
+        msHistory.current.push(d.timing.modal_ms);
+        if (msHistory.current.length > 10) msHistory.current.shift();
+        const avg = Math.round(msHistory.current.reduce((a, b) => a + b, 0) / msHistory.current.length);
+
+        // fps: exact here too -- purely the gap between arriving results,
+        // which doesn't depend on anything JPEG-specific.
+        receivedCountRef.current += 1;
+        const nowMs = performance.now();
+        if (lastArrivalRef.current) {
+          arrivalHistory.current.push(nowMs - lastArrivalRef.current);
+          if (arrivalHistory.current.length > 20) arrivalHistory.current.shift();
+        }
+        lastArrivalRef.current = nowMs;
+        const avgGap = arrivalHistory.current.length
+          ? arrivalHistory.current.reduce((a, b) => a + b, 0) / arrivalHistory.current.length
+          : 0;
+        const liveFps = avgGap > 0 ? Math.round((1000 / avgGap) * 10) / 10 : 0;
+        const curFps = avgGap > 0 ? 1000 / avgGap : 0;
+
+        serverBase.current.push(d.timing.modal_ms);
+        if (curFps > 0) fpsBase.current.push(curFps);
+        setStats((s) => ({ ...s, received: s.received + 1, avgMs: avg, fps: liveFps }));
+        setCur((c) => ({ ...c, server: d.timing!.modal_ms, fps: curFps }));
+      },
+      // rtt/net here are NOT the exact per-frame number the JPEG path shows
+      // (there's no single frame a reply can be timed against once the
+      // browser's own encoder is sending continuously) -- this is the
+      // browser's own getStats() reporting the active connection's
+      // round-trip time, a real measurement, just a smoothed one updated
+      // once a second rather than per frame. encodeMsPerFrame is the actual
+      // number this whole feature was built to answer: what the browser's
+      // encoder costs, hardware or software, whichever Chrome picked.
+      onStats: ({ encodeMsPerFrame, rttMs }) => {
+        encodeMsRef.current = encodeMsPerFrame;
+        if (rttMs > 0) {
+          // serverBase.current.mean, not the cur state: this callback's
+          // closure is created once at session start, so reading cur.server
+          // here would always see whatever it was at that moment, never
+          // later updates -- the rolling tracker is a ref, always current.
+          const net = Math.max(0, rttMs - (serverBase.current.mean || 0));
+          rttBase.current.push(rttMs);
+          netBase.current.push(net);
+          setStats((s) => ({ ...s, rttMs: Math.round(rttMs), netMs: Math.round(net) }));
+          setCur((c) => ({ ...c, rtt: rttMs, net }));
+        }
       },
     });
   }
