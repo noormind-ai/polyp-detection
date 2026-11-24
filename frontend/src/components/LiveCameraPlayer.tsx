@@ -469,7 +469,9 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // past test can't silently turn itself on later. v1 scope, confirmed with
   // the operator 2026-11-07: auto-capture and recording are disabled (not
   // approximated) while this is active -- see startLoopWebRTC below.
-  const [transport, setTransport] = useState<"jpeg" | "webrtc">("jpeg");
+  // WebRTC is the default since 2026-11-24; it falls back to JPEG by itself
+  // if the connection can't be made (webrtcRecovery.ts "fallback").
+  const [transport, setTransport] = useState<"jpeg" | "webrtc">("webrtc");
   const transportRef = useRef(transport);
   useEffect(() => { transportRef.current = transport; }, [transport]);
   const webrtcSessionRef = useRef<WebrtcSession | null>(null);
