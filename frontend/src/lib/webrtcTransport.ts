@@ -49,7 +49,7 @@ export type WebrtcStats = { encodeMsPerFrame: number; rttMs: number };
 
 export type WebrtcSession = {
   close: () => void;
-  /** Send a control message (record / capture). False if the socket isn't open. */
+  /** Send a control message (record / capture). False if not connected yet (or between reconnects) -- callers retry. */
   send: (msg: object) => boolean;
 };
 
@@ -134,7 +134,7 @@ function openAttempt(opts: SessionOpts, emit: (e: AttemptEvent) => void): Attemp
     try {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      await waitForIceGatheringComplete(pc);
+      await waitForUsableCandidates(pc);
       if (closed) return;
       ws.send(JSON.stringify({ type: "offer", sdp: pc.localDescription!.sdp }));
     } catch {
@@ -211,15 +211,38 @@ function openAttempt(opts: SessionOpts, emit: (e: AttemptEvent) => void): Attemp
   return { close, send };
 }
 
-function waitForIceGatheringComplete(pc: RTCPeerConnection): Promise<void> {
+/** How long to wait for candidate gathering before sending the offer anyway. */
+const GATHER_MAX_MS = 3000;
+/** After the first relay (TURN) candidate, wait this much more for siblings. */
+const GATHER_AFTER_RELAY_MS = 500;
+
+/** Wait until the offer has candidates worth sending -- NOT until gathering
+ *  is "complete". Measured on noormind-iran 2026-11-24: with Google's STUN
+ *  server listed, Chrome reports "complete" only after ~40 s (it waits out
+ *  STUN requests that never get an answer), although the useful candidates
+ *  arrive in under 0.1 s. Waiting for "complete" made every attempt miss
+ *  its connect deadline. So: done at "complete", or shortly after the first
+ *  relay candidate (the one that actually gets through the server's
+ *  firewall), or at GATHER_MAX_MS -- whichever comes first. The offer then
+ *  carries whatever was gathered so far (non-trickle signaling, so nothing
+ *  found later is ever sent -- acceptable, the relay is the path we use). */
+function waitForUsableCandidates(pc: RTCPeerConnection): Promise<void> {
   if (pc.iceGatheringState === "complete") return Promise.resolve();
   return new Promise((resolve) => {
-    const check = () => {
-      if (pc.iceGatheringState === "complete") {
-        pc.removeEventListener("icegatheringstatechange", check);
-        resolve();
-      }
+    let relayTimer: ReturnType<typeof setTimeout> | null = null;
+    const done = () => {
+      pc.removeEventListener("icegatheringstatechange", onState);
+      pc.removeEventListener("icecandidate", onCandidate);
+      clearTimeout(maxTimer);
+      if (relayTimer) clearTimeout(relayTimer);
+      resolve();
     };
-    pc.addEventListener("icegatheringstatechange", check);
+    const onState = () => { if (pc.iceGatheringState === "complete") done(); };
+    const onCandidate = (e: RTCPeerConnectionIceEvent) => {
+      if (e.candidate?.type === "relay" && !relayTimer) relayTimer = setTimeout(done, GATHER_AFTER_RELAY_MS);
+    };
+    const maxTimer = setTimeout(done, GATHER_MAX_MS);
+    pc.addEventListener("icegatheringstatechange", onState);
+    pc.addEventListener("icecandidate", onCandidate);
   });
 }

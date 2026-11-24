@@ -111,6 +111,17 @@ The watchdog only counts while the browser's encoder is actually producing
 frames (from `getStats()`). A background tab stops drawing the canvas, so no
 frames are sent and no results are expected — that must not trigger rebuilds.
 
+### Don't wait for candidate gathering to "complete"
+
+Before sending its offer the browser gathers candidate addresses. Measured
+on noormind-iran (2026-11-24): with Google's STUN server listed, Chrome
+reports gathering "complete" only after **~40 s** — it waits out STUN
+requests that never get an answer — although the useful candidates arrive
+in under 0.1 s. Waiting for "complete" made every attempt miss its 10 s
+connect deadline, so no connection (first or rebuilt) could ever open in
+time. The offer is now sent once a relay candidate has arrived (+0.5 s for
+siblings), or after 3 s at most.
+
 ### Why no ICE restart
 
 ICE is the "find a working route" step. The textbook rung between Wait and
@@ -141,9 +152,39 @@ Server-side recording (WebRTC mode) belongs to one connection. On a rebuild:
 
 Accepted cost: a gap of a few seconds, and two recording files instead of one.
 
+Two races, found by the live test (2026-11-24), that reconnects made common:
+
+- **Command before offer.** The server treats the first message after its
+  setup message as the offer and closes (1002) on anything else. The
+  auto-recorder's "start" could get there first and kill a fresh
+  connection. Fixed in parallel by commit 3c243cc: control commands wait
+  until the answer is applied (the recorder retries on its next frame),
+  and the server now skips anything before the offer instead of closing.
+- **Disconnect during a recording start.** The start runs in a worker
+  thread; a disconnect at that moment cancelled the handler before the
+  recording was registered, so cleanup missed it and it stayed
+  "recording" forever with 0 s of video. Cleanup now waits for a pending
+  start and closes it.
+
+## 4. How it was tested
+
+- Unit tests, fake clock: `node --test "frontend/tests/*.test.ts"` — every
+  rung, backoff and jitter, fallback counting, stale events, close().
+- Live, on noormind-iran against a throwaway backend + dev frontend (never
+  production), headless Chrome with a fake camera; script kept at
+  `~/e2e/wrtc_recovery.js` on that box. Results, 2026-11-24:
+
+  | Scenario | What was broken | Boxes back after |
+  |---|---|---|
+  | restart | backend killed for 15 s | 8–23 s after it returned (depends where in the backoff it lands) |
+  | freeze | backend frozen (SIGSTOP) 20 s | ~4 s after it resumed |
+  | pipe | video pipe forced to `failed` | ~4 s |
+  | fallback | video can never connect | JPEG mode took over after ~45 s, with on-screen notice |
+
+
 ---
 
-## 4. Sources
+## 5. Sources
 
 - BlogGeek, ICE restart — https://bloggeek.me/webrtcglossary/ice-restart/
 - RTMA, connection recovery & ICE restart —
