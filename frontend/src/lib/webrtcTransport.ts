@@ -61,6 +61,12 @@ export function startWebrtcSession(opts: {
 }): WebrtcSession {
   const { wsUrl, stream, onResult, onStatus, onStats, onControl, connectTimeoutMs = 5000 } = opts;
   let closed = false;
+  // True once the server's answer is applied. Control messages (record,
+  // capture) are held back until then: the server reads the FIRST message
+  // after setup as the offer, and auto-record can fire before the offer is
+  // sent (the offer waits for ICE gathering). Sending "record start" first
+  // made the server drop the connection -- the "WebRTC: closed/timeout" race.
+  let negotiated = false;
   let pc: RTCPeerConnection | null = null;
   let statsTimer: ReturnType<typeof setInterval> | null = null;
   let lastEncodeTime = 0;
@@ -130,7 +136,7 @@ export function startWebrtcSession(opts: {
         // without this file being updated to match.
         void handleSetupMessage(data);
       } else if (data.type === "answer") {
-        void pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
+        void pc.setRemoteDescription({ type: "answer", sdp: data.sdp }).then(() => { negotiated = true; });
       } else if (data.type === "recording" || data.type === "captured") {
         onControl?.(data);
       } else {
@@ -178,7 +184,7 @@ export function startWebrtcSession(opts: {
   }
 
   function send(msg: object): boolean {
-    if (closed || ws.readyState !== WebSocket.OPEN) return false;
+    if (closed || !negotiated || ws.readyState !== WebSocket.OPEN) return false;
     try { ws.send(JSON.stringify(msg)); return true; } catch { return false; }
   }
 

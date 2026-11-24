@@ -321,12 +321,17 @@ async def webrtc_infer_stream(websocket: WebSocket):
         log.info("webrtc connection state: %s (user=%s)", pc.connectionState, user)
 
     try:
-        raw = await websocket.receive_text()
-        msg = json.loads(raw)
-        if msg.get("type") != "offer":
-            await websocket.send_text(json.dumps({"error": "expected an offer"}))
-            await websocket.close(code=1002)
-            return
+        # The first message that matters is the offer. Anything else before
+        # it (a record/capture command from a client that sent too early) is
+        # skipped, not fatal: rejecting it used to drop the whole connection,
+        # which is what made WebRTC mode fail to connect most of the time
+        # once auto-record could fire before the offer went out.
+        while True:
+            msg = json.loads(await websocket.receive_text())
+            if msg.get("type") == "offer":
+                break
+            log.warning("webrtc: ignoring %r received before the offer (user=%s)",
+                        msg.get("type"), user)
 
         await pc.setRemoteDescription(RTCSessionDescription(sdp=msg["sdp"], type="offer"))
         answer = await pc.createAnswer()
