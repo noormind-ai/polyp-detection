@@ -13,7 +13,7 @@ load_dotenv(Path(__file__).parent / ".env")
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from backend import auth, db
-from backend.routes import auth as auth_routes, diagnostics, infer, feedback, recordings, spectate, webrtc_infer
+from backend.routes import auth as auth_routes, diagnostics, infer, feedback, recordings, spectate, status, webrtc_infer
 
 # File logger — writes to logs/backend.log, rotates at 5 MB, keeps 3 files
 Path("logs").mkdir(exist_ok=True)
@@ -23,6 +23,11 @@ handler = logging.handlers.RotatingFileHandler(
 handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(name)s — %(message)s"))
 logging.getLogger().addHandler(handler)
 logging.getLogger().setLevel(logging.INFO)
+# uvicorn's loggers don't propagate to the root logger, so without this every
+# unhandled exception (the "Exception in ASGI application" tracebacks) went to
+# the systemd journal only and never reached backend.log or the /status page.
+# Not uvicorn.access: per-request lines would drown everything else.
+logging.getLogger("uvicorn.error").addHandler(handler)
 
 # Suppress Modal's internal gRPC / hpack debug noise
 for noisy in ("hpack", "grpc", "modal", "h2", "httpx", "httpcore"):
@@ -62,6 +67,7 @@ app.include_router(recordings.router, prefix="/api")
 app.include_router(spectate.router, prefix="/api")
 app.include_router(diagnostics.router, prefix="/api")
 app.include_router(webrtc_infer.router, prefix="/api")
+app.include_router(status.router, prefix="/api")
 
 
 @app.get("/health")
