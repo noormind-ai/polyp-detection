@@ -110,6 +110,9 @@ class _Session:
         self.websocket = websocket
         self.user = user
         self.recording = None  # webrtc_recorder.ServerRecording while one is open
+        # (recording, future) while a start is still running in its worker
+        # thread -- see _handle_record and the cleanup in webrtc_infer_stream.
+        self.starting: tuple | None = None
         self.frame_no = 0
         # frame number -> (bgr image, recording id or None, offset in it)
         self.ring: "collections.OrderedDict[int, tuple]" = collections.OrderedDict()
@@ -371,6 +374,16 @@ async def webrtc_infer_stream(websocket: WebSocket):
             track_task.cancel()
         # A dropped connection must not leave a recording open forever: close
         # it now. Its metadata says why, so the next incident is readable.
+        if sess.starting is not None:
+            # A start was cut off by the disconnect: let it finish, then close it.
+            starting, fut = sess.starting
+            sess.starting = None
+            try:
+                await fut
+                if sess.recording is None:
+                    sess.recording = starting
+            except Exception:
+                pass  # it failed to start: nothing to close
         if sess.recording is not None and not sess.recording.stopped:
             rec, sess.recording = sess.recording, None
             await asyncio.to_thread(rec.stop, "disconnect")
@@ -403,15 +416,26 @@ async def _handle_record(sess: _Session, msg: dict) -> None:
         else:
             source = msg.get("source") if msg.get("source") in ("camera", "screen") else "camera"
             rec = ServerRecording(str(msg.get("case_id", "")), sess.user, source)
+            # Track the start while it runs. If the connection drops now, this
+            # handler is cancelled mid-await, but the thread still creates the
+            # recording; the connection's cleanup must find it and stop it, or
+            # it stays "recording" forever with 0 s of video (seen in the
+            # 2026-11-24 reconnect e2e run). shield: the start itself is never
+            # abandoned half-done.
+            fut = asyncio.ensure_future(asyncio.to_thread(rec.start))
+            sess.starting = (rec, fut)
             try:
-                await asyncio.to_thread(rec.start)
+                await asyncio.shield(fut)
             except HTTPException as e:
+                sess.starting = None
                 await sess.send({"type": "recording", "state": "error", "error": str(e.detail)})
                 return
             except Exception as e:
+                sess.starting = None
                 log.exception("server recording failed to start (user=%s)", sess.user)
                 await sess.send({"type": "recording", "state": "error", "error": str(e)[:200]})
                 return
+            sess.starting = None
             sess.recording = rec
             log.info("server recording %s started (user=%s, case=%s)", rec.id, sess.user, rec.case_id)
     elif rec is None or rec.stopped:
