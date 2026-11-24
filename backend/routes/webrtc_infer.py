@@ -45,6 +45,11 @@ router = APIRouter()
 # per frame but still shows up quickly in the log.
 FRAME_LOG_EVERY = 30
 
+# Close code when the video pipe has failed for good: tells the browser
+# "rebuild", as distinct from 1011 ("this server can't do WebRTC at all",
+# which makes the browser fall back to JPEG instead of retrying).
+WS_CLOSE_PIPE_FAILED = 4000
+
 # Inferred frames kept, newest last, so the browser can ask "file frame #N"
 # and get the exact picture its boxes were computed on -- the browser never
 # has that frame itself in this mode. At the ~10 fps the CPU engine infers,
@@ -319,6 +324,16 @@ async def webrtc_infer_stream(websocket: WebSocket):
     @pc.on("connectionstatechange")
     async def on_state_change():
         log.info("webrtc connection state: %s (user=%s)", pc.connectionState, user)
+        # "failed" never heals (and aiortc can't ICE-restart). Close the
+        # socket so the browser rebuilds at once instead of waiting for its
+        # own timers, and so the finally-block below finalizes the recording
+        # now rather than holding it open on a dead pipe. See
+        # documents/design/webrtc-connection-recovery.md.
+        if pc.connectionState == "failed":
+            try:
+                await websocket.close(code=WS_CLOSE_PIPE_FAILED)
+            except Exception:
+                pass  # already closing
 
     try:
         # The first message that matters is the offer. Anything else before

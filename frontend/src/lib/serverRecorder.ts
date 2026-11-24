@@ -38,6 +38,10 @@ export type ServerRecorder = RecorderLike & {
   /** Feed the `rec` field of each inference result: where that frame sits. */
   noteMark: (rec: { id?: string; offset_ms?: number } | undefined) => void;
   snapshot: () => ServerRecSnapshot;
+  /** The connection was rebuilt (webrtcRecovery.ts): the server already
+   *  finalized the old recording as "disconnect" and will never reply about
+   *  it. Forget it, so the auto-record rules start a fresh one. */
+  reset: () => void;
 };
 
 export function createServerRecorder(opts: {
@@ -130,5 +134,10 @@ export function createServerRecorder(opts: {
       }
     },
     snapshot: () => snap,
+    reset() {
+      wanted = "idle";
+      blocked = false;
+      set({ state: "idle", recordingId: null, offsetMs: 0, error: null });
+    },
   };
 }

@@ -467,6 +467,13 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   useEffect(() => { transportRef.current = transport; }, [transport]);
   const webrtcSessionRef = useRef<WebrtcSession | null>(null);
   const [webrtcStatus, setWebrtcStatus] = useState<WebrtcStatus | null>(null);
+  // Set when WebRTC gave up mid-session and this session switched itself to
+  // JPEG (webrtcRecovery.ts's "fallback"); shown so the switch isn't silent.
+  const [webrtcFellBack, setWebrtcFellBack] = useState(false);
+  // Bumped to stop one WebRTC draw loop without touching scanRef -- the
+  // JPEG fallback starts its own loop (scanRef true again) in the same tick,
+  // and the old loop must not keep drawing alongside it.
+  const webrtcLoopGenRef = useRef(0);
   // Picked before starting, like the transport itself; persisted per browser
   // so the clinic PC keeps its choice. See WEBRTC_WIDTHS.
   const [webrtcWidth, setWebrtcWidthState] = useState<number>(() => {
@@ -3315,12 +3322,14 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     stopLoopWebRTC();
     scanRef.current = true;
     webrtcInsideRef.current = true;
+    setWebrtcFellBack(false);
+    const gen = ++webrtcLoopGenRef.current;
     let lastGateAt = 0;
 
     const canvas = document.createElement("canvas");
 
     const draw = () => {
-      if (!scanRef.current) return;
+      if (!scanRef.current || gen !== webrtcLoopGenRef.current) return;
       const video = videoRef.current;
       if (!video || !video.videoWidth) {
         requestAnimationFrame(draw);
@@ -3367,7 +3376,23 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     webrtcSessionRef.current = startWebrtcSession({
       wsUrl,
       stream,
-      onStatus: setWebrtcStatus,
+      // The session heals itself (lib/webrtcRecovery.ts, design in
+      // documents/design/webrtc-connection-recovery.md); this only shows it,
+      // and acts on the one outcome it can't handle alone: giving up.
+      onStatus: (status) => {
+        setWebrtcStatus(status);
+        if (status === "fallback") fallBackToJpeg();
+      },
+      // A fresh connection replaced a lost one. The server already closed
+      // the old recording ("disconnect") and its frame numbers mean nothing
+      // on the new connection -- forget both, so auto-record starts a new
+      // file and no capture asks the new server for an old frame.
+      onReconnected: () => {
+        serverRecRef.current?.reset();
+        webrtcPendingRef.current.clear();
+        webrtcFrameRef.current = null;
+        lastArrivalRef.current = 0; // the outage gap is not an fps sample
+      },
       onControl: (data) => {
         if (data.type === "recording") serverRecRef.current?.onServerMessage(data as Parameters<ServerRecorder["onServerMessage"]>[0]);
         else if (data.type === "captured") void onWebrtcCaptured(data);
@@ -3477,6 +3502,19 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     webrtcSessionRef.current?.close();
     webrtcSessionRef.current = null;
     setWebrtcStatus(null);
+  }
+
+  /** WebRTC gave up (several reconnects in a row never connected, or the
+   *  server can't do WebRTC): carry on in JPEG mode, which reconnects forever
+   *  by itself. Same camera, same case; only the transport changes. */
+  function fallBackToJpeg() {
+    webrtcLoopGenRef.current += 1; // stop the WebRTC draw loop
+    stopLoopWebRTC();
+    scanRef.current = false;
+    transportRef.current = "jpeg";
+    setTransport("jpeg");
+    setWebrtcFellBack(true);
+    void startLoop();
   }
 
   /** The single choke point every startLoop() call site now goes through --
@@ -4529,13 +4567,19 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
               ))}
             </select>
           )}
-          {transport === "webrtc" && webrtcStatus && (
+          {transport === "webrtc" && webrtcStatus && webrtcStatus !== "closed" && (
             <span className={`text-xs px-2 py-0.5 rounded-md border ${
               webrtcStatus === "open" ? "border-emerald-800 bg-emerald-950/40 text-emerald-300"
               : webrtcStatus === "connecting" ? "border-gray-700 bg-gray-900/40 text-gray-400"
+              : webrtcStatus === "reconnecting" ? "border-amber-800 bg-amber-950/40 text-amber-300"
               : "border-red-800 bg-red-950/40 text-red-300"
             }`}>
-              {t("WebRTC: {status}", { status: webrtcStatus })}
+              {t("WebRTC: {status}", { status: t(webrtcStatus) })}
+            </span>
+          )}
+          {webrtcFellBack && transport === "jpeg" && (
+            <span className="text-xs px-2 py-0.5 rounded-md border border-amber-800 bg-amber-950/40 text-amber-300">
+              {t("WebRTC kept failing, switched to JPEG")}
             </span>
           )}
           {/* Tier 3 — the same control the spectator view gets, over the same

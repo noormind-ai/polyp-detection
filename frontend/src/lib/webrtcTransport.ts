@@ -13,7 +13,12 @@
  *  JPEG path already uses.
  */
 
-export type WebrtcStatus = "connecting" | "open" | "closed" | "error" | "timeout";
+import { superviseWebrtc, type Attempt, type AttemptEvent, type RecoveryInfo, type RecoveryStatus } from "./webrtcRecovery";
+
+/** Status of the whole WebRTC session (every reconnect attempt together) --
+ *  see webrtcRecovery.ts. "fallback" = gave up on WebRTC; switch to JPEG. */
+export type WebrtcStatus = RecoveryStatus;
+export type { RecoveryInfo as WebrtcStatusInfo };
 
 export type WebrtcResult = {
   boxes?: unknown; timing?: unknown; error?: string;
@@ -50,16 +55,33 @@ export type WebrtcSession = {
 
 const STATS_POLL_MS = 1000;
 
-export function startWebrtcSession(opts: {
+type SessionOpts = {
   wsUrl: string;
   stream: MediaStream;
   onResult: (data: WebrtcResult) => void;
-  onStatus: (status: WebrtcStatus) => void;
+  onStatus: (status: WebrtcStatus, info: RecoveryInfo) => void;
   onStats?: (stats: WebrtcStats) => void;
   onControl?: (data: WebrtcControl) => void;
-  connectTimeoutMs?: number;
-}): WebrtcSession {
-  const { wsUrl, stream, onResult, onStatus, onStats, onControl, connectTimeoutMs = 5000 } = opts;
+  /** A fresh connection replaced a lost one: the server-side session
+   *  (recording, frame numbers) of the old one is gone. */
+  onReconnected?: () => void;
+};
+
+/** A self-healing WebRTC session: reconnects on its own after any drop
+ *  (webrtcRecovery.ts decides when), until close() or "fallback". */
+export function startWebrtcSession(opts: SessionOpts): WebrtcSession {
+  return superviseWebrtc({
+    connect: (emit) => openAttempt(opts, emit),
+    onStatus: opts.onStatus,
+    onReconnected: opts.onReconnected,
+  });
+}
+
+/** ONE connection attempt: a WebSocket plus one RTCPeerConnection. Never
+ *  retries by itself -- it reports what happens to it through `emit`, and
+ *  the supervisor throws it away and opens a new one when needed. */
+function openAttempt(opts: SessionOpts, emit: (e: AttemptEvent) => void): Attempt {
+  const { wsUrl, stream, onResult, onStats, onControl } = opts;
   let closed = false;
   // True once the server's answer is applied. Control messages (record,
   // capture) are held back until then: the server reads the FIRST message
@@ -71,18 +93,8 @@ export function startWebrtcSession(opts: {
   let statsTimer: ReturnType<typeof setInterval> | null = null;
   let lastEncodeTime = 0;
   let lastFramesEncoded = 0;
-  onStatus("connecting");
 
   const ws = new WebSocket(wsUrl);
-
-  // No connection within this window -> tell the caller so it can fall back
-  // to JPEG rather than leaving the session looking like it's still trying.
-  const timeoutId = setTimeout(() => {
-    if (!closed && pc?.connectionState !== "connected") {
-      onStatus("timeout");
-      close();
-    }
-  }, connectTimeoutMs);
 
   async function handleSetupMessage(data: { type: string; username?: string; password?: string }) {
     // Without any ICE server this box only ever offers its own
@@ -107,12 +119,15 @@ export function startWebrtcSession(opts: {
     stream.getVideoTracks().forEach((track) => pc!.addTrack(track, stream));
     pc.onconnectionstatechange = () => {
       if (closed || !pc) return;
-      if (pc.connectionState === "connected") {
-        clearTimeout(timeoutId);
-        onStatus("open");
-        if (onStats && !statsTimer) statsTimer = setInterval(() => void pollStats(), STATS_POLL_MS);
-      } else if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
-        onStatus("error");
+      const state = pc.connectionState;
+      if (state === "connected") {
+        // Always polled, not only when the caller wants stats: the
+        // watchdog needs framesEncoded to tell "sending but no answer"
+        // from "nothing to send" (a background tab).
+        if (!statsTimer) statsTimer = setInterval(() => void pollStats(), STATS_POLL_MS);
+        emit({ kind: "pipe", state: "connected" });
+      } else if (state === "disconnected" || state === "failed") {
+        emit({ kind: "pipe", state });
       }
     };
 
@@ -120,9 +135,10 @@ export function startWebrtcSession(opts: {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       await waitForIceGatheringComplete(pc);
+      if (closed) return;
       ws.send(JSON.stringify({ type: "offer", sdp: pc.localDescription!.sdp }));
     } catch {
-      onStatus("error");
+      if (!closed) emit({ kind: "pipe", state: "failed" });
     }
   }
 
@@ -130,13 +146,16 @@ export function startWebrtcSession(opts: {
     try {
       const data = JSON.parse(ev.data as string);
       if (!data) return;
+      emit({ kind: "message" });
       if (!pc) {
         // First message: the setup step above (turn/ready) -- anything
         // else here would mean the server's signaling order changed
         // without this file being updated to match.
         void handleSetupMessage(data);
       } else if (data.type === "answer") {
-        void pc.setRemoteDescription({ type: "answer", sdp: data.sdp }).then(() => { negotiated = true; });
+        pc.setRemoteDescription({ type: "answer", sdp: data.sdp })
+          .then(() => { negotiated = true; })
+          .catch(() => { if (!closed) emit({ kind: "pipe", state: "failed" }); });
       } else if (data.type === "recording" || data.type === "captured") {
         onControl?.(data);
       } else {
@@ -147,11 +166,12 @@ export function startWebrtcSession(opts: {
     }
   };
 
-  ws.onerror = () => { if (!closed) onStatus("error"); };
-  ws.onclose = () => { if (!closed) onStatus("closed"); };
+  ws.onopen = () => { if (!closed) emit({ kind: "ws-open" }); };
+  // onerror is always followed by onclose; one report is enough.
+  ws.onclose = (ev) => { if (!closed) emit({ kind: "ws-closed", code: ev.code }); };
 
   async function pollStats() {
-    if (closed || !pc || !onStats) return;
+    if (closed || !pc) return;
     const report = await pc.getStats();
     let encodeMsPerFrame = 0;
     let rttMs = 0;
@@ -165,6 +185,7 @@ export function startWebrtcSession(opts: {
           if (dFrames > 0) encodeMsPerFrame = (dTime / dFrames) * 1000;
           lastEncodeTime = totalEncodeTime;
           lastFramesEncoded = framesEncoded;
+          emit({ kind: "frames", encoded: framesEncoded });
         }
       } else if (stat.type === "candidate-pair" && (stat as { state?: string }).state === "succeeded"
         && (stat as { nominated?: boolean }).nominated) {
@@ -172,12 +193,11 @@ export function startWebrtcSession(opts: {
         if (typeof rtt === "number") rttMs = rtt * 1000;
       }
     });
-    onStats({ encodeMsPerFrame, rttMs });
+    onStats?.({ encodeMsPerFrame, rttMs });
   }
 
   function close() {
     closed = true;
-    clearTimeout(timeoutId);
     if (statsTimer) clearInterval(statsTimer);
     try { ws.close(); } catch { /* already closed */ }
     try { pc?.close(); } catch { /* already closed */ }
