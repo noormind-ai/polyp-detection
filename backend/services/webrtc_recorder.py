@@ -57,6 +57,26 @@ def _even(n: int) -> int:
     return max(2, n - (n % 2))
 
 
+# Largest side a browser-declared recording size may have.
+MAX_DECLARED_SIDE = 4096
+
+
+def recording_size(declared, frame_w: int, frame_h: int) -> tuple:
+    """Size to open the encoder at. The browser's declared send size when it
+    gave a sane one, else the first frame's. Chrome usually OPENS a WebRTC
+    stream below the size it was given (e.g. 640x360 for 960x540) and only
+    climbs to it seconds later; sizing the file to that first frame locked
+    whole recordings at the reduced size (seen 2026-11-24)."""
+    if isinstance(declared, (tuple, list)) and len(declared) == 2:
+        try:
+            w, h = int(declared[0]), int(declared[1])
+        except (TypeError, ValueError):
+            w = h = 0
+        if 2 <= w <= MAX_DECLARED_SIDE and 2 <= h <= MAX_DECLARED_SIDE:
+            return _even(w), _even(h)
+    return _even(frame_w), _even(frame_h)
+
+
 class ServerRecording:
     """One recording. Lifecycle: start() -> push()/pause()/resume() -> stop().
 
@@ -64,8 +84,10 @@ class ServerRecording:
     the same meaning as useSessionRecorder's mark() in the browser path, so a
     capture's video_offset_ms seeks to the right moment either way."""
 
-    def __init__(self, case_id: str, user: str, source: str, transport: str = "webrtc"):
+    def __init__(self, case_id: str, user: str, source: str, transport: str = "webrtc",
+                 size=None):
         self.case_id = case_id
+        self.size = size  # (w, h) the browser says it sends; see recording_size
         self.user = user
         self.source = source
         self.transport = transport
@@ -164,7 +186,7 @@ class ServerRecording:
                     break
                 frame, offset = item
                 if container is None:
-                    w, h = _even(frame.width), _even(frame.height)
+                    w, h = recording_size(self.size, frame.width, frame.height)
                     container = av.open(str(path), mode="w", format="mp4", options={
                         "movflags": "frag_keyframe+empty_moov+default_base_moof"})
                     stream = container.add_stream("libx264", rate=30)

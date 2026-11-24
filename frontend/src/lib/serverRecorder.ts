@@ -50,6 +50,10 @@ export function createServerRecorder(opts: {
    *  while one session stays open (see onCaseEnd in LiveCameraPlayer). */
   caseId: () => string;
   source: () => "camera" | "screen";
+  /** The picture size the browser sends, read at start time. The server
+   *  sizes the recording to it rather than to the first frame it receives,
+   *  which Chrome usually sends smaller while the connection ramps up. */
+  size?: () => { w: number; h: number } | null;
   onChange: (s: ServerRecSnapshot) => void;
   onComplete?: () => void;
 }): ServerRecorder {
@@ -72,7 +76,9 @@ export function createServerRecorder(opts: {
     start() {
       if (blocked || wanted !== "idle") return;
       wanted = "recording";
-      if (opts.send({ type: "record", action: "start", case_id: opts.caseId(), source: opts.source() })) {
+      const size = opts.size?.() ?? null;
+      if (opts.send({ type: "record", action: "start", case_id: opts.caseId(), source: opts.source(),
+                      ...(size ? { w: size.w, h: size.h } : {}) })) {
         set({ state: "starting", error: null, offsetMs: 0 });
       } else {
         wanted = "idle";

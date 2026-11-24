@@ -417,7 +417,8 @@ async def _handle_record(sess: _Session, msg: dict) -> None:
             rec.resume()
         else:
             source = msg.get("source") if msg.get("source") in ("camera", "screen") else "camera"
-            rec = ServerRecording(str(msg.get("case_id", "")), sess.user, source)
+            rec = ServerRecording(str(msg.get("case_id", "")), sess.user, source,
+                                  size=(msg.get("w"), msg.get("h")))
             # Track the start while it runs. If the connection drops now, this
             # handler is cancelled mid-await, but the thread still creates the
             # recording; the connection's cleanup must find it and stop it, or

@@ -494,6 +494,8 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     window.localStorage.setItem(WEBRTC_WIDTH_KEY, String(w));
   };
   const webrtcWidthRef = useRef(webrtcWidth);
+  // Size the WebRTC loop is currently sending; the server sizes recordings to it.
+  const webrtcSendSizeRef = useRef<{ w: number; h: number } | null>(null);
   useEffect(() => { webrtcWidthRef.current = webrtcWidth; }, [webrtcWidth]);
   // WebRTC mode records on the SERVER, which already receives the video (see
   // lib/serverRecorder.ts). Non-null only while a WebRTC session is open;
@@ -3331,6 +3333,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     scanRef.current = true;
     webrtcInsideRef.current = true;
     setWebrtcFellBack(false);
+    webrtcSendSizeRef.current = null; // set by the first draw of this loop
     const gen = ++webrtcLoopGenRef.current;
     let lastGateAt = 0;
 
@@ -3352,6 +3355,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       if (canvas.width !== capW || canvas.height !== capH) {
         canvas.width = capW;
         canvas.height = capH;
+        webrtcSendSizeRef.current = { w: capW, h: capH };
       }
       if (capH * 2 >= srcH) {
         drawDeinterlaced(video, srcX, srcY, srcW, srcH, canvas, capW, capH);
@@ -3491,6 +3495,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       send: (msg) => session.send(msg),
       caseId: () => caseIdRef.current,
       source: () => (captureModeRef.current === "screen" ? "screen" : "camera"),
+      size: () => webrtcSendSizeRef.current,
       onChange: setServerRec,
       onComplete: () => setShowRecordings(true),
     });
