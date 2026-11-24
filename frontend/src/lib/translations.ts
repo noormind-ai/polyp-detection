@@ -820,6 +820,7 @@ export const FA: Record<string, string> = {
   "Picture size sent over WebRTC -- also the size of the saved video and captures. Bigger is sharper but uses more of the clinic's upload. Pick before starting.":
     "اندازهٔ تصویری که با WebRTC فرستاده می‌شود — اندازهٔ ویدیوی ذخیره‌شده و تصاویر ثبت‌شده هم همین است. بزرگ‌تر واضح‌تر است ولی پهنای باند آپلود کلینیک را بیشتر مصرف می‌کند. پیش از شروع انتخاب کنید.",
   "{w}px (default)": "{w} پیکسل (پیش‌فرض)",
+  "Native size (default)": "اندازهٔ اصلی (پیش‌فرض)",
   "{w}px": "{w} پیکسل",
   "Experimental: sends video via WebRTC instead of per-frame JPEG. The server records the video and files captures itself. Pick before starting.":
     "آزمایشی: ویدیو را به‌جای فریم‌به‌فریم JPEG از طریق WebRTC می‌فرستد. سرور خودش ویدیو را ضبط و تصاویر را ثبت می‌کند. پیش از شروع انتخاب کنید.",

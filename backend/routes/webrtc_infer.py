@@ -56,9 +56,11 @@ WS_CLOSE_PIPE_FAILED = 4000
 # 150 is ~15 s, comfortably more than auto-capture's 1 s best-frame window
 # plus a slow round trip. ~230 KB each at 320px: ~35 MB per live session.
 RING_FRAMES = 150
-# ...but bounded by memory too, because the operator can stream larger
-# frames (up to 960px wide: ~2 MB each raw). Past this budget fewer frames
-# are kept: ~3 s at 960px, still well over the 1 s best-frame window.
+# ...but bounded by memory too, because the browser streams the source's
+# native size by default (720x576 PAL: ~1.2 MB each raw). Past this budget
+# fewer frames are kept: ~5 s at 720x576, still well over the 1 s best-frame
+# window. A 1080p source (~6 MB each) keeps only ~1 s -- pick a fixed width
+# in the UI for a source that large.
 RING_BYTES = 64 * 1024 * 1024
 # Model input side when the engine doesn't say (the Modal engine).
 DEFAULT_MODEL_SIDE = 640

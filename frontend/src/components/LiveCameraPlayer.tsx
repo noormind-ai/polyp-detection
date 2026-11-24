@@ -27,6 +27,7 @@ import { createGLEnhancer, type GLEnhancer } from "@/lib/enhanceGL";
 import { createGLDeinterlacer, DEINT_MODES, type GLDeinterlacer, type DeintMode } from "@/lib/deinterlaceGL";
 import { JpegEncoder } from "@/lib/jpegEncoder";
 import { startWebrtcSession, type WebrtcSession, type WebrtcStatus, type WebrtcControl } from "@/lib/webrtcTransport";
+import { WEBRTC_NATIVE, webrtcSendWidth, webrtcSendHeight } from "@/lib/webrtcSize";
 import { createServerRecorder, type ServerRecorder, type ServerRecSnapshot, type RecorderLike } from "@/lib/serverRecorder";
 import { readProcAmpCaps, readProcAmpValues, measureLevels, autoTuneProcAmp,
          type ProcAmpCaps, type Levels } from "@/lib/procAmp";
@@ -209,12 +210,18 @@ const AUTO_CAPTURE_REFRESH_MS = 8000;
 // WebRTC mode's in-body gate cadence: about the rate JPEG mode calls it at.
 const WEBRTC_GATE_EVERY_MS = 100;
 // Picture width WebRTC mode streams at -- and therefore the size the server
-// records and files captures at. The smallest is the default and what this
-// mode always sent before the choice existed. Larger costs clinic upload
-// bandwidth (the browser's encoder raises its bitrate with the size), not
-// inference: the server shrinks every frame to the model's input first.
-const WEBRTC_WIDTHS = [320, 480, 640, 960] as const;
-const WEBRTC_WIDTH_KEY = "polyp_webrtc_width";
+// records and files captures at. WEBRTC_NATIVE (the default) sends the
+// source's own size with no browser resize at all: the server already
+// shrinks every frame to the model's input with area averaging
+// (webrtc_infer._fit_for_model), so a browser-side shrink only threw away
+// detail the recording, the captures and the analyzed panel could have kept
+// -- 320px looked plainly blurry stretched over the panel. The fixed widths
+// stay as a fallback for a weak clinic uplink (the encoder's bitrate grows
+// with the size). A fixed width never upscales a smaller source.
+const WEBRTC_WIDTHS = [WEBRTC_NATIVE, 320, 480, 640, 960] as const;
+// v2: the default changed from 320px to native; a fresh key so browsers that
+// stored a pick under the old default start from the new one.
+const WEBRTC_WIDTH_KEY = "polyp_webrtc_width_v2";
 // A detection gap shorter than this counts as the same episode. The detector
 // drops the odd frame on a lesion that never left the screen, and treating that
 // as "gone" would re-trigger a capture on the very next frame.
@@ -477,9 +484,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // Picked before starting, like the transport itself; persisted per browser
   // so the clinic PC keeps its choice. See WEBRTC_WIDTHS.
   const [webrtcWidth, setWebrtcWidthState] = useState<number>(() => {
-    if (typeof window === "undefined") return inferWidth;
-    const saved = Number(window.localStorage.getItem(WEBRTC_WIDTH_KEY));
-    return (WEBRTC_WIDTHS as readonly number[]).includes(saved) ? saved : inferWidth;
+    if (typeof window === "undefined") return WEBRTC_NATIVE;
+    const raw = window.localStorage.getItem(WEBRTC_WIDTH_KEY);
+    const saved = raw === null ? NaN : Number(raw);
+    return (WEBRTC_WIDTHS as readonly number[]).includes(saved) ? saved : WEBRTC_NATIVE;
   });
   const setWebrtcWidth = (w: number) => {
     setWebrtcWidthState(w);
@@ -3339,10 +3347,8 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       sampleInterlace(video);
       const { x: srcX, y: srcY, w: srcW, h: srcH } = sourceRect(video);
       setAspect(`${srcW}/${srcH}`);
-      const sendW = webrtcWidthRef.current;
-      const scale = sendW / srcW;
-      const capW = sendW;
-      const capH = Math.round(srcH * scale);
+      const capW = webrtcSendWidth(webrtcWidthRef.current, srcW);
+      const capH = webrtcSendHeight(capW, srcW, srcH);
       if (canvas.width !== capW || canvas.height !== capH) {
         canvas.width = capW;
         canvas.height = capH;
@@ -4562,7 +4568,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
             >
               {WEBRTC_WIDTHS.map((w) => (
                 <option key={w} value={w} className="bg-gray-900">
-                  {w === inferWidth ? t("{w}px (default)", { w }) : t("{w}px", { w })}
+                  {w === WEBRTC_NATIVE ? t("Native size (default)") : t("{w}px", { w })}
                 </option>
               ))}
             </select>
