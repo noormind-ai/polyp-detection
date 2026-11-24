@@ -37,6 +37,8 @@ import AlertSoundControls from "./AlertSoundControls";
 import CaptureStrip, { StripChooser, STRIP_SIZE_DEFAULT, clampStripSize,
          type Shot, type StripPos, type StripReplay } from "./CaptureStrip";
 import LatencyHud, { type LatencyStats } from "./LatencyHud";
+import NoInferenceBanner from "./NoInferenceBanner";
+import { aiHealth, AI_HEALTH, type AiDown } from "@/lib/inferenceHealth";
 import DoctorScreen from "./DoctorScreen";
 import { useDoctorWindow, doctorRoot, canPlaceWindows, hasSecondDisplay,
          listDisplays, suggestDisplay, watchDisplays,
@@ -696,6 +698,21 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   }
   const pendingQueueRef = useRef<Pending[]>([]);
 
+  // Is AI detection actually running? Timestamps (performance.now()) feeding
+  // lib/inferenceHealth.ts, which drives the doctor's "No AI detection"
+  // banner. Refs, not state: they change every frame and only the 2 Hz
+  // check below reads them.
+  const aiStartedAtRef = useRef(0);
+  const aiLastSentAtRef = useRef(0);
+  const aiSendingSinceRef = useRef(0);
+  const aiLastOkAtRef = useRef(0);
+  const [aiDown, setAiDown] = useState<AiDown>(null);
+  /** A frame went to the server (or, in WebRTC mode, video is flowing). */
+  function noteAiSent(now: number) {
+    if (now - aiLastSentAtRef.current >= AI_HEALTH.SENDING_WINDOW_MS) aiSendingSinceRef.current = now;
+    aiLastSentAtRef.current = now;
+  }
+
   /** Hand one frame to the socket and return a promise for its boxes. Does NOT
    *  wait: the caller decides when to settle it, which is what lets the next
    *  frame be prepared and sent while this one is still being inferred. */
@@ -704,6 +721,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       const entry: Pending = { resolve, sentAt: performance.now(), done: false, bytes: buf.byteLength };
       pendingQueueRef.current.push(entry);
       ws.send(buf);
+      noteAiSent(entry.sentAt);
       // bufferedAmount right after send() is the size of THIS frame (nothing
       // has had a chance to drain yet) -- the question is how long it takes
       // to get back to whatever it was before this send, i.e. how long the
@@ -787,6 +805,40 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // "closed" now means closed for good (the component is going away);
   // an unexpected drop is "reconnecting", because it is about to come back.
   const [wsStatus, setWsStatus]           = useState<"connecting" | "open" | "error" | "reconnecting" | "closed">("connecting");
+  // The doctor's "No AI detection" banner -- see aiStartedAtRef and
+  // lib/inferenceHealth.ts. Declared here, after the state it reads.
+  // "starting" means THIS camera session has never produced a result. The
+  // clock starts with the session, not with each loop (re)start: a loop
+  // restarted after a reconnect that then gets no answer is an outage, and
+  // must say so rather than "starting" (found by the live freeze test).
+  useEffect(() => { if (streaming) aiStartedAtRef.current = performance.now(); }, [streaming]);
+  useEffect(() => {
+    if (!streaming) { setAiDown(null); return; }
+    const webrtc = transport === "webrtc";
+    const connected = webrtc ? webrtcStatus === "open" : wsStatus === "open";
+    const check = () => {
+      const now = performance.now();
+      // WebRTC streams continuously once open -- there is no per-frame send
+      // to stamp, so an open connection IS "sending".
+      if (webrtc && connected) noteAiSent(now);
+      // JPEG mode keeps one frame in flight and sends nothing more until it
+      // is answered -- so a frozen server stops the SENDING too. A frame
+      // still awaiting its answer means a result is owed, exactly like a
+      // fresh send. (Found by the live freeze test, 2026-11-24.)
+      if (!webrtc && connected && pendingQueueRef.current.length > 0) noteAiSent(now);
+      const next = aiHealth({
+        now, streaming, connected,
+        startedAt: aiStartedAtRef.current,
+        lastSentAt: aiLastSentAtRef.current,
+        sendingSince: aiSendingSinceRef.current,
+        lastOkAt: aiLastOkAtRef.current,
+      });
+      setAiDown((prev) => (prev === next ? prev : next));
+    };
+    check();
+    const id = setInterval(check, 500);
+    return () => clearInterval(id);
+  }, [streaming, transport, wsStatus, webrtcStatus]);
   const [closeCode, setCloseCode]         = useState<number | null>(null);
   const [polyp, setPolyp]                 = useState(false);
   const [stats, setStats]                 = useState({ sent: 0, received: 0, avgMs: 0, rttMs: 0, netMs: 0, fps: 0 });
@@ -2174,6 +2226,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         const entry = pendingQueueRef.current.shift();
 
         const { boxes, timing } = data as { boxes: Box[]; timing: Timing };
+        aiLastOkAtRef.current = performance.now();
         const g = (data as { timing?: { gate?: GateState } }).timing?.gate;
         if (g) setGate(g);
         onActivity?.();
@@ -3417,6 +3470,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       onResult: (data) => {
         const d = data as { boxes?: Box[]; timing?: Timing; error?: string };
         if (d.error || !d.boxes) return;
+        aiLastOkAtRef.current = performance.now();
         if (typeof data.frame === "number") webrtcFrameRef.current = data.frame;
         serverRecRef.current?.noteMark(data.rec);
         // Boxes arrive in the frame size the server RECEIVED (data.w), which
@@ -4277,6 +4331,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
           {detectedFs.active && hudOn && (
             <LatencyHud stats={hudStats} compact className="absolute top-3 start-3 z-40" />
           )}
+          <NoInferenceBanner state={aiDown} />
           {detectedFs.active && (
             <button onClick={detectedFs.toggle} className={fsExitBtnClass}>
               {t("Exit full screen")}
@@ -5514,6 +5569,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
             hudStats={hudStats}
             hudOn={hudOn}
             stopped={!streaming}
+            aiDown={aiDown}
             replay={stripReplay}
           />,
           doctorRoot(doctor.win)!,

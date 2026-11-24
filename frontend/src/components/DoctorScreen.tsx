@@ -7,6 +7,8 @@ import { mirrorLanguage } from "@/lib/useDoctorWindow";
 import CaptureStrip, { StripChooser, type Shot, type StripPos,
          type StripReplay } from "./CaptureStrip";
 import LatencyHud, { type LatencyStats } from "./LatencyHud";
+import NoInferenceBanner from "./NoInferenceBanner";
+import type { AiDown } from "@/lib/inferenceHealth";
 
 export interface DoctorScreenProps {
   /** The popup this is portalled into. Every global in here is the OPENER's,
@@ -34,6 +36,9 @@ export interface DoctorScreenProps {
    *  note in LiveCameraPlayer. Shutting the doctor's monitor off mid-sentence
    *  is worse than a frozen last frame with a label on it. */
   stopped: boolean;
+  /** AI detection isn't running (lib/inferenceHealth.ts): shown as a loud
+   *  banner so "no box" is never read as "no polyp" while nothing is looking. */
+  aiDown: AiDown;
 }
 
 /** What the doctor's monitor shows: the annotated picture, the recent
@@ -48,7 +53,7 @@ export interface DoctorScreenProps {
  *  detectedPanel, and lib/useFullscreen's header). */
 function DoctorScreenInner({
   win, mirrorSource, generation, aspect, shots, stripPos, onStripPos,
-  stripSize, onStripSize, openShotId, onOpenShot, hudStats, hudOn, stopped, replay,
+  stripSize, onStripSize, openShotId, onOpenShot, hudStats, hudOn, stopped, aiDown, replay,
 }: DoctorScreenProps) {
   const { t, lang } = useLanguage();
   const [dst, setDst] = useState<HTMLCanvasElement | null>(null);
@@ -141,6 +146,8 @@ function DoctorScreenInner({
             {t("Full screen")}
           </button>
         )}
+
+        <NoInferenceBanner state={aiDown} />
 
         {stopped && (
           <div className="absolute top-3 inset-x-0 z-30 flex justify-center pointer-events-none">

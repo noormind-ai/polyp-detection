@@ -19,6 +19,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import DoctorScreen from "@/components/DoctorScreen";
+import NoInferenceBanner from "@/components/NoInferenceBanner";
+import type { AiDown } from "@/lib/inferenceHealth";
 import CaptureStrip, { StripChooser, STRIP_SIZE_DEFAULT,
          type Shot, type StripPos } from "@/components/CaptureStrip";
 import LatencyHud, { type LatencyStats } from "@/components/LatencyHud";
@@ -100,6 +102,9 @@ export default function DoctorTestPage() {
     fps: { shown: Math.round(fps.current.mean * 10) / 10, cur: cur.fps, baseline: fps.current.mean, n: fps.current.n },
   };
 
+  // Force a "No AI detection" banner state, to judge it on both screens.
+  const [aiDown, setAiDown] = useState<AiDown>(null);
+
   const mirrorSource = useCallback(() => canvasRef.current, []);
   const generation = useCallback(() => genRef.current, []);
 
@@ -154,6 +159,16 @@ export default function DoctorTestPage() {
           <button onClick={() => addShot("dr")} className={btn}>+ Dr capture</button>
           <button onClick={() => addShot("first")} className={btn}>+ capture (not uploaded)</button>
           <button onClick={() => { spikeRef.current = 8; }} className={btn}>inject latency spike</button>
+          <label className="flex items-center gap-2 text-xs text-gray-400">
+            AI banner
+            <select value={aiDown ?? ""} onChange={(e) => setAiDown((e.target.value || null) as AiDown)}
+                    className="bg-gray-900 border border-gray-700 rounded px-1 py-0.5 text-gray-200">
+              <option value="">none (healthy)</option>
+              <option value="starting">starting</option>
+              <option value="reconnecting">reconnecting</option>
+              <option value="no-results">no-results</option>
+            </select>
+          </label>
           <label className="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
             <input type="checkbox" checked={hudOn} onChange={(e) => setHudOn(e.target.checked)} className="accent-blue-500" />
             latency numbers
@@ -208,6 +223,7 @@ export default function DoctorTestPage() {
           <StripChooser position={stripPos} onChange={setStripPos}
                         size={stripSize} onSize={setStripSize} />
           {hudOn && <LatencyHud stats={hudStats} compact className="absolute top-3 start-3 z-40" />}
+          <NoInferenceBanner state={aiDown} />
         </div>
 
         <LatencyHud stats={hudStats} />
@@ -230,6 +246,7 @@ export default function DoctorTestPage() {
             hudStats={hudStats}
             hudOn={hudOn}
             stopped={false}
+            aiDown={aiDown}
           />,
           doctorRoot(doctor.win)!,
         )}
