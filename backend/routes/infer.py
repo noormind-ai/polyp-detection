@@ -332,7 +332,10 @@ async def _stream_frames(websocket: WebSocket, label: str, engine_name: str, eng
                 _spectate_tasks.add(task)
                 task.add_done_callback(_spectate_tasks.discard)
         except Exception as e:
-            log.error("frame %d inference error: %s", frame_n, e)
+            # log.exception, not log.error: some exceptions have an empty
+            # str(), which left "inference error: " with nothing after it and
+            # no way to tell what failed. Type + traceback always say.
+            log.exception("frame %d inference error: %s: %s", frame_n, type(e).__name__, e)
             await websocket.send_text(json.dumps({"error": str(e)[:200]}))
 
 
