@@ -15,7 +15,20 @@
 
 export type WebrtcStatus = "connecting" | "open" | "closed" | "error" | "timeout";
 
-export type WebrtcResult = { boxes?: unknown; timing?: unknown; error?: string };
+export type WebrtcResult = {
+  boxes?: unknown; timing?: unknown; error?: string;
+  /** This result's frame number on the server -- what "file frame #N" names. */
+  frame?: number;
+  /** Where that frame sits in the server's open recording, if any. */
+  rec?: { id?: string; offset_ms?: number };
+  /** Size of the frame as the server received it -- the space the boxes are in. */
+  w?: number; h?: number;
+};
+
+/** Replies to commands sent with session.send(): server recording state
+ *  ("recording") and filed captures ("captured"). See
+ *  backend/routes/webrtc_infer.py's _handle_control. */
+export type WebrtcControl = { type: "recording" | "captured"; [k: string]: unknown };
 
 /** Numbers the browser itself measured -- not derived, not guessed.
  *  encodeMsPerFrame comes straight from getStats()'s outbound-rtp report
@@ -29,7 +42,11 @@ export type WebrtcResult = { boxes?: unknown; timing?: unknown; error?: string }
  *  disclosed difference rather than a hidden one). */
 export type WebrtcStats = { encodeMsPerFrame: number; rttMs: number };
 
-export type WebrtcSession = { close: () => void };
+export type WebrtcSession = {
+  close: () => void;
+  /** Send a control message (record / capture). False if the socket isn't open. */
+  send: (msg: object) => boolean;
+};
 
 const STATS_POLL_MS = 1000;
 
@@ -39,9 +56,10 @@ export function startWebrtcSession(opts: {
   onResult: (data: WebrtcResult) => void;
   onStatus: (status: WebrtcStatus) => void;
   onStats?: (stats: WebrtcStats) => void;
+  onControl?: (data: WebrtcControl) => void;
   connectTimeoutMs?: number;
 }): WebrtcSession {
-  const { wsUrl, stream, onResult, onStatus, onStats, connectTimeoutMs = 5000 } = opts;
+  const { wsUrl, stream, onResult, onStatus, onStats, onControl, connectTimeoutMs = 5000 } = opts;
   let closed = false;
   let pc: RTCPeerConnection | null = null;
   let statsTimer: ReturnType<typeof setInterval> | null = null;
@@ -113,6 +131,8 @@ export function startWebrtcSession(opts: {
         void handleSetupMessage(data);
       } else if (data.type === "answer") {
         void pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
+      } else if (data.type === "recording" || data.type === "captured") {
+        onControl?.(data);
       } else {
         onResult(data);
       }
@@ -157,7 +177,12 @@ export function startWebrtcSession(opts: {
     try { pc?.close(); } catch { /* already closed */ }
   }
 
-  return { close };
+  function send(msg: object): boolean {
+    if (closed || ws.readyState !== WebSocket.OPEN) return false;
+    try { ws.send(JSON.stringify(msg)); return true; } catch { return false; }
+  }
+
+  return { close, send };
 }
 
 function waitForIceGatheringComplete(pc: RTCPeerConnection): Promise<void> {

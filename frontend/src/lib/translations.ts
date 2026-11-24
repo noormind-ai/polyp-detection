@@ -805,4 +805,19 @@ export const FA: Record<string, string> = {
   "Following the live view": "در حال دنبال کردن نمای زنده",
   "· live": "· زنده",
 
+  // --- WebRTC mode: server-side recording (LiveCameraPlayer) ---
+  "(recorded on the server)": "(روی سرور ضبط می‌شود)",
+  "Not recording": "در حال ضبط نیست",
+  "Not recording -- starts when the scope is inside the body": "در حال ضبط نیست — وقتی آندوسکوپ وارد بدن شود شروع می‌شود",
+  "Starting recording...": "در حال شروع ضبط...",
+  "Recording on server · {time}": "در حال ضبط روی سرور · {time}",
+  "Recording paused (scope outside the body) · {time}": "ضبط متوقف موقت (آندوسکوپ بیرون از بدن) · {time}",
+  "Recording failed: {error}": "ضبط ناموفق بود: {error}",
+  "Picture size sent over WebRTC -- also the size of the saved video and captures. Bigger is sharper but uses more of the clinic's upload. Pick before starting.":
+    "اندازهٔ تصویری که با WebRTC فرستاده می‌شود — اندازهٔ ویدیوی ذخیره‌شده و تصاویر ثبت‌شده هم همین است. بزرگ‌تر واضح‌تر است ولی پهنای باند آپلود کلینیک را بیشتر مصرف می‌کند. پیش از شروع انتخاب کنید.",
+  "{w}px (default)": "{w} پیکسل (پیش‌فرض)",
+  "{w}px": "{w} پیکسل",
+  "Experimental: sends video via WebRTC instead of per-frame JPEG. The server records the video and files captures itself. Pick before starting.":
+    "آزمایشی: ویدیو را به‌جای فریم‌به‌فریم JPEG از طریق WebRTC می‌فرستد. سرور خودش ویدیو را ضبط و تصاویر را ثبت می‌کند. پیش از شروع انتخاب کنید.",
+
 };

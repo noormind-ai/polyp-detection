@@ -153,17 +153,13 @@ def _decorate(meta: dict) -> dict:
     return out
 
 
-@router.post("/recordings/{case_id}/start")
-async def start_recording(
-    case_id: str,
-    source: str = Form(default="camera"),
-    mime: str = Form(default="video/webm"),
-    width: int = Form(default=0),
-    height: int = Form(default=0),
-    user: str = Depends(require_user),
-):
-    """Open a recording and return its id. The client then streams chunks to
-    /chunk in order and calls /stop when the operator stops it."""
+def open_recording(case_id: str, user: str, source: str, mime: str,
+                   width: int = 0, height: int = 0, extra: Optional[dict] = None) -> dict:
+    """Validate, check disk, write the metadata sidecar and create the empty
+    video file. Returns the metadata. Shared by the browser-upload route below
+    and the server-side WebRTC recorder (backend/services/webrtc_recorder.py),
+    so a recording made either way lands in the same list in the same shape.
+    Raises HTTPException on bad input or a full disk."""
     _check_id(case_id, "case_id")
     if source not in SOURCES:
         raise HTTPException(status_code=400, detail=f"source must be one of {sorted(SOURCES)}")
@@ -195,11 +191,34 @@ async def start_recording(
         "chunks": 0,
         "status": "recording",
     }
+    if extra:
+        meta.update(extra)
     _write_meta(meta)
     # Create the file up front so a recording that receives no chunk at all is
     # still a (zero-byte) recording rather than a metadata row pointing at nothing.
     _video_path(meta).touch()
     log.info("recording %s started by %s (case %s, %s)", meta["id"], user, case_id, source)
+    return meta
+
+
+# Public names for the server-side recorder, which writes the file itself
+# instead of receiving chunks over HTTP.
+video_path = _video_path
+write_meta = _write_meta
+
+
+@router.post("/recordings/{case_id}/start")
+async def start_recording(
+    case_id: str,
+    source: str = Form(default="camera"),
+    mime: str = Form(default="video/webm"),
+    width: int = Form(default=0),
+    height: int = Form(default=0),
+    user: str = Depends(require_user),
+):
+    """Open a recording and return its id. The client then streams chunks to
+    /chunk in order and calls /stop when the operator stops it."""
+    meta = open_recording(case_id, user, source, mime, width, height)
     return {"recording_id": meta["id"], "max_mb": MAX_RECORDING_MB}
 
 

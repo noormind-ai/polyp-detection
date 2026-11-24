@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import FeedbackPanel from "./FeedbackPanel";
-import RecordingControls from "./RecordingControls";
+import RecordingControls, { formatDuration } from "./RecordingControls";
 import RecordingRecoveryBanner from "./RecordingRecoveryBanner";
 import RecordingsPanel from "./RecordingsPanel";
 import { DEMO_VIDEOS } from "./demos";
@@ -26,7 +26,8 @@ import { drawBoxes, type Box } from "@/lib/drawBoxes";
 import { createGLEnhancer, type GLEnhancer } from "@/lib/enhanceGL";
 import { createGLDeinterlacer, DEINT_MODES, type GLDeinterlacer, type DeintMode } from "@/lib/deinterlaceGL";
 import { JpegEncoder } from "@/lib/jpegEncoder";
-import { startWebrtcSession, type WebrtcSession, type WebrtcStatus } from "@/lib/webrtcTransport";
+import { startWebrtcSession, type WebrtcSession, type WebrtcStatus, type WebrtcControl } from "@/lib/webrtcTransport";
+import { createServerRecorder, type ServerRecorder, type ServerRecSnapshot, type RecorderLike } from "@/lib/serverRecorder";
 import { readProcAmpCaps, readProcAmpValues, measureLevels, autoTuneProcAmp,
          type ProcAmpCaps, type Levels } from "@/lib/procAmp";
 import { useFullscreen, fsWrapClass, fsExitBtnClass, fsBoxStyle } from "@/lib/useFullscreen";
@@ -205,6 +206,15 @@ const HI_RING_SLOTS = MAX_IN_FLIGHT + 1;
 // A polyp that is STILL on screen is re-filed at most this often, so a long
 // look is not represented in the queue by a single frame.
 const AUTO_CAPTURE_REFRESH_MS = 8000;
+// WebRTC mode's in-body gate cadence: about the rate JPEG mode calls it at.
+const WEBRTC_GATE_EVERY_MS = 100;
+// Picture width WebRTC mode streams at -- and therefore the size the server
+// records and files captures at. The smallest is the default and what this
+// mode always sent before the choice existed. Larger costs clinic upload
+// bandwidth (the browser's encoder raises its bitrate with the size), not
+// inference: the server shrinks every frame to the model's input first.
+const WEBRTC_WIDTHS = [320, 480, 640, 960] as const;
+const WEBRTC_WIDTH_KEY = "polyp_webrtc_width";
 // A detection gap shorter than this counts as the same episode. The detector
 // drops the odd frame on a lesion that never left the screen, and treating that
 // as "gone" would re-trigger a capture on the very next frame.
@@ -457,6 +467,35 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   useEffect(() => { transportRef.current = transport; }, [transport]);
   const webrtcSessionRef = useRef<WebrtcSession | null>(null);
   const [webrtcStatus, setWebrtcStatus] = useState<WebrtcStatus | null>(null);
+  // Picked before starting, like the transport itself; persisted per browser
+  // so the clinic PC keeps its choice. See WEBRTC_WIDTHS.
+  const [webrtcWidth, setWebrtcWidthState] = useState<number>(() => {
+    if (typeof window === "undefined") return inferWidth;
+    const saved = Number(window.localStorage.getItem(WEBRTC_WIDTH_KEY));
+    return (WEBRTC_WIDTHS as readonly number[]).includes(saved) ? saved : inferWidth;
+  });
+  const setWebrtcWidth = (w: number) => {
+    setWebrtcWidthState(w);
+    window.localStorage.setItem(WEBRTC_WIDTH_KEY, String(w));
+  };
+  const webrtcWidthRef = useRef(webrtcWidth);
+  useEffect(() => { webrtcWidthRef.current = webrtcWidth; }, [webrtcWidth]);
+  // WebRTC mode records on the SERVER, which already receives the video (see
+  // lib/serverRecorder.ts). Non-null only while a WebRTC session is open;
+  // activeRecorder() prefers it over the browser recorder.
+  const serverRecRef = useRef<ServerRecorder | null>(null);
+  const [serverRec, setServerRec] = useState<ServerRecSnapshot | null>(null);
+  // The server numbers every frame it infers and keeps the recent ones, so
+  // auto-capture can say "file frame #N" and get the exact picture its boxes
+  // were computed on -- the browser never holds that frame in this mode.
+  const webrtcFrameRef = useRef<number | null>(null);
+  // In-body verdict for WebRTC mode, where every frame is inferred: captures
+  // are only filed while this is true (JPEG mode gets that for free, because
+  // it never infers an out-of-body frame at all).
+  const webrtcInsideRef = useRef(true);
+  // Captures sent to the server, by ref, waiting for its "captured" reply.
+  const webrtcPendingRef = useRef<Map<string, { kind: "first" | "best"; boxes: Box[]; takenAtMs: number }>>(new Map());
+  const webrtcCaptureSeqRef = useRef(0);
   /** Drop the current socket so it comes straight back on the current URL.
    *  Set by the socket effect; used when the case id rotates. */
   const reopenSocketRef = useRef<(() => void) | null>(null);
@@ -504,7 +543,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   const captureAtRef      = useRef<Map<string, number>>(new Map());
   // The bar gets longer while a procedure runs, so the panel needs a heartbeat.
   const [timelineTick, setTimelineTick] = useState(0);
-  const bestRef = useRef<{ score: number; boxes: Box[] } | null>(null);
+  const bestRef = useRef<{ score: number; boxes: Box[]; frame?: number } | null>(null);
   // Two scratch canvases, reused for the life of the session: the frame being
   // considered, and the best one held so far. A fresh 960px canvas per inferred
   // frame would be megabytes a second of garbage on a clinic PC.
@@ -846,6 +885,11 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
   // e2e-case-rotate.js caught three recordings in a row going to the wrong one.
   const recorderRef = useRef(recorder);
   useEffect(() => { recorderRef.current = recorder; });
+  /** Whichever recorder this session uses: the server's in WebRTC mode, the
+   *  browser's otherwise. Same start/pause/resume/stop/mark contract. */
+  function activeRecorder(): RecorderLike {
+    return serverRecRef.current ?? recorderRef.current;
+  }
 
   const [showRecordings, setShowRecordings] = useState(false);
   // Read through a ref inside applyAutoRecord for the same reason every other
@@ -1025,7 +1069,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     if (!want && !autoStoppedRef.current && outsideStartRef.current !== null
         && Date.now() - outsideStartRef.current >= oobStopMs) {
       autoStoppedRef.current = true;
-      recorderRef.current.stop("out-of-body");
+      activeRecorder().stop("out-of-body");
       // Same moment, one level up: this patient is over, so the next captures
       // and the next recording belong to a new case. Safe to rotate while the
       // finalize above is still uploading -- useSessionRecorder snapshots the
@@ -1039,15 +1083,15 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       // Recording needs an account (see RecordingControls.tsx) -- without
       // this check a signed-out operator would see a failed /start POST
       // retried every frame for as long as the scope stays inside the body.
-      if (authUserRef.current) void recorderRef.current.start();
-      recorderRef.current.resume();
+      if (authUserRef.current) void activeRecorder().start();
+      activeRecorder().resume();
     } else {
       // No trickle here: an upload attempt fired on every out-of-body frame
       // sat blocked behind the exact same oobStopMs threshold anyway (see
       // the gate-release block above), so it was a no-op "waitingForLink"
       // flicker on every brief withdrawal, never an actual head start.
       // Uploading now starts cleanly, once, at the auto-stop branch above.
-      recorderRef.current.pause({ trickle: false });
+      activeRecorder().pause({ trickle: false });
     }
   }
 
@@ -2531,7 +2575,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         Math.round(b.bbox[2] * k), Math.round(b.bbox[3] * k),
       ] as [number, number, number, number],
     }));
-    bestRef.current = { score, boxes: scaled };
+    // In WebRTC mode, which server frame these boxes belong to -- see
+    // webrtcFrameRef. Undefined in JPEG mode, where the canvas IS the frame.
+    const frame = webrtcSessionRef.current ? webrtcFrameRef.current ?? undefined : undefined;
+    bestRef.current = { score, boxes: scaled, frame };
   }
 
   function resetEpisode() {
@@ -2640,11 +2687,47 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       lastAutoCaptureRef.current = now;
       bestRef.current = null;  // a refresh picks a fresh best, not this one again
     }
+    if (best.frame !== undefined && webrtcSessionRef.current) {
+      sendWebrtcCapture(best.frame, boxes, kind);
+      return;
+    }
     const w = canvas.width, h = canvas.height;
     canvas.toBlob((blob) => {
       if (!blob) return;
       sendCapture(blob, boxes, kind, pushShot(blob, boxes, kind, w, h));
     }, "image/jpeg", 0.82);
+  }
+
+  /** WebRTC mode's sendCapture: ask the server to file one of the frames it
+   *  inferred. The picture never crosses the network again -- the server
+   *  already has it -- and it is exactly the frame these boxes describe. */
+  function sendWebrtcCapture(frame: number, boxes: Box[], kind: "first" | "best") {
+    const session = webrtcSessionRef.current;
+    if (!session) return;
+    const ref = `c${++webrtcCaptureSeqRef.current}`;
+    const takenAtMs = procStartRef.current ? Date.now() - procStartRef.current : 0;
+    if (session.send({ type: "capture", ref, frame, kind, boxes, case_id: caseIdRef.current })) {
+      webrtcPendingRef.current.set(ref, { kind, boxes, takenAtMs });
+    }
+  }
+
+  /** The server filed a capture (or couldn't). Put it in the strip from the
+   *  server's own copy, so the tile shows the frame that was actually filed. */
+  async function onWebrtcCaptured(data: WebrtcControl) {
+    const ref = String(data.ref ?? "");
+    const pending = webrtcPendingRef.current.get(ref);
+    webrtcPendingRef.current.delete(ref);
+    if (!pending || data.error || typeof data.filename !== "string") return;
+    const filename = data.filename;
+    if (procStartRef.current) captureAtRef.current.set(filename, pending.takenAtMs);
+    setFeedbackRefreshKey((k) => k + 1);
+    try {
+      const res = await fetch(`${API}/api/feedback/${encodeURIComponent(String(data.case_id))}/image/${encodeURIComponent(filename)}`);
+      if (!res.ok) return;
+      const blob = await res.blob();
+      const id = pushShot(blob, pending.boxes, pending.kind, Number(data.width) || 0, Number(data.height) || 0);
+      markShotUploaded(id);
+    } catch { /* the capture is filed either way; only the strip tile is missing */ }
   }
 
   /** Keep a filed capture on screen, now, without waiting for its upload.
@@ -2700,7 +2783,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
     // No clip. The session recording already holds this moment, so all a
     // reviewer needs is where to seek to — a few bytes instead of the ~250 KB
     // of video that was starving the live frame stream.
-    const at = recorderRef.current.mark();
+    const at = activeRecorder().mark();
     if (at) {
       fd.append("recording_id", at.recordingId);
       fd.append("video_offset_ms", String(at.offsetMs));
@@ -2772,7 +2855,7 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       // No clip. The session recording already holds this moment, so all a
       // reviewer needs is where to seek to — a few bytes instead of the ~250 KB
       // of video that was starving the live frame stream.
-      const at = recorderRef.current.mark();
+      const at = activeRecorder().mark();
       if (at) {
         fd.append("recording_id", at.recordingId);
         fd.append("video_offset_ms", String(at.offsetMs));
@@ -3226,7 +3309,13 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
    *  documents/webrtc-implementation-plan.txt for why. */
   async function startLoopWebRTC() {
     if (scanRef.current) return;
+    // A source switch restarts the loop without passing through stopCamera;
+    // close the previous connection (and the recording on it) first, or it
+    // stays open with no frames until the server notices.
+    stopLoopWebRTC();
     scanRef.current = true;
+    webrtcInsideRef.current = true;
+    let lastGateAt = 0;
 
     const canvas = document.createElement("canvas");
 
@@ -3241,8 +3330,9 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       sampleInterlace(video);
       const { x: srcX, y: srcY, w: srcW, h: srcH } = sourceRect(video);
       setAspect(`${srcW}/${srcH}`);
-      const scale = inferWidth / srcW;
-      const capW = inferWidth;
+      const sendW = webrtcWidthRef.current;
+      const scale = sendW / srcW;
+      const capW = sendW;
       const capH = Math.round(srcH * scale);
       if (canvas.width !== capW || canvas.height !== capH) {
         canvas.width = capW;
@@ -3254,6 +3344,19 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         canvas.getContext("2d")!.drawImage(video, srcX, srcY, srcW, srcH, 0, 0, capW, capH);
       }
       drawAnalyzedFrame(canvas, canvas, lastBoxesRef.current);
+      // In-body gate, at roughly the cadence JPEG mode evaluates it (its
+      // debounce counts calls, so 60 calls a second would make it 6x jumpier).
+      // Used for two things only: auto-record start/pause/stop, exactly as in
+      // JPEG mode, and whether a detection may be filed. It does NOT stop
+      // frames being sent -- the encoder streams continuously regardless.
+      const now = performance.now();
+      if (now - lastGateAt >= WEBRTC_GATE_EVERY_MS && serverRecRef.current) {
+        lastGateAt = now;
+        const gateCap = capW > INFER_WIDTH ? downscaleForGates(canvas) : canvas;
+        const insideNow = inBody.shouldInfer(gateCap);
+        webrtcInsideRef.current = insideNow;
+        applyAutoRecord(insideNow);
+      }
       requestAnimationFrame(draw);
     };
     requestAnimationFrame(draw);
@@ -3265,6 +3368,10 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       wsUrl,
       stream,
       onStatus: setWebrtcStatus,
+      onControl: (data) => {
+        if (data.type === "recording") serverRecRef.current?.onServerMessage(data as Parameters<ServerRecorder["onServerMessage"]>[0]);
+        else if (data.type === "captured") void onWebrtcCaptured(data);
+      },
       // Same refs/state the JPEG path (ws.onmessage) populates, reused
       // as-is -- the numbers land in the exact same HUD slots so the two
       // transports are directly comparable, not two different-shaped
@@ -3273,8 +3380,21 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
       onResult: (data) => {
         const d = data as { boxes?: Box[]; timing?: Timing; error?: string };
         if (d.error || !d.boxes) return;
-        const shown = temporal.filter(d.boxes.filter((b) => b.conf >= confMinRef.current));
+        if (typeof data.frame === "number") webrtcFrameRef.current = data.frame;
+        serverRecRef.current?.noteMark(data.rec);
+        // Boxes arrive in the frame size the server RECEIVED (data.w), which
+        // WebRTC may have lowered on a congested link; draw them on ours.
+        const k = data.w && canvas.width ? canvas.width / data.w : 1;
+        const inCanvas = Math.abs(k - 1) < 0.01 ? d.boxes : d.boxes.map((b) => ({
+          ...b, bbox: [b.bbox[0] * k, b.bbox[1] * k, b.bbox[2] * k, b.bbox[3] * k] as [number, number, number, number],
+        }));
+        const shown = temporal.filter(inCanvas.filter((b) => b.conf >= confMinRef.current));
         updateBoxes(shown);
+        // Same first/best capture tiers as JPEG mode. `canvas` is only used
+        // to SCORE candidates (sharpness); the picture filed is the server's
+        // own copy of frame #N -- see flushBest/sendWebrtcCapture.
+        if (webrtcInsideRef.current) maybeAutoCapture(shown, canvas, null);
+        else maybeAutoCapture([], null, null);
         if (!d.timing) return;
 
         // gate isn't in the Timing type (same as the JPEG path's ws.onmessage,
@@ -3333,9 +3453,27 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
         }
       },
     });
+    const session = webrtcSessionRef.current;
+    // Created synchronously, before the first draw() frame can run, so the
+    // gate above never sees a null recorder and falls back to the browser's.
+    serverRecRef.current = createServerRecorder({
+      send: (msg) => session.send(msg),
+      caseId: () => caseIdRef.current,
+      source: () => (captureModeRef.current === "screen" ? "screen" : "camera"),
+      onChange: setServerRec,
+      onComplete: () => setShowRecordings(true),
+    });
+    setServerRec(serverRecRef.current.snapshot());
   }
 
   function stopLoopWebRTC() {
+    // Stop sent before close on the same socket, so the server finalizes the
+    // file with a real reason rather than seeing a bare "disconnect".
+    serverRecRef.current?.stop("session-stop");
+    serverRecRef.current = null;
+    setServerRec(null);
+    webrtcPendingRef.current.clear();
+    webrtcFrameRef.current = null;
     webrtcSessionRef.current?.close();
     webrtcSessionRef.current = null;
     setWebrtcStatus(null);
@@ -4371,15 +4509,25 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
           <button
             onClick={() => setTransport(transport === "jpeg" ? "webrtc" : "jpeg")}
             disabled={streaming}
-            title={t("Experimental: sends video via WebRTC instead of per-frame JPEG. Auto-capture and recording turn off while this is active. Pick before starting.")}
+            title={t("Experimental: sends video via WebRTC instead of per-frame JPEG. The server records the video and files captures itself. Pick before starting.")}
             className={`${toggleBtn} ${transport === "webrtc" ? "text-emerald-400 border-emerald-700" : ""} ${streaming ? "opacity-40 cursor-not-allowed" : ""}`}
           >
             {t("Transport: {mode}", { mode: transport === "webrtc" ? "WebRTC" : "JPEG" })}
           </button>
           {transport === "webrtc" && (
-            <span className="text-xs px-2 py-0.5 rounded-md border border-amber-800 bg-amber-950/40 text-amber-300">
-              {t("WebRTC mode: auto-capture & recording are off")}
-            </span>
+            <select
+              value={webrtcWidth}
+              onChange={(e) => setWebrtcWidth(Number(e.target.value))}
+              disabled={streaming}
+              title={t("Picture size sent over WebRTC -- also the size of the saved video and captures. Bigger is sharper but uses more of the clinic's upload. Pick before starting.")}
+              className={`${toggleBtn} bg-transparent ${streaming ? "opacity-40 cursor-not-allowed" : ""}`}
+            >
+              {WEBRTC_WIDTHS.map((w) => (
+                <option key={w} value={w} className="bg-gray-900">
+                  {w === inferWidth ? t("{w}px (default)", { w }) : t("{w}px", { w })}
+                </option>
+              ))}
+            </select>
           )}
           {transport === "webrtc" && webrtcStatus && (
             <span className={`text-xs px-2 py-0.5 rounded-md border ${
@@ -4818,9 +4966,38 @@ export default function LiveCameraPlayer({ caseId, onStop, onActivity, wsPath = 
             {/* Recording is opt-in: nothing is written to the server until this
                 is pressed, so a session that nobody wants archived leaves nothing. */}
             <RecordingRecoveryBanner />
-            <RecordingControls recorder={recorder} ready={streaming}
-              autoRecordEnabled={autoRecordEnabled} onAutoRecordEnabledChange={setAutoRecordEnabled}
-              recordOverride={recordOverride} onRecordOverrideChange={setRecordOverride} />
+            {transport === "webrtc" ? (
+              // WebRTC mode records on the server (lib/serverRecorder.ts):
+              // nothing to upload, so none of RecordingControls' upload
+              // progress applies. "Save video" is the same auto-record switch
+              // -- on, it records whenever the scope is inside the body.
+              <div className="space-y-1 text-xs">
+                <label className="flex items-center gap-2 text-gray-300">
+                  <input type="checkbox" checked={autoRecordEnabled}
+                    onChange={(e) => {
+                      const on = e.target.checked;
+                      autoRecordEnabledRef.current = on;
+                      setAutoRecordEnabled(on);
+                      if (!on) serverRecRef.current?.stop("manual");
+                    }} />
+                  {t("Save video")}
+                  <span className="text-gray-500">{t("(recorded on the server)")}</span>
+                </label>
+                <p className={serverRec?.state === "recording" ? "text-red-300"
+                  : serverRec?.state === "error" ? "text-red-400" : "text-gray-500"}>
+                  {!serverRec || serverRec.state === "idle"
+                    ? (autoRecordEnabled ? t("Not recording -- starts when the scope is inside the body") : t("Not recording"))
+                    : serverRec.state === "starting" ? t("Starting recording...")
+                    : serverRec.state === "recording" ? t("Recording on server · {time}", { time: formatDuration(serverRec.offsetMs) })
+                    : serverRec.state === "paused" ? t("Recording paused (scope outside the body) · {time}", { time: formatDuration(serverRec.offsetMs) })
+                    : t("Recording failed: {error}", { error: serverRec.error ?? "" })}
+                </p>
+              </div>
+            ) : (
+              <RecordingControls recorder={recorder} ready={streaming}
+                autoRecordEnabled={autoRecordEnabled} onAutoRecordEnabledChange={setAutoRecordEnabled}
+                recordOverride={recordOverride} onRecordOverrideChange={setRecordOverride} />
+            )}
           </div>
           <div dir={pageDir} className={`space-y-2 min-w-0 bg-gray-900/50 border border-gray-800 rounded-xl p-3 xl:order-2 ${showLive ? "xl:col-span-2" : ""}`}>
             {/* Detected and Live, always rendered as this exact pair in this exact
